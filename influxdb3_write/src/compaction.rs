@@ -1,6 +1,8 @@
+use crate::write_buffer::persisted_files::PersistedFiles;
 use crate::{ParquetFile, ParquetFileId, WriteBuffer};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion_util::stream_from_batches;
 use influxdb3_catalog::catalog::Catalog;
 use influxdb3_id::{DbId, TableId};
@@ -71,8 +73,12 @@ pub struct CompactionService {
     config: CompactionConfig,
     catalog: Arc<Catalog>,
     write_buffer: Arc<dyn WriteBuffer>,
+    persisted_files: Arc<PersistedFiles>,
     executor: Arc<Executor>,
+    datafusion_config: HashMap<String, String>,
     object_store: Arc<dyn ObjectStore>,
+    object_store_url: ObjectStoreUrl,
+    node_identifier_prefix: String,
     time_provider: Arc<dyn TimeProvider>,
     shutdown_token: influxdb3_shutdown::ShutdownToken,
 }
@@ -82,8 +88,12 @@ impl CompactionService {
         config: CompactionConfig,
         catalog: Arc<Catalog>,
         write_buffer: Arc<dyn WriteBuffer>,
+        persisted_files: Arc<PersistedFiles>,
         executor: Arc<Executor>,
+        datafusion_config: HashMap<String, String>,
         object_store: Arc<dyn ObjectStore>,
+        object_store_url: ObjectStoreUrl,
+        node_identifier_prefix: impl Into<String>,
         time_provider: Arc<dyn TimeProvider>,
         shutdown_token: influxdb3_shutdown::ShutdownToken,
     ) -> Self {
@@ -91,11 +101,55 @@ impl CompactionService {
             config,
             catalog,
             write_buffer,
+            persisted_files,
             executor,
+            datafusion_config,
             object_store,
+            object_store_url,
+            node_identifier_prefix: node_identifier_prefix.into(),
             time_provider,
             shutdown_token,
         }
+    }
+
+    fn persisted_files(&self) -> Arc<PersistedFiles> {
+        Arc::clone(&self.persisted_files)
+    }
+
+    /// Drop catalog entries whose objects are missing from object storage.
+    async fn filter_existing_files(
+        &self,
+        db_id: DbId,
+        table_id: TableId,
+        files: Vec<ParquetFile>,
+    ) -> Result<Vec<ParquetFile>> {
+        let mut existing = Vec::with_capacity(files.len());
+        let mut missing = Vec::new();
+
+        for file in files {
+            let path = ObjPath::from(file.path.as_str());
+            match self.object_store.head(&path).await {
+                Ok(_) => existing.push(file),
+                Err(object_store::Error::NotFound { .. }) => {
+                    warn!("Skipping missing parquet file in catalog: {}", file.path);
+                    missing.push(file);
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        if !missing.is_empty() {
+            self.persisted_files()
+                .remove_persisted_files(&db_id, &table_id, &missing);
+            debug!(
+                "Pruned {} stale parquet catalog entries for db={} table={}",
+                missing.len(),
+                db_id,
+                table_id
+            );
+        }
+
+        Ok(existing)
     }
 
     /// Start the background compaction service
@@ -148,7 +202,7 @@ impl CompactionService {
                 if let Some(result) = set.join_next().await {
                     match result {
                         Ok(Ok(_)) => completed_jobs += 1,
-                        Ok(Err(e)) => error!("Compaction job failed: {}", e),
+                        Ok(Err(e)) => error!("Compaction job failed: {:#}", e),
                         Err(e) => error!("Compaction task failed: {}", e),
                     }
                 }
@@ -164,7 +218,7 @@ impl CompactionService {
         while let Some(result) = set.join_next().await {
             match result {
                 Ok(Ok(_)) => completed_jobs += 1,
-                Ok(Err(e)) => error!("Compaction job failed: {}", e),
+                Ok(Err(e)) => error!("Compaction job failed: {:#}", e),
                 Err(e) => error!("Compaction task failed: {}", e),
             }
         }
@@ -190,8 +244,15 @@ impl CompactionService {
                     continue;
                 }
 
-                // Get files for this table
-                let files = self.write_buffer.parquet_files(db_schema.id, table_def.table_id);
+                // Get files for this table, skipping catalog entries with no object store object
+                let files = self
+                    .filter_existing_files(
+                        db_schema.id,
+                        table_def.table_id,
+                        self.write_buffer
+                            .parquet_files(db_schema.id, table_def.table_id),
+                    )
+                    .await?;
                 if files.len() < self.config.min_files_for_compaction {
                     continue;
                 }
@@ -254,8 +315,14 @@ impl CompactionService {
         // Create chunks from the parquet files
         let chunks = self.create_chunks_from_files(&job.files, &job.schema).await?;
 
-        // Execute compaction using DataFusion
-        let ctx = self.executor.new_context();
+        // Execute compaction using DataFusion (honor server datafusion config, e.g. max_parquet_fanout)
+        let ctx = {
+            let mut session_config = self.executor.new_session_config();
+            for (key, value) in &self.datafusion_config {
+                session_config = session_config.with_config_option(key, value);
+            }
+            session_config.build()
+        };
         
         info!(
             "Creating compaction plan with sort key: {:?} for table {}",
@@ -338,7 +405,7 @@ impl CompactionService {
             let chunk = crate::write_buffer::parquet_chunk_from_file(
                 file,
                 schema,
-                datafusion::execution::object_store::ObjectStoreUrl::parse("file://")?,
+                self.object_store_url.clone(),
                 Arc::clone(&self.object_store),
                 i as i64,
             );
@@ -378,6 +445,11 @@ impl CompactionService {
                 Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
                 batch_stream,
             ).await?;
+
+            self.object_store
+                .put(&path, parquet_bytes.bytes.clone().into())
+                .await
+                .with_context(|| format!("failed to upload compacted parquet to {}", path))?;
 
             let parquet_file = ParquetFile {
                 id: ParquetFileId::new(),
@@ -539,7 +611,8 @@ impl CompactionService {
     ) -> Result<ObjPath> {
         let date_time = DateTime::<Utc>::from_timestamp_nanos(chunk_time);
         let path = format!(
-            "dbs/{}-{}/{}-{}/gen{}/{}/{}.parquet",
+            "{}/dbs/{}-{}/{}-{}/gen{}/{}/{}.parquet",
+            self.node_identifier_prefix,
             job.table_name,
             job.database_id,
             job.table_name,
@@ -555,17 +628,25 @@ impl CompactionService {
     /// Update catalog for compaction: add new compacted files and remove old files
     async fn update_catalog_for_compaction(
         &self,
-        _job: &CompactionJob,
-        _new_files: &[ParquetFile],
+        job: &CompactionJob,
+        new_files: &[ParquetFile],
         old_files: &[ParquetFile],
     ) -> Result<()> {
-        // Delete old files from object store
+        let persisted_files = self.persisted_files();
+
+        for file in new_files {
+            persisted_files.add_persisted_file(&job.database_id, &job.table_id, file);
+        }
+
+        persisted_files.remove_persisted_files(&job.database_id, &job.table_id, old_files);
+
         for file in old_files {
-            let path = object_store::path::Path::from(file.path.clone());
+            let path = ObjPath::from(file.path.clone());
             if let Err(e) = self.object_store.delete(&path).await {
-                warn!("Failed to delete old compacted file {}: {}", file.path, e);
+                warn!("Failed to delete old gen{} file {}: {}", job.source_generation, file.path, e);
             }
         }
+
         Ok(())
     }
 
@@ -756,6 +837,8 @@ mod tests {
         use crate::compaction::{CompactionConfig, CompactionService};
         use influxdb3_shutdown::ShutdownManager;
         use crate::Precision;
+        use crate::persister::DEFAULT_OBJECT_STORE_URL;
+        use datafusion::execution::object_store::ObjectStoreUrl;
         use iox_time::MockProvider;
 
         // Set up in-memory object store and catalog
@@ -857,8 +940,12 @@ mod tests {
             compaction_config,
             Arc::clone(&catalog),
             write_buffer.clone(),
+            write_buffer.persisted_files(),
             Arc::new(Executor::new_testing()),
+            HashMap::new(),
             Arc::clone(&object_store),
+            ObjectStoreUrl::parse(DEFAULT_OBJECT_STORE_URL).unwrap(),
+            "test-host",
             Arc::clone(&time_provider),
             ShutdownManager::new_testing().register(),
         );

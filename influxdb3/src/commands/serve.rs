@@ -1012,8 +1012,12 @@ pub async fn command(config: Config) -> Result<()> {
             compaction_config,
             Arc::clone(&catalog),
             Arc::clone(&write_buffer_impl) as Arc<dyn WriteBuffer>,
+            Arc::clone(&persisted_files),
             Arc::clone(&write_path_executor),
+            config.iox_query_datafusion_config.clone().build(),
             Arc::clone(&object_store),
+            persister.object_store_url().clone(),
+            config.node_identifier_prefix.clone(),
             Arc::clone(&time_provider),
             shutdown_manager.register(),
         ));

@@ -79,18 +79,17 @@ RUN chown -R root:root /usr/lib/influxdb3
 RUN mkdir /plugins && \
     chown influxdb3:influxdb3 /plugins
 
-USER influxdb3
-
-RUN mkdir ~/.influxdb3
-
 ARG PACKAGE=influxdb3
 ENV PACKAGE=$PACKAGE
 ENV INFLUXDB3_PLUGIN_DIR=/plugins
 
 COPY --from=build "/root/$PACKAGE" "/usr/bin/$PACKAGE"
-COPY docker/entrypoint.sh /usr/bin/entrypoint.sh
+COPY --chmod=755 docker/entrypoint.sh /usr/bin/entrypoint.sh
+RUN chmod +x "/usr/bin/$PACKAGE"
 
-RUN chmod +x /usr/bin/influxdb3 /usr/bin/entrypoint.sh
+USER influxdb3
+
+RUN mkdir ~/.influxdb3
 
 EXPOSE 8181
 

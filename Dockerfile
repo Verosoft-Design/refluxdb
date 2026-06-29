@@ -17,26 +17,33 @@ ARG CARGO_NET_GIT_FETCH_WITH_CLI=false
 ARG PROFILE=release
 ARG FEATURES=aws,gcp,azure,jemalloc_replacing_malloc
 ARG PACKAGE=influxdb3
-ARG PBS_DATE=unset
-ARG PBS_VERSION=unset
-ARG PBS_TARGET=unset
+ARG PBS_DATE=20250612
+ARG PBS_VERSION=3.13.5
+# PBS_TARGET is derived automatically from Docker's TARGETARCH (set by buildx for multi-arch).
+# Override only if building for a non-standard target.
+ARG TARGETARCH
 ENV CARGO_INCREMENTAL=$CARGO_INCREMENTAL \
     CARGO_NET_GIT_FETCH_WITH_CLI=$CARGO_NET_GIT_FETCH_WITH_CLI \
     PROFILE=$PROFILE \
     FEATURES=$FEATURES \
     PACKAGE=$PACKAGE \
-    PBS_TARGET=$PBS_TARGET \
     PBS_DATE=$PBS_DATE \
     PBS_VERSION=$PBS_VERSION
 
 # obtain python-build-standalone and configure PYO3_CONFIG_FILE
 COPY .circleci /influxdb3/.circleci
 RUN \
+  case "${TARGETARCH}" in \
+    amd64) PBS_TARGET="x86_64-unknown-linux-gnu" ;; \
+    arm64) PBS_TARGET="aarch64-unknown-linux-gnu" ;; \
+    *) echo "Unsupported TARGETARCH: ${TARGETARCH}"; exit 1 ;; \
+  esac && \
   sed -i "s/^readonly TARGETS=.*/readonly TARGETS=${PBS_TARGET}/" ./.circleci/scripts/fetch-python-standalone.bash && \
   ./.circleci/scripts/fetch-python-standalone.bash /influxdb3/python-artifacts "${PBS_DATE}" "${PBS_VERSION}" && \
   tar -C /influxdb3/python-artifacts -zxf /influxdb3/python-artifacts/all.tar.gz "./${PBS_TARGET}" && \
   sed -i 's#tmp/workspace#influxdb3#' "/influxdb3/python-artifacts/${PBS_TARGET}/pyo3_config_file.txt" && \
-  cat "/influxdb3/python-artifacts/${PBS_TARGET}/pyo3_config_file.txt"
+  cat "/influxdb3/python-artifacts/${PBS_TARGET}/pyo3_config_file.txt" && \
+  echo "${PBS_TARGET}" > /influxdb3/.pbs_target
 
 COPY . /influxdb3
 
@@ -53,6 +60,7 @@ RUN \
   --mount=type=cache,id=influxdb3_git,sharing=locked,target=/usr/local/cargo/git \
   --mount=type=cache,id=influxdb3_target,sharing=locked,target=/influxdb3/target \
     du -cshx /usr/local/rustup /usr/local/cargo/registry /usr/local/cargo/git /influxdb3/target && \
+    PBS_TARGET=$(cat /influxdb3/.pbs_target) && \
     PYO3_CONFIG_FILE="/influxdb3/python-artifacts/$PBS_TARGET/pyo3_config_file.txt" cargo build --target-dir /influxdb3/target --package="$PACKAGE" --profile="$PROFILE" --no-default-features --features="$FEATURES" && \
     objcopy --compress-debug-sections "target/$PROFILE/$PACKAGE" && \
     cp "/influxdb3/target/$PROFILE/$PACKAGE" "/root/$PACKAGE" && \

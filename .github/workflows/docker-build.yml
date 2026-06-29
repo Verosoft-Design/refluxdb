@@ -11,10 +11,7 @@ env:
 
 jobs:
   build-and-push:
-    # ubuntu-latest-8-cores requires GitHub Team/Enterprise plan.
-    # Falls back to ubuntu-latest (2-core) on free plans — remove the fallback
-    # line and keep only ubuntu-latest-8-cores once the plan is confirmed.
-    runs-on: ${{ github.repository_owner == 'Verosoft-Design' && 'ubuntu-latest-8-cores' || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write

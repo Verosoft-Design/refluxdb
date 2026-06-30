@@ -289,11 +289,55 @@ impl CompactionService {
         }
 
         let start_time = std::time::Instant::now();
-        let total_input_size: u64 = job.files.iter().map(|f| f.size_bytes).sum();
-        let _total_input_rows: u64 = job.files.iter().map(|f| f.row_count).sum();
+
+        // Filter out catalog entries whose objects are missing from object storage (catalog drift).
+        // Done per-job (typically 100s of files) rather than pre-planning (potentially 100k+ files)
+        // so this remains fast even with large catalogs.
+        let files = {
+            let mut existing = Vec::with_capacity(job.files.len());
+            let mut missing = Vec::new();
+            for file in &job.files {
+                let path = ObjPath::from(file.path.as_str());
+                match self.object_store.head(&path).await {
+                    Ok(_) => existing.push(file.clone()),
+                    Err(object_store::Error::NotFound { .. }) => {
+                        warn!("Skipping missing parquet file in catalog: {}", file.path);
+                        missing.push(file.clone());
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            if !missing.is_empty() {
+                self.persisted_files()
+                    .remove_persisted_files(&job.database_id, &job.table_id, &missing);
+                info!(
+                    "Pruned {} stale catalog entries for db={} table={}",
+                    missing.len(), job.database_id, job.table_name
+                );
+            }
+            if existing.len() < self.config.min_files_for_compaction {
+                info!(
+                    "Skipping compaction for db={} table={}: only {} files remain after drift check (min {})",
+                    job.database_id, job.table_name, existing.len(), self.config.min_files_for_compaction
+                );
+                return Ok(CompactionResult {
+                    database_id: job.database_id,
+                    table_name: job.table_name,
+                    files_compacted: 0,
+                    rows_compacted: 0,
+                    input_size_bytes: 0,
+                    output_size_bytes: 0,
+                    duration_secs: 0.0,
+                });
+            }
+            existing
+        };
+
+        let total_input_size: u64 = files.iter().map(|f| f.size_bytes).sum();
+        let _total_input_rows: u64 = files.iter().map(|f| f.row_count).sum();
 
         // Create chunks from the parquet files
-        let chunks = self.create_chunks_from_files(&job.files, &job.schema).await?;
+        let chunks = self.create_chunks_from_files(&files, &job.schema).await?;
 
         // Execute compaction using DataFusion (honor server datafusion config, e.g. max_parquet_fanout)
         let ctx = {
@@ -346,7 +390,7 @@ impl CompactionService {
         self.validate_compacted_data(&compacted_files).await?;
 
         // Update catalog: add new compacted files and remove old files
-        self.update_catalog_for_compaction(&job, &compacted_files, &job.files).await?;
+        self.update_catalog_for_compaction(&job, &compacted_files, &files).await?;
 
         // Calculate results
         let total_output_size: u64 = compacted_files.iter().map(|f| f.size_bytes).sum();
@@ -355,7 +399,7 @@ impl CompactionService {
 
         let result = CompactionResult {
             compacted_files,
-            deleted_files: job.files.clone(),
+            deleted_files: files.clone(),
             total_size_reduction: size_reduction,
             total_rows_compacted: total_output_rows,
         };

@@ -344,10 +344,16 @@ impl CompactionService {
             .await
             .context("failed to create physical plan")?;
 
-        let data = ctx
+        let raw_data = ctx
             .collect(physical_plan)
             .await
             .context("failed to execute compaction")?;
+
+        // gen1 WAL files are stored in ingestion order, not sorted by series key or time.
+        // SortPreservingMergeExec assumes sorted inputs; explicitly sort the collected output
+        // so gen2 files are correctly ordered for pruning and time-range min/max metadata.
+        let data = sort_record_batches(raw_data, &job.sort_key)
+            .context("failed to sort compaction output")?;
 
         // Write compacted data to new files
         let compacted_files = self.write_compacted_files(
@@ -514,11 +520,15 @@ impl CompactionService {
         let min_time = time_array.value(0);
         let max_time = time_array.value(time_array.len() - 1);
 
-        // Ensure the array is sorted (it should be from ReorgPlanner)
+        // Verify monotonic order (each value must be >= previous value)
         for i in 1..time_array.len() {
+            let prev = time_array.value(i - 1);
             let current = time_array.value(i);
-            if current < min_time {
-                return Err(anyhow::anyhow!("Time column is not sorted: found {} after {}", current, min_time));
+            if current < prev {
+                return Err(anyhow::anyhow!(
+                    "Time column is not sorted: found {} after {}",
+                    current, prev
+                ));
             }
         }
 
@@ -681,6 +691,63 @@ impl CompactionService {
             duration_secs
         );
     }
+}
+
+/// Sort a collection of record batches by the given sort key.
+///
+/// gen1 Parquet files are written from WAL flush windows in ingestion order, not sorted
+/// by series key or time. This function concatenates all batches and re-sorts them so
+/// the compacted gen2 output is correctly ordered for file pruning and time metadata.
+fn sort_record_batches(
+    batches: Vec<arrow::record_batch::RecordBatch>,
+    sort_key: &SortKey,
+) -> Result<Vec<arrow::record_batch::RecordBatch>> {
+    if batches.is_empty() {
+        return Ok(batches);
+    }
+
+    let schema = batches[0].schema();
+    let combined = arrow::compute::concat_batches(&schema, &batches)
+        .context("failed to concatenate batches for sort")?;
+
+    if combined.num_rows() == 0 {
+        return Ok(vec![combined]);
+    }
+
+    // Build sort columns from the sort key; skip any columns not present in the schema.
+    let sort_columns: Vec<arrow::compute::SortColumn> = sort_key
+        .iter()
+        .filter_map(|(col_name, opts)| {
+            schema.index_of(col_name).ok().map(|idx| arrow::compute::SortColumn {
+                values: combined.column(idx).clone(),
+                options: Some(arrow::compute::SortOptions {
+                    descending: opts.descending,
+                    nulls_first: opts.nulls_first,
+                }),
+            })
+        })
+        .collect();
+
+    if sort_columns.is_empty() {
+        return Ok(vec![combined]);
+    }
+
+    let indices = arrow::compute::lexsort_to_indices(&sort_columns, None)
+        .context("failed to compute sort indices")?;
+
+    let sorted_arrays: Vec<arrow::array::ArrayRef> = combined
+        .columns()
+        .iter()
+        .map(|arr| {
+            arrow::compute::take(arr.as_ref(), &indices, None)
+                .context("failed to reorder column during sort")
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let sorted = arrow::record_batch::RecordBatch::try_new(schema, sorted_arrays)
+        .context("failed to construct sorted record batch")?;
+
+    Ok(vec![sorted])
 }
 
 #[cfg(test)]

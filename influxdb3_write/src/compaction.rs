@@ -321,13 +321,10 @@ impl CompactionService {
                     job.database_id, job.table_name, existing.len(), self.config.min_files_for_compaction
                 );
                 return Ok(CompactionResult {
-                    database_id: job.database_id,
-                    table_name: job.table_name,
-                    files_compacted: 0,
-                    rows_compacted: 0,
-                    input_size_bytes: 0,
-                    output_size_bytes: 0,
-                    duration_secs: 0.0,
+                    compacted_files: vec![],
+                    deleted_files: vec![],
+                    total_size_reduction: 0,
+                    total_rows_compacted: 0,
                 });
             }
             existing

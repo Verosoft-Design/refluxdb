@@ -473,26 +473,14 @@ impl CompactionService {
         Ok(compacted_files)
     }
 
-    /// Validate that the compacted data is properly sorted
+    /// Validate that the compacted data was written successfully.
+    ///
+    /// Note: after sorting by the full series key (company, site, asset_id, ..., time),
+    /// time is monotonic per-series but NOT globally across files — different asset_ids
+    /// interleave in time. We only verify file count here; min/max metadata is computed
+    /// correctly per-batch by calculate_time_range_from_batch.
     async fn validate_compacted_data(&self, compacted_files: &[ParquetFile]) -> Result<()> {
-        if compacted_files.len() <= 1 {
-            return Ok(());
-        }
-
-        // Check that files are sorted by min_time
-        for i in 1..compacted_files.len() {
-            let prev_file = &compacted_files[i - 1];
-            let curr_file = &compacted_files[i];
-            
-            if curr_file.min_time < prev_file.min_time {
-                return Err(anyhow::anyhow!(
-                    "Compacted files are not sorted by time. File {} (min_time: {}) comes before file {} (min_time: {})",
-                    curr_file.path, curr_file.min_time, prev_file.path, prev_file.min_time
-                ));
-            }
-        }
-
-        info!("Validated {} compacted files are properly sorted by time", compacted_files.len());
+        info!("Compacted into {} output file(s)", compacted_files.len());
         Ok(())
     }
 
@@ -517,20 +505,14 @@ impl CompactionService {
             return Ok((0, 0));
         }
 
-        let min_time = time_array.value(0);
-        let max_time = time_array.value(time_array.len() - 1);
-
-        // Verify monotonic order (each value must be >= previous value)
-        for i in 1..time_array.len() {
-            let prev = time_array.value(i - 1);
-            let current = time_array.value(i);
-            if current < prev {
-                return Err(anyhow::anyhow!(
-                    "Time column is not sorted: found {} after {}",
-                    current, prev
-                ));
-            }
-        }
+        // After sorting by the full series key (asset_id, meter, ..., time), time is monotonic
+        // per-series but NOT globally — rows from ASSET002 (older timestamps) follow ASSET001
+        // (newer timestamps). Compute actual min/max across the whole batch instead of
+        // assuming global monotonicity.
+        let min_time = arrow::compute::min(time_array)
+            .ok_or_else(|| anyhow::anyhow!("Failed to compute min time"))?;
+        let max_time = arrow::compute::max(time_array)
+            .ok_or_else(|| anyhow::anyhow!("Failed to compute max time"))?;
 
         Ok((min_time, max_time))
     }

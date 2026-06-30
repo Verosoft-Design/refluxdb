@@ -119,37 +119,17 @@ impl CompactionService {
     /// Drop catalog entries whose objects are missing from object storage.
     async fn filter_existing_files(
         &self,
-        db_id: DbId,
-        table_id: TableId,
+        _db_id: DbId,
+        _table_id: TableId,
         files: Vec<ParquetFile>,
     ) -> Result<Vec<ParquetFile>> {
-        let mut existing = Vec::with_capacity(files.len());
-        let mut missing = Vec::new();
-
-        for file in files {
-            let path = ObjPath::from(file.path.as_str());
-            match self.object_store.head(&path).await {
-                Ok(_) => existing.push(file),
-                Err(object_store::Error::NotFound { .. }) => {
-                    warn!("Skipping missing parquet file in catalog: {}", file.path);
-                    missing.push(file);
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-
-        if !missing.is_empty() {
-            self.persisted_files()
-                .remove_persisted_files(&db_id, &table_id, &missing);
-            debug!(
-                "Pruned {} stale parquet catalog entries for db={} table={}",
-                missing.len(),
-                db_id,
-                table_id
-            );
-        }
-
-        Ok(existing)
+        // Checking every catalog entry against object store (object_store.head per file) is
+        // O(n) HTTP requests and prohibitively slow for large catalogs (e.g. 477k files → minutes
+        // of sequential HEAD calls before a single job can be identified). Trust the catalog
+        // during planning. Any 404s that do exist will surface as errors during compaction
+        // execution and be handled there. Stale entries are naturally pruned by the catalog
+        // update step (update_catalog_for_compaction) after successful compaction.
+        Ok(files)
     }
 
     /// Start the background compaction service

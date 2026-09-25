@@ -69,6 +69,9 @@ pub struct CompactionResult {
     pub total_rows_compacted: u64,
 }
 
+#[cfg(test)]
+mod drift_tests;
+
 #[derive(Debug)]
 pub struct CompactionService {
     config: CompactionConfig,
@@ -127,9 +130,9 @@ impl CompactionService {
         // Checking every catalog entry against object store (object_store.head per file) is
         // O(n) HTTP requests and prohibitively slow for large catalogs (e.g. 477k files → minutes
         // of sequential HEAD calls before a single job can be identified). Trust the catalog
-        // during planning. Any 404s that do exist will surface as errors during compaction
-        // execution and be handled there. Stale entries are naturally pruned by the catalog
-        // update step (update_catalog_for_compaction) after successful compaction.
+        // during planning. Missing objects and size mismatches (stale entries for overwritten
+        // objects) are detected and pruned per job in execute_compaction_job, which only HEADs
+        // the files of that job.
         Ok(files)
     }
 
@@ -291,29 +294,40 @@ impl CompactionService {
 
         let start_time = std::time::Instant::now();
 
-        // Filter out catalog entries whose objects are missing from object storage (catalog drift).
-        // Done per-job (typically 100s of files) rather than pre-planning (potentially 100k+ files)
-        // so this remains fast even with large catalogs.
+        // Filter out catalog entries that do not describe what is in object storage (catalog
+        // drift): the object is missing, or its size differs from the indexed size (the object was
+        // overwritten after the entry was recorded; reading it with the stale size fails with
+        // "Invalid Parquet file. Corrupt footer"). Done per-job (typically 100s of files) rather
+        // than pre-planning (potentially 100k+ files) so this remains fast even with large catalogs.
         let files = {
             let mut existing = Vec::with_capacity(job.files.len());
-            let mut missing = Vec::new();
+            let mut stale = Vec::new();
             for file in &job.files {
                 let path = ObjPath::from(file.path.as_str());
                 match self.object_store.head(&path).await {
-                    Ok(_) => existing.push(file.clone()),
+                    Ok(meta) if meta.size as u64 == file.size_bytes => existing.push(file.clone()),
+                    Ok(meta) => {
+                        warn!(
+                            "Skipping parquet file whose size does not match the catalog: {} (catalog {} bytes, object store {} bytes)",
+                            file.path, file.size_bytes, meta.size
+                        );
+                        stale.push(file.clone());
+                    }
                     Err(object_store::Error::NotFound { .. }) => {
                         warn!("Skipping missing parquet file in catalog: {}", file.path);
-                        missing.push(file.clone());
+                        stale.push(file.clone());
                     }
                     Err(e) => return Err(e.into()),
                 }
             }
-            if !missing.is_empty() {
+            if !stale.is_empty() {
+                // Removal is by file id, so pruning a stale entry never drops a valid entry that
+                // shares its path.
                 self.persisted_files()
-                    .remove_persisted_files(&job.database_id, &job.table_id, &missing);
+                    .remove_persisted_files(&job.database_id, &job.table_id, &stale);
                 info!(
                     "Pruned {} stale catalog entries for db={} table={}",
-                    missing.len(), job.database_id, job.table_name
+                    stale.len(), job.database_id, job.table_name
                 );
             }
             if existing.len() < self.config.min_files_for_compaction {

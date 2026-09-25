@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinSet;
+use uuid::Uuid;
 
 /// Configuration for the compaction service
 #[derive(Debug, Clone)]
@@ -464,7 +465,7 @@ impl CompactionService {
                 .ok_or_else(|| anyhow::anyhow!("No duration configured for generation {}", job.target_generation))?;
             
             let chunk_time = self.calculate_chunk_time_for_generation(&batch, target_duration);
-            let path = self.generate_file_path(job, job.target_generation, chunk_time, i).await?;
+            let path = self.generate_file_path(job, job.target_generation, chunk_time, i);
 
             // Write the batch to parquet
             let batch_stream = stream_from_batches(schema.as_arrow(), vec![batch.clone()]);
@@ -615,27 +616,21 @@ impl CompactionService {
     }
 
     /// Generate file path for a generation
-    async fn generate_file_path(
+    fn generate_file_path(
         &self,
         job: &CompactionJob,
         generation: u8,
         chunk_time: i64,
         file_index: usize,
-    ) -> Result<ObjPath> {
-        let date_time = DateTime::<Utc>::from_timestamp_nanos(chunk_time);
-        let path = format!(
-            "{}/dbs/{}-{}/{}-{}/gen{}/{}/{}.parquet",
-            self.node_identifier_prefix,
-            job.table_name,
-            job.database_id,
-            job.table_name,
-            job.table_id,
+    ) -> ObjPath {
+        compacted_file_path(
+            &self.node_identifier_prefix,
+            job,
             generation,
-            date_time.format("%Y-%m-%d/%H-%M"),
-            file_index
-        );
-        
-        Ok(ObjPath::from(path))
+            chunk_time,
+            file_index,
+            Uuid::new_v4(),
+        )
     }
 
     /// Update catalog for compaction: add new compacted files and remove old files
@@ -753,6 +748,34 @@ fn sort_record_batches(
     Ok(vec![sorted])
 }
 
+/// Build the object store path for a compacted file.
+///
+/// The file name carries a unique id so that compacting the same time window more than once
+/// (e.g. when late gen1 files arrive for a window that already has a gen2 file) never overwrites
+/// an existing file that the catalog still references with its old size.
+fn compacted_file_path(
+    node_identifier_prefix: &str,
+    job: &CompactionJob,
+    generation: u8,
+    chunk_time: i64,
+    file_index: usize,
+    unique_id: Uuid,
+) -> ObjPath {
+    let date_time = DateTime::<Utc>::from_timestamp_nanos(chunk_time);
+    ObjPath::from(format!(
+        "{}/dbs/{}-{}/{}-{}/gen{}/{}/{}-{}.parquet",
+        node_identifier_prefix,
+        job.table_name,
+        job.database_id,
+        job.table_name,
+        job.table_id,
+        generation,
+        date_time.format("%Y-%m-%d/%H-%M"),
+        file_index,
+        unique_id
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -774,6 +797,34 @@ mod tests {
         // In a real implementation, we would use proper mocking
         assert_eq!(config.max_files_per_run, 100);
         assert_eq!(config.min_files_for_compaction, 10);
+    }
+
+    #[test]
+    fn test_compacted_file_path_is_unique_per_compaction() {
+        let job = CompactionJob {
+            database_id: DbId::from(2),
+            table_id: TableId::from(3),
+            table_name: Arc::from("alarm_event"),
+            source_generation: 1,
+            target_generation: 2,
+            files: vec![],
+            schema: schema::SchemaBuilder::new().timestamp().build().unwrap(),
+            sort_key: SortKey::from_columns(vec!["time"]),
+        };
+        // 2026-09-18T00:00:00Z
+        let chunk_time = 1_789_689_600_000_000_000;
+
+        // Compacting the same window twice must not reuse the path, otherwise the second write
+        // overwrites the first file while the catalog still holds its old size.
+        let first = compacted_file_path("node", &job, 2, chunk_time, 0, Uuid::new_v4());
+        let second = compacted_file_path("node", &job, 2, chunk_time, 0, Uuid::new_v4());
+        assert_ne!(first, second);
+
+        let id = Uuid::nil();
+        assert_eq!(
+            compacted_file_path("node", &job, 2, chunk_time, 0, id).as_ref(),
+            format!("node/dbs/alarm_event-2/alarm_event-3/gen2/2026-09-18/00-00/0-{id}.parquet")
+        );
     }
 
     #[tokio::test]

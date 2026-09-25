@@ -377,17 +377,27 @@ impl CompactionService {
         let data = sort_record_batches(raw_data, &job.sort_key)
             .context("failed to sort compaction output")?;
 
-        // Write compacted data to new files
+        // Write compacted data to new files. On failure this removes whatever it uploaded.
         let compacted_files = self.write_compacted_files(
             &job,
             data,
             &job.schema,
         ).await?;
 
-        // Validate that the compacted data is properly sorted
-        self.validate_compacted_data(&compacted_files).await?;
+        // Validate that the compacted data is properly sorted. The outputs are not referenced by
+        // the index yet, so on failure delete them rather than leaving orphans behind.
+        if let Err(e) = self.validate_compacted_data(&compacted_files).await {
+            let paths: Vec<ObjPath> = compacted_files
+                .iter()
+                .map(|f| ObjPath::from(f.path.as_str()))
+                .collect();
+            self.delete_unreferenced_outputs(&paths).await;
+            return Err(e);
+        }
 
-        // Update catalog: add new compacted files and remove old files
+        // Update catalog: add new compacted files and remove old files. No cleanup on failure
+        // here: the new files are added to the index first, so deleting them could leave the
+        // index pointing at missing objects.
         self.update_catalog_for_compaction(&job, &compacted_files, &files).await?;
 
         // Calculate results
@@ -443,16 +453,42 @@ impl CompactionService {
         Ok(chunks)
     }
 
-    /// Write compacted data to new parquet files
+    /// Write compacted data to new parquet files.
+    ///
+    /// Every output gets a fresh unique name, so a retry never overwrites (reclaims) what a failed
+    /// attempt uploaded. If any step fails, the objects uploaded by this call are therefore
+    /// deleted (best effort) before the original error is returned.
     async fn write_compacted_files(
         &self,
         job: &CompactionJob,
         data: Vec<arrow::record_batch::RecordBatch>,
         schema: &Schema,
     ) -> Result<Vec<ParquetFile>> {
+        let mut uploaded = Vec::new();
+        match self
+            .try_write_compacted_files(job, data, schema, &mut uploaded)
+            .await
+        {
+            Ok(files) => Ok(files),
+            Err(e) => {
+                self.delete_unreferenced_outputs(&uploaded).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Body of [`Self::write_compacted_files`]. Each path is pushed to `uploaded` before its `put`
+    /// is issued, so an upload whose outcome is unknown (e.g. timed out) is cleaned up too.
+    async fn try_write_compacted_files(
+        &self,
+        job: &CompactionJob,
+        data: Vec<arrow::record_batch::RecordBatch>,
+        schema: &Schema,
+        uploaded: &mut Vec<ObjPath>,
+    ) -> Result<Vec<ParquetFile>> {
         let mut compacted_files = Vec::new();
-        
-        for (i, batch) in data.into_iter().enumerate() {
+
+        for batch in data {
             if batch.num_rows() == 0 {
                 continue;
             }
@@ -465,7 +501,7 @@ impl CompactionService {
                 .ok_or_else(|| anyhow::anyhow!("No duration configured for generation {}", job.target_generation))?;
             
             let chunk_time = self.calculate_chunk_time_for_generation(&batch, target_duration);
-            let path = self.generate_file_path(job, job.target_generation, chunk_time, i);
+            let path = self.generate_file_path(job, job.target_generation, chunk_time);
 
             // Write the batch to parquet
             let batch_stream = stream_from_batches(schema.as_arrow(), vec![batch.clone()]);
@@ -474,6 +510,7 @@ impl CompactionService {
                 batch_stream,
             ).await?;
 
+            uploaded.push(path.clone());
             self.object_store
                 .put(&path, parquet_bytes.bytes.clone().into())
                 .await
@@ -493,6 +530,21 @@ impl CompactionService {
         }
 
         Ok(compacted_files)
+    }
+
+    /// Best-effort delete of compaction outputs that the index does not reference, after a
+    /// failed attempt. Failures are logged and otherwise ignored so the caller can return the
+    /// original error.
+    async fn delete_unreferenced_outputs(&self, paths: &[ObjPath]) {
+        for path in paths {
+            match self.object_store.delete(path).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => warn!(
+                    "Failed to delete orphaned compaction output {}: {}",
+                    path, e
+                ),
+            }
+        }
     }
 
     /// Validate that the compacted data was written successfully.
@@ -542,7 +594,7 @@ impl CompactionService {
     /// Get the generation level for a file based on its path
     fn get_file_generation(&self, file: &ParquetFile) -> Result<u8> {
         // Parse generation from file path
-        // Expected format: dbs/{table}-{db_id}/{table}-{table_id}/gen{level}/{YYYY-MM-DD}/{HH-MM}/{file_index}.parquet
+        // Expected format: dbs/{table}-{db_id}/{table}-{table_id}/gen{level}/{YYYY-MM-DD}/{HH-MM}/{uuid}.parquet
         let path = &file.path;
         
         // Look for "gen{level}" in the path
@@ -621,15 +673,13 @@ impl CompactionService {
         job: &CompactionJob,
         generation: u8,
         chunk_time: i64,
-        file_index: usize,
     ) -> ObjPath {
         compacted_file_path(
             &self.node_identifier_prefix,
             job,
             generation,
             chunk_time,
-            file_index,
-            Uuid::new_v4(),
+            Uuid::now_v7(),
         )
     }
 
@@ -750,20 +800,20 @@ fn sort_record_batches(
 
 /// Build the object store path for a compacted file.
 ///
-/// The file name carries a unique id so that compacting the same time window more than once
-/// (e.g. when late gen1 files arrive for a window that already has a gen2 file) never overwrites
-/// an existing file that the catalog still references with its old size.
+/// The file name is a unique id so that compacting the same time window more than once (e.g. when
+/// late gen1 files arrive for a window that already has a gen2 file) never overwrites an existing
+/// file that the catalog still references with its old size. Callers pass a UUID v7: being
+/// time-ordered, files in a window directory list in the order they were written.
 fn compacted_file_path(
     node_identifier_prefix: &str,
     job: &CompactionJob,
     generation: u8,
     chunk_time: i64,
-    file_index: usize,
     unique_id: Uuid,
 ) -> ObjPath {
     let date_time = DateTime::<Utc>::from_timestamp_nanos(chunk_time);
     ObjPath::from(format!(
-        "{}/dbs/{}-{}/{}-{}/gen{}/{}/{}-{}.parquet",
+        "{}/dbs/{}-{}/{}-{}/gen{}/{}/{}.parquet",
         node_identifier_prefix,
         job.table_name,
         job.database_id,
@@ -771,7 +821,6 @@ fn compacted_file_path(
         job.table_id,
         generation,
         date_time.format("%Y-%m-%d/%H-%M"),
-        file_index,
         unique_id
     ))
 }
@@ -800,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compacted_file_path_is_unique_per_compaction() {
+    fn test_compacted_file_path_format() {
         let job = CompactionJob {
             database_id: DbId::from(2),
             table_id: TableId::from(3),
@@ -813,18 +862,411 @@ mod tests {
         };
         // 2026-09-18T00:00:00Z
         let chunk_time = 1_789_689_600_000_000_000;
+        let id = Uuid::now_v7();
+        let path = compacted_file_path("node", &job, 2, chunk_time, id).to_string();
 
-        // Compacting the same window twice must not reuse the path, otherwise the second write
-        // overwrites the first file while the catalog still holds its old size.
-        let first = compacted_file_path("node", &job, 2, chunk_time, 0, Uuid::new_v4());
-        let second = compacted_file_path("node", &job, 2, chunk_time, 0, Uuid::new_v4());
-        assert_ne!(first, second);
+        // The database segment (`dbs/{db}-{db_id}`) is deliberately not asserted here.
+        assert!(path.starts_with("node/dbs/"), "{path}");
+        let (_, rest) = path
+            .split_once("/alarm_event-3/gen2/2026-09-18/00-00/")
+            .unwrap_or_else(|| panic!("unexpected layout: {path}"));
+        let stem = rest
+            .strip_suffix(".parquet")
+            .unwrap_or_else(|| panic!("missing .parquet suffix: {path}"));
+        assert_eq!(Uuid::parse_str(stem).unwrap(), id);
+    }
 
-        let id = Uuid::nil();
+    struct CompactionHarness {
+        object_store: Arc<dyn ObjectStore>,
+        catalog: Arc<Catalog>,
+        write_buffer: Arc<crate::write_buffer::WriteBufferImpl>,
+        service: CompactionService,
+    }
+
+    impl CompactionHarness {
+        const DB: &'static str = "testdb";
+        const TABLE: &'static str = "testtable";
+
+        /// In-memory object store + real `WriteBufferImpl` + `CompactionService` that compacts
+        /// gen1 -> gen2 into 2 minute windows as soon as a single gen1 file exists.
+        async fn new() -> Self {
+            use crate::persister::{DEFAULT_OBJECT_STORE_URL, Persister};
+            use crate::write_buffer::{WriteBufferImpl, WriteBufferImplArgs};
+            use influxdb3_cache::distinct_cache::DistinctCacheProvider;
+            use influxdb3_cache::last_cache::LastCacheProvider;
+            use influxdb3_shutdown::ShutdownManager;
+            use influxdb3_wal::WalConfig;
+            use iox_time::MockProvider;
+            use metric::Registry;
+            use object_store::memory::InMemory;
+
+            // Not `Executor::new_testing()`: that shares a process-wide DedicatedExecutor whose IO
+            // runtime is the tokio runtime of whichever test created it first, so running a
+            // DataFusion plan after that test ends panics with "IO runtime was shut down". A
+            // per-test executor captures this test's runtime for IO instead.
+            let mut runtime_builder = tokio::runtime::Builder::new_current_thread();
+            runtime_builder.enable_time();
+            let executor = Arc::new(Executor::new_with_config_and_executor(
+                iox_query::exec::ExecutorConfig::testing(),
+                executor::DedicatedExecutor::new(
+                    "compaction-test",
+                    runtime_builder,
+                    Arc::new(Registry::default()),
+                ),
+            ));
+
+            let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let time_provider: Arc<dyn TimeProvider> =
+                Arc::new(MockProvider::new(iox_time::Time::from_timestamp_nanos(0)));
+            let catalog = Arc::new(
+                Catalog::new(
+                    "test-host",
+                    Arc::clone(&object_store),
+                    Arc::clone(&time_provider),
+                    Default::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            catalog.create_database(Self::DB).await.unwrap();
+
+            let persister = Arc::new(Persister::new(
+                Arc::clone(&object_store),
+                "test-host",
+                Arc::clone(&time_provider),
+            ));
+            let last_cache = LastCacheProvider::new_from_catalog(Arc::clone(&catalog))
+                .await
+                .unwrap();
+            let distinct_cache = DistinctCacheProvider::new_from_catalog(
+                Arc::clone(&time_provider),
+                Arc::clone(&catalog),
+            )
+            .await
+            .unwrap();
+            let write_buffer = WriteBufferImpl::new(WriteBufferImplArgs {
+                persister,
+                catalog: Arc::clone(&catalog),
+                last_cache,
+                distinct_cache,
+                time_provider: Arc::clone(&time_provider),
+                executor: Arc::clone(&executor),
+                wal_config: WalConfig::test_config(),
+                parquet_cache: None,
+                metric_registry: Arc::new(Registry::default()),
+                snapshotted_wal_files_to_keep: 10,
+                query_file_limit: None,
+                n_snapshots_to_load_on_start: 1,
+                shutdown: ShutdownManager::new_testing().register(),
+                wal_replay_concurrency_limit: None,
+            })
+            .await
+            .unwrap();
+
+            let config = CompactionConfig {
+                enabled: true,
+                interval: Duration::from_secs(1),
+                max_files_per_run: 10,
+                min_files_for_compaction: 1,
+                generation_durations: HashMap::from([
+                    (1, Duration::from_secs(60)),
+                    (2, Duration::from_secs(120)),
+                ]),
+            };
+            let service = CompactionService::new(
+                config,
+                Arc::clone(&catalog),
+                Arc::clone(&write_buffer) as Arc<dyn WriteBuffer>,
+                write_buffer.persisted_files(),
+                executor,
+                // As the server sets it (influxdb3_clap_blocks datafusion config): without this,
+                // iox_query encodes a size hint that plain object stores reject.
+                HashMap::from([(
+                    "iox.hint_known_object_size_to_object_store".to_string(),
+                    false.to_string(),
+                )]),
+                Arc::clone(&object_store),
+                ObjectStoreUrl::parse(DEFAULT_OBJECT_STORE_URL).unwrap(),
+                "test-host",
+                time_provider,
+                ShutdownManager::new_testing().register(),
+            );
+
+            Self {
+                object_store,
+                catalog,
+                write_buffer,
+                service,
+            }
+        }
+
+        /// All files in the index for the test table (empty until the table exists).
+        fn indexed_files(&self) -> Vec<ParquetFile> {
+            let db = self.catalog.db_schema(Self::DB).unwrap();
+            let Some(table) = db.table_definition(Self::TABLE) else {
+                return vec![];
+            };
+            self.write_buffer
+                .persisted_files()
+                .get_files(db.id, table.table_id)
+        }
+
+        fn gen1_file_count(&self) -> usize {
+            self.indexed_files()
+                .iter()
+                .filter(|f| !f.path.contains("/gen"))
+                .count()
+        }
+
+        /// Write line protocol and force it through a snapshot into a new gen1 parquet file.
+        async fn write_gen1(&self, lp: &str) {
+            use data_types::NamespaceName;
+
+            let gen1_before = self.gen1_file_count();
+            self.write_buffer
+                .write_lp(
+                    NamespaceName::new(Self::DB).unwrap(),
+                    lp,
+                    iox_time::Time::from_timestamp_nanos(0),
+                    false,
+                    crate::Precision::Nanosecond,
+                    false,
+                )
+                .await
+                .unwrap();
+            if let Some((snapshot_done, _, _permit)) =
+                self.write_buffer.wal().force_flush_buffer().await
+            {
+                snapshot_done.await.expect("snapshot failed");
+            }
+            for _ in 0..100 {
+                if self.gen1_file_count() > gen1_before {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!("no new gen1 file was persisted");
+        }
+
+        /// Plan and run all compaction jobs through the real service code path.
+        async fn compact(&self) -> Vec<ParquetFile> {
+            let jobs = self.service.identify_compaction_jobs().await.unwrap();
+            assert_eq!(
+                jobs.len(),
+                1,
+                "expected exactly one gen1->gen2 job: {jobs:?}"
+            );
+            let job = jobs.into_iter().next().unwrap();
+            assert_eq!((job.source_generation, job.target_generation), (1, 2));
+            self.service
+                .execute_compaction_job(job)
+                .await
+                .unwrap()
+                .compacted_files
+        }
+
+        /// Every indexed file must exist with exactly the indexed size, and its footer must parse
+        /// to the indexed row count. Then scan all indexed files the way queries do (object
+        /// size taken from the index) and check the total row count.
+        async fn assert_index_readable(&self, expected_rows: u64) {
+            use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+            let files = self.indexed_files();
+            for file in &files {
+                let path = ObjPath::from(file.path.as_str());
+                let meta = self.object_store.head(&path).await.unwrap();
+                assert_eq!(
+                    meta.size as u64, file.size_bytes,
+                    "index size does not match object size for {}",
+                    file.path
+                );
+                let bytes = self
+                    .object_store
+                    .get(&path)
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap();
+                let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
+                    .unwrap_or_else(|e| panic!("unreadable parquet {}: {e}", file.path));
+                assert_eq!(
+                    builder.metadata().file_metadata().num_rows() as u64,
+                    file.row_count,
+                    "row count mismatch for {}",
+                    file.path
+                );
+            }
+
+            let table_def = self
+                .catalog
+                .db_schema(Self::DB)
+                .unwrap()
+                .table_definition(Self::TABLE)
+                .unwrap();
+            let chunks = self
+                .service
+                .create_chunks_from_files(&files, &table_def.schema)
+                .await
+                .unwrap();
+            let plan = ReorgPlanner::new()
+                .compact_plan(
+                    data_types::TableId::new(0),
+                    Arc::clone(&table_def.table_name),
+                    &table_def.schema,
+                    chunks,
+                    table_def.sort_key.clone(),
+                )
+                .unwrap();
+            let ctx = {
+                let mut session_config = self.service.executor.new_session_config();
+                for (key, value) in &self.service.datafusion_config {
+                    session_config = session_config.with_config_option(key, value);
+                }
+                session_config.build()
+            };
+            let physical = ctx.create_physical_plan(&plan).await.unwrap();
+            let batches = ctx.collect(physical).await.unwrap();
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(rows as u64, expected_rows);
+        }
+    }
+
+    /// Regression test: a second gen1->gen2 compaction of a window that already has a gen2 file
+    /// used to reuse the name `gen2/{date}/{HH-MM}/0.parquet`, overwriting the first gen2 file
+    /// while the index kept its old size ("Invalid Parquet file. Corrupt footer" on query).
+    #[tokio::test]
+    async fn test_recompacting_same_window_keeps_all_files_readable() {
+        let h = CompactionHarness::new().await;
+
+        // gen1 data spanning the 2 minute gen2 window starting at t=0 (span must be >= 120s).
+        h.write_gen1(
+            "testtable value=1 10000000000\ntesttable value=2 30000000000\n\
+             testtable value=3 20000000000\ntesttable value=4 40000000000\n\
+             testtable value=5 130000000000",
+        )
+        .await;
+        let first = h.compact().await;
+        assert_eq!(first.len(), 1);
         assert_eq!(
-            compacted_file_path("node", &job, 2, chunk_time, 0, id).as_ref(),
-            format!("node/dbs/alarm_event-2/alarm_event-3/gen2/2026-09-18/00-00/0-{id}.parquet")
+            h.gen1_file_count(),
+            0,
+            "gen1 inputs should be replaced by gen2"
         );
+        h.assert_index_readable(5).await;
+
+        // Late gen1 data for the same window (different row count, so a different file size).
+        h.write_gen1(
+            "testtable value=6 15000000000\ntesttable value=7 25000000000\n\
+             testtable value=8 135000000000",
+        )
+        .await;
+        let second = h.compact().await;
+        assert_eq!(second.len(), 1);
+        assert_eq!(
+            first[0].chunk_time, second[0].chunk_time,
+            "test setup: both compactions must target the same gen2 window"
+        );
+        assert_ne!(
+            first[0].path, second[0].path,
+            "second compaction reused the first path"
+        );
+
+        let indexed = h.indexed_files();
+        let mut paths: Vec<_> = indexed.iter().map(|f| f.path.clone()).collect();
+        paths.sort();
+        let mut expected = vec![first[0].path.clone(), second[0].path.clone()];
+        expected.sort();
+        assert_eq!(
+            paths, expected,
+            "index should hold exactly the two gen2 files"
+        );
+
+        h.assert_index_readable(8).await;
+    }
+
+    /// If writing a later output fails, outputs already uploaded by this attempt are deleted.
+    #[tokio::test]
+    async fn test_failed_compaction_write_deletes_uploaded_outputs() {
+        use arrow::array::{Float64Array, Int64Array, TimestampNanosecondArray};
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+        use futures::TryStreamExt;
+
+        let h = CompactionHarness::new().await;
+        let schema = schema::SchemaBuilder::new()
+            .influx_field("value", schema::InfluxFieldType::Float)
+            .timestamp()
+            .build()
+            .unwrap();
+        let job = CompactionJob {
+            database_id: DbId::from(0),
+            table_id: TableId::from(0),
+            table_name: Arc::from(CompactionHarness::TABLE),
+            source_generation: 1,
+            target_generation: 2,
+            files: vec![],
+            schema: schema.clone(),
+            sort_key: SortKey::from_columns(vec!["time"]),
+        };
+
+        let good_columns = schema
+            .as_arrow()
+            .fields()
+            .iter()
+            .map(|f| match f.name().as_str() {
+                "value" => Arc::new(Float64Array::from(vec![1.0, 2.0])) as arrow::array::ArrayRef,
+                "time" => Arc::new(TimestampNanosecondArray::from(vec![
+                    10_000_000_000,
+                    20_000_000_000,
+                ])),
+                other => panic!("unexpected column {other}"),
+            })
+            .collect();
+        let good = RecordBatch::try_new(schema.as_arrow(), good_columns).unwrap();
+        // A `time` column that is not a timestamp makes the second output fail after the
+        // first one has already been uploaded.
+        let bad = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("value", DataType::Float64, true),
+                Field::new("time", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Float64Array::from(vec![3.0])),
+                Arc::new(Int64Array::from(vec![30_000_000_000])),
+            ],
+        )
+        .unwrap();
+
+        // Sanity check: the good batch alone uploads one object.
+        let ok = h
+            .service
+            .write_compacted_files(&job, vec![good.clone()], &schema)
+            .await
+            .unwrap();
+        assert_eq!(ok.len(), 1);
+        h.service
+            .delete_unreferenced_outputs(&[ObjPath::from(ok[0].path.as_str())])
+            .await;
+
+        let err = h
+            .service
+            .write_compacted_files(&job, vec![good, bad], &schema)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not a timestamp"), "{err:#}");
+
+        let leftover: Vec<_> = h
+            .object_store
+            .list(None)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.location.to_string())
+            .filter(|p| p.contains("/gen2/"))
+            .collect();
+        assert!(leftover.is_empty(), "orphaned outputs left behind: {leftover:?}");
     }
 
     #[tokio::test]

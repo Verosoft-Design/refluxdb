@@ -804,6 +804,54 @@ mod tests {
         assert_eq!(row_count, 30); // 3 files * 10 rows
     }
 
+    /// Files removed at runtime (hard delete or retention) are recorded in the next snapshot's
+    /// `removed_files`, as `QueryableBuffer` does. After a restart they must stay removed, even
+    /// though an older snapshot still lists them. Snapshots used to be folded newest first, so
+    /// the older snapshot's adds were applied after the removal and the files came back.
+    #[tokio::test]
+    async fn test_files_removed_for_deletion_stay_removed_after_restart() {
+        let db_id = DbId::from(0);
+        let kept_table = TableId::from(0);
+        let deleted_table = TableId::from(1);
+
+        let kept_files = build_parquet_files("kept_", 3);
+        let mut snapshot_1 = build_snapshot(kept_files.clone(), 1, 1, 1);
+        for file in build_parquet_files("deleted_", 2) {
+            snapshot_1.add_parquet_file(db_id, deleted_table, file);
+        }
+
+        let persisted_files =
+            PersistedFiles::new_from_persisted_snapshots(vec![snapshot_1.clone()]);
+        persisted_files.delete_table(db_id, deleted_table);
+        let catalog = Arc::new(Catalog::new_in_memory("test").await.unwrap());
+        let removed = persisted_files.remove_files_for_deletion(catalog);
+        assert_eq!(removed.get(&db_id).unwrap().tables[&deleted_table].len(), 2);
+
+        // The next snapshot carries a new file and the runtime removals.
+        let new_file = build_parquet_files("new_", 1);
+        let mut snapshot_2 = build_snapshot(new_file.clone(), 2, 2, 2);
+        snapshot_2.removed_files = removed;
+
+        // Restart: `Persister::load_snapshots` returns the newest snapshot first.
+        let reloaded = PersistedFiles::new_from_persisted_snapshots(vec![snapshot_2, snapshot_1]);
+
+        assert!(reloaded.get_files(db_id, deleted_table).is_empty());
+        let mut kept: Vec<_> = reloaded
+            .get_files(db_id, kept_table)
+            .into_iter()
+            .map(|f| f.id)
+            .collect();
+        kept.sort();
+        let mut expected: Vec<_> = kept_files.iter().chain(&new_file).map(|f| f.id).collect();
+        expected.sort();
+        assert_eq!(kept, expected);
+
+        let (file_count, size_mb, row_count) = reloaded.get_metrics();
+        assert_eq!(file_count, 4);
+        assert_eq!(size_mb, 0.2); // 4 files * 50_000 bytes
+        assert_eq!(row_count, 40); // 4 files * 10 rows
+    }
+
     #[tokio::test]
     async fn test_remove_files_for_deletion_deleted_tables() {
         let parquet_files = build_parquet_files("file_", 3);

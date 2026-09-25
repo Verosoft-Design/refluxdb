@@ -1492,11 +1492,16 @@ mod tests {
         // Get the table_id after the line protocol write creates the table
         let table_id = catalog.db_schema(db_name).unwrap().table_definition(table_name).unwrap().table_id;
         
-        // Wait a bit for the data to be fully persisted
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        
-        // Check if we have any persisted files
-        let files = write_buffer.persisted_files().get_files(db_id, table_id);
+        // Wait for the data to be persisted. Persisting runs in the background, so poll instead
+        // of sleeping a fixed amount (which is flaky when other tests load the machine).
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let files = loop {
+            let files = write_buffer.persisted_files().get_files(db_id, table_id);
+            if !files.is_empty() || std::time::Instant::now() >= deadline {
+                break files;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
         assert!(!files.is_empty(), "Should have persisted files before compaction");
 
         // Set up compaction service

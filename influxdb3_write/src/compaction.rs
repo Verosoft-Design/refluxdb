@@ -307,6 +307,9 @@ impl CompactionService {
                 match self.object_store.head(&path).await {
                     Ok(meta) if meta.size as u64 == file.size_bytes => existing.push(file.clone()),
                     Ok(meta) => {
+                        // Pruning drops the entry, so the object's rows stop being queryable.
+                        // The object itself is left in place; the path logged here is enough
+                        // to re-index or inspect it manually.
                         warn!(
                             "Skipping parquet file whose size does not match the catalog: {} (catalog {} bytes, object store {} bytes)",
                             file.path, file.size_bytes, meta.size
@@ -400,6 +403,8 @@ impl CompactionService {
 
         // Validate that the compacted data is properly sorted. The outputs are not referenced by
         // the index yet, so on failure delete them rather than leaving orphans behind.
+        // validate_compacted_data currently always succeeds; this keeps cleanup correct if it
+        // starts rejecting output.
         if let Err(e) = self.validate_compacted_data(&compacted_files).await {
             let paths: Vec<ObjPath> = compacted_files
                 .iter()
@@ -712,6 +717,9 @@ impl CompactionService {
 
         persisted_files.remove_persisted_files(&job.database_id, &job.table_id, old_files);
 
+        // Objects are deleted by path while the index removed entries by id. This assumes no
+        // other index entry shares an input's path, which holds because gen1 paths carry the WAL
+        // sequence number and compacted paths carry a UUID.
         for file in old_files {
             let path = ObjPath::from(file.path.clone());
             if let Err(e) = self.object_store.delete(&path).await {

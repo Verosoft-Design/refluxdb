@@ -181,7 +181,7 @@ impl SnapshotTracker {
         self.last_snapshot_sequence_number
     }
 
-    fn increment_snapshot_sequence_number(&mut self) -> SnapshotSequenceNumber {
+    pub(crate) fn increment_snapshot_sequence_number(&mut self) -> SnapshotSequenceNumber {
         self.last_snapshot_sequence_number = self.last_snapshot_sequence_number.next();
         self.last_snapshot_sequence_number
     }

@@ -1013,6 +1013,7 @@ pub async fn command(config: Config) -> Result<()> {
             Arc::clone(&catalog),
             Arc::clone(&write_buffer_impl) as Arc<dyn WriteBuffer>,
             Arc::clone(&persisted_files),
+            Arc::clone(&persister),
             Arc::clone(&write_path_executor),
             config.iox_query_datafusion_config.clone().build(),
             Arc::clone(&object_store),

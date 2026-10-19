@@ -653,6 +653,14 @@ impl Wal for WalObjectStore {
             .last_snapshot_sequence_number()
     }
 
+    async fn reserve_next_snapshot_sequence_number(&self) -> SnapshotSequenceNumber {
+        self.flush_buffer
+            .lock()
+            .await
+            .snapshot_tracker
+            .increment_snapshot_sequence_number()
+    }
+
     async fn shutdown(&self) {
         // stop accepting writes
         self.flush_buffer

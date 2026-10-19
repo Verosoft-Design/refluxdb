@@ -220,7 +220,7 @@ impl PersistedSnapshot {
         }
     }
 
-    fn add_parquet_file(
+    pub(crate) fn add_parquet_file(
         &mut self,
         database_id: DbId,
         table_id: TableId,

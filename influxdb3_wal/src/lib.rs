@@ -104,6 +104,9 @@ pub trait Wal: Debug + Send + Sync + 'static {
     /// Returns the last persisted wal file sequence number
     async fn last_snapshot_sequence_number(&self) -> SnapshotSequenceNumber;
 
+    /// Atomically reserves the next snapshot sequence number under the WAL flush lock.
+    async fn reserve_next_snapshot_sequence_number(&self) -> SnapshotSequenceNumber;
+
     /// Stop all writes to the WAL and flush the buffer to a WAL file.
     async fn shutdown(&self);
 

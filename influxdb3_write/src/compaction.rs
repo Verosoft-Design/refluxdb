@@ -1,5 +1,7 @@
+use crate::persister::Persister;
 use crate::write_buffer::persisted_files::PersistedFiles;
-use crate::{ParquetFile, ParquetFileId, WriteBuffer};
+use crate::{ParquetFile, ParquetFileId, PersistedSnapshot, PersistedSnapshotVersion, WriteBuffer};
+use influxdb3_wal::Wal;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use datafusion::execution::object_store::ObjectStoreUrl;
@@ -50,6 +52,7 @@ impl Default for CompactionConfig {
 #[derive(Debug, Clone)]
 pub struct CompactionJob {
     pub database_id: DbId,
+    pub database_name: Arc<str>,
     pub table_id: TableId,
     pub table_name: Arc<str>,
     pub source_generation: u8,
@@ -74,6 +77,7 @@ pub struct CompactionService {
     catalog: Arc<Catalog>,
     write_buffer: Arc<dyn WriteBuffer>,
     persisted_files: Arc<PersistedFiles>,
+    persister: Arc<Persister>,
     executor: Arc<Executor>,
     datafusion_config: HashMap<String, String>,
     object_store: Arc<dyn ObjectStore>,
@@ -89,6 +93,7 @@ impl CompactionService {
         catalog: Arc<Catalog>,
         write_buffer: Arc<dyn WriteBuffer>,
         persisted_files: Arc<PersistedFiles>,
+        persister: Arc<Persister>,
         executor: Arc<Executor>,
         datafusion_config: HashMap<String, String>,
         object_store: Arc<dyn ObjectStore>,
@@ -102,6 +107,7 @@ impl CompactionService {
             catalog,
             write_buffer,
             persisted_files,
+            persister,
             executor,
             datafusion_config,
             object_store,
@@ -254,18 +260,25 @@ impl CompactionService {
                     // Check if we can compact to the next generation
                     if let Some(next_gen) = self.get_next_generation(*current_gen) {
                         if let Some(target_duration) = self.config.generation_durations.get(&next_gen) {
-                            // Check if files span the target duration
-                            if self.can_compact_to_generation(files, *target_duration) {
-                                jobs.push(CompactionJob {
-                                    database_id: db_schema.id,
-                                    table_id: table_def.table_id,
-                                    table_name: Arc::clone(&table_def.table_name),
-                                    source_generation: *current_gen,
-                                    target_generation: next_gen,
-                                    files: files.clone(),
-                                    schema: table_def.schema.clone(),
-                                    sort_key: table_def.sort_key.clone(),
-                                });
+                            for batch in group_files_by_time_window(
+                                files,
+                                *target_duration,
+                                self.config.min_files_for_compaction,
+                                self.config.max_files_per_run,
+                            ) {
+                                if self.can_compact_to_generation(&batch, *target_duration) {
+                                    jobs.push(CompactionJob {
+                                        database_id: db_schema.id,
+                                        database_name: Arc::clone(&db_schema.name),
+                                        table_id: table_def.table_id,
+                                        table_name: Arc::clone(&table_def.table_name),
+                                        source_generation: *current_gen,
+                                        target_generation: next_gen,
+                                        files: batch,
+                                        schema: table_def.schema.clone(),
+                                        sort_key: table_def.sort_key.clone(),
+                                    });
+                                }
                             }
                         }
                     }
@@ -626,7 +639,7 @@ impl CompactionService {
         let path = format!(
             "{}/dbs/{}-{}/{}-{}/gen{}/{}/{}.parquet",
             self.node_identifier_prefix,
-            job.table_name,
+            job.database_name,
             job.database_id,
             job.table_name,
             job.table_id,
@@ -638,19 +651,50 @@ impl CompactionService {
         Ok(ObjPath::from(path))
     }
 
-    /// Update catalog for compaction: add new compacted files and remove old files
+    /// Update catalog for compaction: persist snapshot, then update catalog and remove old files.
     async fn update_catalog_for_compaction(
         &self,
         job: &CompactionJob,
         new_files: &[ParquetFile],
         old_files: &[ParquetFile],
     ) -> Result<()> {
-        let persisted_files = self.persisted_files();
+        let wal = self.write_buffer.wal();
+        let snapshot_sequence_number = wal.reserve_next_snapshot_sequence_number().await;
+        let wal_file_sequence_number = wal.last_wal_sequence_number().await;
+        let mut snapshot = PersistedSnapshot::new(
+            self.node_identifier_prefix.clone(),
+            snapshot_sequence_number,
+            wal_file_sequence_number,
+            self.catalog.sequence_number(),
+        );
+        for file in new_files {
+            snapshot.add_parquet_file(job.database_id, job.table_id, file.clone());
+        }
+        snapshot
+            .removed_files
+            .entry(job.database_id)
+            .or_default()
+            .tables
+            .entry(job.table_id)
+            .or_default()
+            .extend(old_files.iter().cloned());
 
+        // Persist snapshot before mutating catalog or deleting old parquet objects.
+        let persisted_snapshot = PersistedSnapshotVersion::V1(snapshot);
+        loop {
+            match self.persister.persist_snapshot(&persisted_snapshot).await {
+                Ok(_) => break,
+                Err(e) => {
+                    error!(%e, "Error persisting compaction snapshot, sleeping and retrying...");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+
+        let persisted_files = self.persisted_files();
         for file in new_files {
             persisted_files.add_persisted_file(&job.database_id, &job.table_id, file);
         }
-
         persisted_files.remove_persisted_files(&job.database_id, &job.table_id, old_files);
 
         for file in old_files {
@@ -694,6 +738,46 @@ impl CompactionService {
             duration_secs
         );
     }
+}
+
+/// Group source files into time-aligned windows and cap batch size per compaction job.
+fn group_files_by_time_window(
+    files: &[ParquetFile],
+    window: Duration,
+    min_files: usize,
+    max_files: usize,
+) -> Vec<Vec<ParquetFile>> {
+    let window_nanos = window.as_nanos() as i64;
+    if window_nanos <= 0 || files.len() < min_files {
+        return Vec::new();
+    }
+
+    let mut by_window: BTreeMap<i64, Vec<ParquetFile>> = BTreeMap::new();
+    for file in files {
+        let window_start = (file.min_time / window_nanos) * window_nanos;
+        by_window
+            .entry(window_start)
+            .or_default()
+            .push(file.clone());
+    }
+
+    let mut batches = Vec::new();
+    for mut group in by_window.into_values() {
+        if group.len() < min_files {
+            continue;
+        }
+        while group.len() >= min_files {
+            let take = group.len().min(max_files);
+            let batch: Vec<_> = group.drain(..take).collect();
+            if batch.len() >= min_files {
+                batches.push(batch);
+            }
+            if group.len() < min_files {
+                break;
+            }
+        }
+    }
+    batches
 }
 
 /// Sort a collection of record batches by the given sort key.
@@ -1011,6 +1095,7 @@ mod tests {
             Arc::clone(&catalog),
             write_buffer.clone(),
             write_buffer.persisted_files(),
+            Arc::clone(&persister),
             Arc::new(Executor::new_testing()),
             HashMap::new(),
             Arc::clone(&object_store),

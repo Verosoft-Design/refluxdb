@@ -181,6 +181,16 @@ impl SnapshotTracker {
         self.last_snapshot_sequence_number
     }
 
+    /// Moves the last [`SnapshotSequenceNumber`] up to `snapshot_sequence_number` if it is behind.
+    pub(crate) fn raise_snapshot_sequence_number(
+        &mut self,
+        snapshot_sequence_number: SnapshotSequenceNumber,
+    ) {
+        self.last_snapshot_sequence_number = self
+            .last_snapshot_sequence_number
+            .max(snapshot_sequence_number);
+    }
+
     pub(crate) fn increment_snapshot_sequence_number(&mut self) -> SnapshotSequenceNumber {
         self.last_snapshot_sequence_number = self.last_snapshot_sequence_number.next();
         self.last_snapshot_sequence_number

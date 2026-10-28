@@ -12,6 +12,7 @@ use influxdb3_catalog::catalog::Catalog;
 use influxdb3_id::TableId;
 use influxdb3_id::{DbId, SerdeVecMap};
 use influxdb3_telemetry::ParquetMetrics;
+use influxdb3_wal::WalFileSequenceNumber;
 use observability_deps::tracing::warn;
 use parking_lot::RwLock;
 
@@ -65,6 +66,29 @@ impl PersistedFiles {
         Self {
             inner: RwLock::new(inner),
         }
+    }
+
+    /// The WAL number of the newest completed data snapshot: every WAL file up to it is in
+    /// parquet (or held nothing to persist), and the ones after it exist only in the WAL. Startup
+    /// replays the WAL after the newest snapshot's number, so a snapshot that persists no WAL data
+    /// (a compaction's) must record this number, never a later one. `None` until a snapshot exists.
+    pub fn last_persisted_wal_sequence_number(&self) -> Option<WalFileSequenceNumber> {
+        self.inner.read().last_persisted_wal_sequence_number
+    }
+
+    /// Record that a data snapshot covering the WAL up to `wal_file_sequence_number` completed.
+    /// The number never moves backwards.
+    pub fn set_last_persisted_wal_sequence_number(
+        &self,
+        wal_file_sequence_number: WalFileSequenceNumber,
+    ) {
+        let mut inner = self.inner.write();
+        let last = inner
+            .last_persisted_wal_sequence_number
+            .map_or(wal_file_sequence_number, |n| {
+                n.max(wal_file_sequence_number)
+            });
+        inner.last_persisted_wal_sequence_number = Some(last);
     }
 
     /// Add all files from a persisted snapshot
@@ -275,6 +299,8 @@ struct Inner {
     pub parquet_files_row_count: u64,
     /// Data that are marked for deletion.
     pub deleted_data: HashMap<DbId, DeletedTables>,
+    /// See [`PersistedFiles::last_persisted_wal_sequence_number`].
+    pub last_persisted_wal_sequence_number: Option<WalFileSequenceNumber>,
 }
 
 impl Inner {
@@ -291,6 +317,10 @@ impl Inner {
     ) -> Self {
         let mut tables: HashMap<(DbId, TableId), TableLoader> = HashMap::new();
         let mut collapsed_duplicates = 0_u64;
+        // The WAL replay on startup starts after this snapshot's number (see `WriteBufferImpl::new`).
+        let last_persisted_wal_sequence_number = persisted_snapshots
+            .first()
+            .map(|s| s.wal_file_sequence_number);
 
         for persisted_snapshot in persisted_snapshots.into_iter().rev() {
             for (db_id, db_tables) in persisted_snapshot.databases {
@@ -337,6 +367,7 @@ impl Inner {
                 .insert(table_id, files);
         }
         inner.parquet_files_size_mb = as_mb(size_bytes);
+        inner.last_persisted_wal_sequence_number = last_persisted_wal_sequence_number;
         inner
     }
 
@@ -1085,5 +1116,36 @@ mod tests {
         files.sort_by_key(|f| f.id);
         assert_eq!(files, vec![kept, replacement]);
         assert_metrics(&persisted_files, 2, 100 + 310, 1 + 4);
+    }
+
+    /// The WAL replay on startup starts after the newest snapshot's number, so that is where the
+    /// index starts; later snapshots only move it forward.
+    #[test]
+    fn test_last_persisted_wal_sequence_number_starts_at_newest_and_never_moves_back() {
+        assert_eq!(
+            PersistedFiles::new().last_persisted_wal_sequence_number(),
+            None
+        );
+
+        let persisted_files = PersistedFiles::new_from_persisted_snapshots(vec![
+            build_snapshot(vec![], 3, 7, 3),
+            build_snapshot(vec![], 2, 5, 2),
+        ]);
+        assert_eq!(
+            persisted_files.last_persisted_wal_sequence_number(),
+            Some(WalFileSequenceNumber::new(7))
+        );
+
+        persisted_files.set_last_persisted_wal_sequence_number(WalFileSequenceNumber::new(6));
+        assert_eq!(
+            persisted_files.last_persisted_wal_sequence_number(),
+            Some(WalFileSequenceNumber::new(7))
+        );
+
+        persisted_files.set_last_persisted_wal_sequence_number(WalFileSequenceNumber::new(9));
+        assert_eq!(
+            persisted_files.last_persisted_wal_sequence_number(),
+            Some(WalFileSequenceNumber::new(9))
+        );
     }
 }

@@ -219,7 +219,8 @@ impl CompactionService {
     /// Identify files that need compaction
     async fn identify_compaction_jobs(&self) -> Result<Vec<CompactionJob>> {
         let mut jobs = Vec::new();
-        
+        let now = self.time_provider.now().timestamp_nanos();
+
         // Get all databases and tables
         let databases = self.catalog.list_db_schema();
         
@@ -269,7 +270,7 @@ impl CompactionService {
                                 self.config.min_files_for_compaction,
                                 self.config.max_files_per_run,
                             ) {
-                                if self.can_compact_to_generation(&batch, *target_duration) {
+                                if window_has_ended(&batch, *target_duration, now) {
                                     jobs.push(CompactionJob {
                                         database_id: db_schema.id,
                                         database_name: Arc::clone(&db_schema.name),
@@ -657,20 +658,6 @@ impl CompactionService {
         }
     }
 
-    /// Check if files can be compacted to the target generation
-    fn can_compact_to_generation(&self, files: &[ParquetFile], target_duration: Duration) -> bool {
-        if files.len() < self.config.min_files_for_compaction {
-            return false;
-        }
-
-        // Check if files span the target duration
-        let min_time = files.iter().map(|f| f.min_time).min().unwrap_or(0);
-        let max_time = files.iter().map(|f| f.max_time).max().unwrap_or(0);
-        let span_duration = Duration::from_nanos((max_time - min_time) as u64);
-        
-        span_duration >= target_duration
-    }
-
     /// Calculate chunk time for a generation based on the batch data and target duration
     fn calculate_chunk_time_for_generation(
         &self,
@@ -723,7 +710,18 @@ impl CompactionService {
     ) -> Result<()> {
         let wal = self.write_buffer.wal();
         let snapshot_sequence_number = wal.reserve_next_snapshot_sequence_number().await;
-        let wal_file_sequence_number = wal.last_wal_sequence_number().await;
+        // A data snapshot with a lower sequence number may still be writing its files; it holds
+        // the WAL's snapshot permit until it is done. Wait for it, so that this snapshot records
+        // its WAL number and a `next_file_id` above its file ids. The number is reserved first
+        // because a flush that starts a snapshot waits for this permit while holding the WAL lock.
+        let snapshot_permit = wal.acquire_snapshot_permit().await;
+        // This snapshot becomes the newest, and startup replays the WAL after its
+        // `wal_file_sequence_number`. It persists no WAL data, so it carries the number of the last
+        // snapshot that did: the last WAL file written would skip rows that exist only in the WAL.
+        let wal_file_sequence_number = self
+            .persisted_files()
+            .last_persisted_wal_sequence_number()
+            .unwrap_or_default();
         let mut snapshot = PersistedSnapshot::new(
             self.node_identifier_prefix.clone(),
             snapshot_sequence_number,
@@ -741,6 +739,11 @@ impl CompactionService {
             .entry(job.table_id)
             .or_default()
             .extend(old_files.iter().cloned());
+        // Release the permit before the upload, which retries until it succeeds: a flush that
+        // starts a data snapshot waits for it while holding the WAL lock, and so does every write.
+        // A data snapshot that starts now gets a higher number than this one, so it is newer
+        // whichever of the two is written first.
+        drop(snapshot_permit);
 
         // Persist snapshot before mutating catalog or deleting old parquet objects.
         let persisted_snapshot = PersistedSnapshotVersion::V1(snapshot);
@@ -844,6 +847,22 @@ fn group_files_by_time_window(
         }
     }
     batches
+}
+
+/// Whether the window that `batch` was grouped into (see [`group_files_by_time_window`]) has
+/// ended at `now`. A window is compacted once it has ended, not once its files span it: files
+/// are grouped by `min_time`, so a window of shorter source files (e.g. a day of 10 minute gen1
+/// files) never spans the whole window.
+fn window_has_ended(batch: &[ParquetFile], window: Duration, now: i64) -> bool {
+    let window_nanos = window.as_nanos() as i64;
+    let Some(min_time) = batch.iter().map(|f| f.min_time).min() else {
+        return false;
+    };
+    if window_nanos <= 0 {
+        return false;
+    }
+    let window_start = (min_time / window_nanos) * window_nanos;
+    window_start.saturating_add(window_nanos) <= now
 }
 
 /// Sort a collection of record batches by the given sort key.
@@ -982,10 +1001,23 @@ mod tests {
         assert_eq!(Uuid::parse_str(stem).unwrap(), id);
     }
 
+    use crate::persister::{DEFAULT_OBJECT_STORE_URL, Persister};
+    use crate::write_buffer::{WriteBufferImpl, WriteBufferImplArgs};
+    use influxdb3_cache::distinct_cache::DistinctCacheProvider;
+    use influxdb3_cache::last_cache::LastCacheProvider;
+    use influxdb3_shutdown::ShutdownManager;
+    use influxdb3_wal::WalConfig;
+    use iox_time::MockProvider;
+    use metric::Registry;
+    use object_store::memory::InMemory;
+
     struct CompactionHarness {
         object_store: Arc<dyn ObjectStore>,
         catalog: Arc<Catalog>,
-        write_buffer: Arc<crate::write_buffer::WriteBufferImpl>,
+        persister: Arc<Persister>,
+        time: Arc<MockProvider>,
+        executor: Arc<Executor>,
+        write_buffer: Arc<WriteBufferImpl>,
         service: CompactionService,
     }
 
@@ -994,18 +1026,33 @@ mod tests {
         const TABLE: &'static str = "testtable";
 
         /// In-memory object store + real `WriteBufferImpl` + `CompactionService` that compacts
-        /// gen1 -> gen2 into 2 minute windows as soon as a single gen1 file exists.
+        /// gen1 -> gen2 into 2 minute windows once a window has ended and holds a gen1 file.
+        /// The clock starts at 0; move it with [`Self::set_now`].
         async fn new() -> Self {
-            use crate::persister::{DEFAULT_OBJECT_STORE_URL, Persister};
-            use crate::write_buffer::{WriteBufferImpl, WriteBufferImplArgs};
-            use influxdb3_cache::distinct_cache::DistinctCacheProvider;
-            use influxdb3_cache::last_cache::LastCacheProvider;
-            use influxdb3_shutdown::ShutdownManager;
-            use influxdb3_wal::WalConfig;
-            use iox_time::MockProvider;
-            use metric::Registry;
-            use object_store::memory::InMemory;
+            Self::with_object_store(Arc::new(InMemory::new())).await
+        }
 
+        /// Like [`Self::new`], on the given object store.
+        async fn with_object_store(object_store: Arc<dyn ObjectStore>) -> Self {
+            let config = CompactionConfig {
+                enabled: true,
+                interval: Duration::from_secs(1),
+                max_files_per_run: 10,
+                min_files_for_compaction: 1,
+                generation_durations: HashMap::from([
+                    (1, Duration::from_secs(60)),
+                    (2, Duration::from_secs(120)),
+                ]),
+            };
+            Self::build(object_store, config).await
+        }
+
+        /// Like [`Self::new`], with the given compaction config.
+        async fn with_config(config: CompactionConfig) -> Self {
+            Self::build(Arc::new(InMemory::new()), config).await
+        }
+
+        async fn build(object_store: Arc<dyn ObjectStore>, config: CompactionConfig) -> Self {
             // Not `Executor::new_testing()`: that shares a process-wide DedicatedExecutor whose IO
             // runtime is the tokio runtime of whichever test created it first, so running a
             // DataFusion plan after that test ends panics with "IO runtime was shut down". A
@@ -1021,9 +1068,8 @@ mod tests {
                 ),
             ));
 
-            let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-            let time_provider: Arc<dyn TimeProvider> =
-                Arc::new(MockProvider::new(iox_time::Time::from_timestamp_nanos(0)));
+            let time = Arc::new(MockProvider::new(iox_time::Time::from_timestamp_nanos(0)));
+            let time_provider: Arc<dyn TimeProvider> = Arc::clone(&time) as _;
             let catalog = Arc::new(
                 Catalog::new(
                     "test-host",
@@ -1041,51 +1087,16 @@ mod tests {
                 "test-host",
                 Arc::clone(&time_provider),
             ));
-            let last_cache = LastCacheProvider::new_from_catalog(Arc::clone(&catalog))
-                .await
-                .unwrap();
-            let distinct_cache = DistinctCacheProvider::new_from_catalog(
-                Arc::clone(&time_provider),
-                Arc::clone(&catalog),
-            )
-            .await
-            .unwrap();
-            let write_buffer = WriteBufferImpl::new(WriteBufferImplArgs {
-                persister: Arc::clone(&persister),
-                catalog: Arc::clone(&catalog),
-                last_cache,
-                distinct_cache,
-                time_provider: Arc::clone(&time_provider),
-                executor: Arc::clone(&executor),
-                wal_config: WalConfig::test_config(),
-                parquet_cache: None,
-                metric_registry: Arc::new(Registry::default()),
-                snapshotted_wal_files_to_keep: 10,
-                query_file_limit: None,
-                n_snapshots_to_load_on_start: 1,
-                shutdown: ShutdownManager::new_testing().register(),
-                wal_replay_concurrency_limit: None,
-            })
-            .await
-            .unwrap();
+            let write_buffer =
+                Self::start_write_buffer(&persister, &catalog, &time_provider, &executor).await;
 
-            let config = CompactionConfig {
-                enabled: true,
-                interval: Duration::from_secs(1),
-                max_files_per_run: 10,
-                min_files_for_compaction: 1,
-                generation_durations: HashMap::from([
-                    (1, Duration::from_secs(60)),
-                    (2, Duration::from_secs(120)),
-                ]),
-            };
             let service = CompactionService::new(
                 config,
                 Arc::clone(&catalog),
                 Arc::clone(&write_buffer) as Arc<dyn WriteBuffer>,
                 write_buffer.persisted_files(),
-                persister,
-                executor,
+                Arc::clone(&persister),
+                Arc::clone(&executor),
                 // As the server sets it (influxdb3_clap_blocks datafusion config): without this,
                 // iox_query encodes a size hint that plain object stores reject.
                 HashMap::from([(
@@ -1102,8 +1113,86 @@ mod tests {
             Self {
                 object_store,
                 catalog,
+                persister,
+                time,
+                executor,
                 write_buffer,
                 service,
+            }
+        }
+
+        /// Build a write buffer the way the server does on startup: load the newest snapshot,
+        /// then replay the WAL files after its `wal_file_sequence_number`.
+        async fn start_write_buffer(
+            persister: &Arc<Persister>,
+            catalog: &Arc<Catalog>,
+            time_provider: &Arc<dyn TimeProvider>,
+            executor: &Arc<Executor>,
+        ) -> Arc<WriteBufferImpl> {
+            let last_cache = LastCacheProvider::new_from_catalog(Arc::clone(catalog))
+                .await
+                .unwrap();
+            let distinct_cache = DistinctCacheProvider::new_from_catalog(
+                Arc::clone(time_provider),
+                Arc::clone(catalog),
+            )
+            .await
+            .unwrap();
+            WriteBufferImpl::new(WriteBufferImplArgs {
+                persister: Arc::clone(persister),
+                catalog: Arc::clone(catalog),
+                last_cache,
+                distinct_cache,
+                time_provider: Arc::clone(time_provider),
+                executor: Arc::clone(executor),
+                wal_config: WalConfig::test_config(),
+                parquet_cache: None,
+                metric_registry: Arc::new(Registry::default()),
+                snapshotted_wal_files_to_keep: 10,
+                query_file_limit: None,
+                n_snapshots_to_load_on_start: 1,
+                shutdown: ShutdownManager::new_testing().register(),
+                wal_replay_concurrency_limit: None,
+            })
+            .await
+            .unwrap()
+        }
+
+        /// Start a second server on the same object store, as a pod restart does. Returns its
+        /// catalog and write buffer once the WAL replay has finished.
+        ///
+        /// The original write buffer keeps running, so don't write to it afterwards: both WALs
+        /// would try to create the same WAL file. Starting a write buffer also resets the
+        /// process-wide parquet file id counter to the newest snapshot's `next_file_id`.
+        async fn restart(&self) -> (Arc<Catalog>, Arc<WriteBufferImpl>) {
+            let time_provider: Arc<dyn TimeProvider> = Arc::clone(&self.time) as _;
+            let catalog = Arc::new(
+                Catalog::new(
+                    "test-host",
+                    Arc::clone(&self.object_store),
+                    Arc::clone(&time_provider),
+                    Default::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            let write_buffer =
+                Self::start_write_buffer(&self.persister, &catalog, &time_provider, &self.executor)
+                    .await;
+            (catalog, write_buffer)
+        }
+
+        fn set_now(&self, since_epoch: Duration) {
+            let nanos = since_epoch.as_nanos() as i64;
+            self.time.set(iox_time::Time::from_timestamp_nanos(nanos));
+        }
+
+        /// The newest persisted snapshot: startup replays the WAL after its
+        /// `wal_file_sequence_number`.
+        async fn newest_snapshot(&self) -> PersistedSnapshot {
+            let snapshots = self.persister.load_snapshots(1).await.unwrap();
+            match snapshots.into_iter().next().expect("no snapshot persisted") {
+                PersistedSnapshotVersion::V1(snapshot) => snapshot,
             }
         }
 
@@ -1153,6 +1242,61 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             panic!("no new gen1 file was persisted");
+        }
+
+        /// Index `count` gen1 files of 10 minutes each from `start`, one per gen1 chunk, without
+        /// writing their objects: planning only reads the index. The table must exist. Returns
+        /// their paths.
+        fn index_ten_minute_gen1_files(&self, start: i64, count: i64) -> Vec<String> {
+            const TEN_MINUTES: i64 = 600_000_000_000;
+
+            let db = self.catalog.db_schema(Self::DB).unwrap();
+            let table_id = db.table_definition(Self::TABLE).unwrap().table_id;
+            let persisted_files = self.write_buffer.persisted_files();
+            (0..count)
+                .map(|i| {
+                    let min_time = start + i * TEN_MINUTES;
+                    let file = ParquetFile {
+                        // Not `ParquetFileId::new()`: that advances the process-wide counter
+                        // that other tests assert on. One id per 10 minute slot is unique.
+                        id: ParquetFileId::from((min_time / TEN_MINUTES) as u64),
+                        path: format!(
+                            "test-host/dbs/{}-{}/{}-{}/{}/{:010}.parquet",
+                            Self::DB,
+                            db.id,
+                            Self::TABLE,
+                            table_id,
+                            DateTime::<Utc>::from_timestamp_nanos(min_time)
+                                .format("%Y-%m-%d/%H-%M"),
+                            i
+                        ),
+                        size_bytes: 100,
+                        row_count: 1,
+                        chunk_time: min_time,
+                        min_time,
+                        max_time: min_time + TEN_MINUTES - 1,
+                    };
+                    persisted_files.add_persisted_file(&db.id, &table_id, &file);
+                    file.path
+                })
+                .collect()
+        }
+
+        /// Write line protocol that only reaches the WAL: no snapshot persists it.
+        async fn write_wal_only(&self, lp: &str) {
+            use data_types::NamespaceName;
+
+            self.write_buffer
+                .write_lp(
+                    NamespaceName::new(Self::DB).unwrap(),
+                    lp,
+                    iox_time::Time::from_timestamp_nanos(0),
+                    false,
+                    crate::Precision::Nanosecond,
+                    false,
+                )
+                .await
+                .unwrap();
         }
 
         /// Plan and run all compaction jobs through the real service code path.
@@ -1245,8 +1389,10 @@ mod tests {
     #[tokio::test]
     async fn test_recompacting_same_window_keeps_all_files_readable() {
         let h = CompactionHarness::new().await;
+        // Both compactions below target the 2 minute gen2 window starting at t=0, which has ended.
+        h.set_now(Duration::from_secs(120));
 
-        // gen1 data spanning the 2 minute gen2 window starting at t=0 (span must be >= 120s).
+        // gen1 data for the 2 minute gen2 window starting at t=0.
         h.write_gen1(
             "testtable value=1 10000000000\ntesttable value=2 30000000000\n\
              testtable value=3 20000000000\ntesttable value=4 40000000000\n\
@@ -1290,6 +1436,338 @@ mod tests {
         );
 
         h.assert_index_readable(8).await;
+    }
+
+    /// Regression test (TAG-2495): a gen1 file covers at most one gen1 chunk, so the files grouped
+    /// into one target window never span the whole window. Compaction used to wait for that span
+    /// and never ran; it must start once the window has ended.
+    #[tokio::test]
+    async fn test_window_of_short_gen1_files_compacts_once_it_has_ended() {
+        let h = CompactionHarness::new().await;
+
+        // Three gen1 files in the 2 minute window [0s, 120s), together spanning only 40s.
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 30000000000").await;
+        h.write_gen1("testtable value=3 50000000000").await;
+        assert_eq!(h.gen1_file_count(), 3);
+
+        h.set_now(Duration::from_secs(119));
+        let open = h.service.identify_compaction_jobs().await.unwrap();
+        assert!(open.is_empty(), "the window has not ended yet: {open:?}");
+
+        h.set_now(Duration::from_secs(120));
+        let compacted = h.compact().await;
+        assert_eq!(compacted.len(), 1);
+        assert_eq!(
+            h.gen1_file_count(),
+            0,
+            "gen1 inputs should be replaced by gen2"
+        );
+        h.assert_index_readable(3).await;
+    }
+
+    /// 2026-09-18T00:00:00Z
+    const DAY_START: i64 = 1_789_689_600_000_000_000;
+    const ONE_DAY: i64 = 86_400_000_000_000;
+
+    /// gen1 -> gen2 into 1 day windows from 10 minute gen1 files, at least 10 files a job, as on
+    /// tagmobi-dev, with room for a whole day of gen1 files in one job.
+    fn daily_gen2_config() -> CompactionConfig {
+        CompactionConfig {
+            enabled: true,
+            interval: Duration::from_secs(1),
+            max_files_per_run: 200,
+            min_files_for_compaction: 10,
+            generation_durations: HashMap::from([
+                (1, Duration::from_secs(600)),
+                (2, Duration::from_secs(86_400)),
+            ]),
+        }
+    }
+
+    /// Regression test (TAG-2495), the case from the issue: a day of 10 minute gen1 files never
+    /// spans the day (the last one ends at 23:59:59.999...), so no job was ever planned. The day
+    /// is one job once it has ended, and none while it is open.
+    #[tokio::test]
+    async fn test_day_of_ten_minute_gen1_files_compacts_once_the_day_has_ended() {
+        let h = CompactionHarness::with_config(daily_gen2_config()).await;
+        h.write_wal_only("testtable value=1 0").await;
+        let mut day = h.index_ten_minute_gen1_files(DAY_START, 144);
+
+        h.set_now(Duration::from_nanos((DAY_START + ONE_DAY - 1) as u64));
+        let open = h.service.identify_compaction_jobs().await.unwrap();
+        assert!(
+            open.is_empty(),
+            "the day has not ended yet: {} jobs",
+            open.len()
+        );
+
+        h.set_now(Duration::from_nanos((DAY_START + ONE_DAY) as u64));
+        let jobs = h.service.identify_compaction_jobs().await.unwrap();
+        assert_eq!(jobs.len(), 1, "expected one job for the ended day");
+        assert_eq!(
+            (jobs[0].source_generation, jobs[0].target_generation),
+            (1, 2)
+        );
+        let mut planned: Vec<_> = jobs[0].files.iter().map(|f| f.path.clone()).collect();
+        planned.sort();
+        day.sort();
+        assert_eq!(planned, day);
+    }
+
+    /// An ended window is compacted only once it holds `min_files_for_compaction` source files.
+    #[tokio::test]
+    async fn test_ended_window_with_too_few_files_is_not_compacted() {
+        let h = CompactionHarness::with_config(daily_gen2_config()).await;
+        h.write_wal_only("testtable value=1 0").await;
+        h.index_ten_minute_gen1_files(DAY_START - ONE_DAY, 9);
+        let mut day = h.index_ten_minute_gen1_files(DAY_START, 144);
+
+        // Both days have ended; only the one with at least 10 files is compacted.
+        h.set_now(Duration::from_nanos((DAY_START + ONE_DAY) as u64));
+        let jobs = h.service.identify_compaction_jobs().await.unwrap();
+        assert_eq!(
+            jobs.len(),
+            1,
+            "expected one job, for the day with 144 files"
+        );
+        let mut planned: Vec<_> = jobs[0].files.iter().map(|f| f.path.clone()).collect();
+        planned.sort();
+        day.sort();
+        assert_eq!(planned, day);
+    }
+
+    /// Regression test (TAG-2495): startup replays the WAL after the newest snapshot's
+    /// `wal_file_sequence_number`. The compaction snapshot used to record the last WAL file
+    /// written there, so a restart after a compaction skipped the WAL files that had not been
+    /// persisted yet, and their rows were gone.
+    #[tokio::test]
+    async fn test_restart_after_compaction_replays_unpersisted_wal() {
+        let h = CompactionHarness::new().await;
+        // One gen1 file spanning the whole window, so this test does not depend on the
+        // window-has-ended fix above.
+        h.write_gen1("testtable value=1 10000000000\ntesttable value=2 130000000000")
+            .await;
+        let persisted_wal = h.newest_snapshot().await.wal_file_sequence_number;
+
+        h.write_wal_only("testtable value=3 140000000000").await;
+        assert!(
+            h.write_buffer.wal().last_wal_sequence_number().await > persisted_wal,
+            "test setup: the WAL must hold a file the snapshot did not persist"
+        );
+
+        h.set_now(Duration::from_secs(120));
+        h.compact().await;
+        let compaction_snapshot = h.newest_snapshot().await;
+        assert!(
+            !compaction_snapshot.removed_files.is_empty(),
+            "test setup: the newest snapshot should be the compaction's"
+        );
+        assert_eq!(
+            compaction_snapshot.wal_file_sequence_number, persisted_wal,
+            "the compaction snapshot moved the WAL replay start past an unpersisted WAL file"
+        );
+
+        // A restart must replay value=3 from the WAL; persist it to count it with the rest.
+        let (catalog, restarted) = h.restart().await;
+        if let Some((snapshot_done, _, _permit)) = restarted.wal().force_flush_buffer().await {
+            snapshot_done.await.expect("snapshot failed");
+        }
+        let db = catalog.db_schema(CompactionHarness::DB).unwrap();
+        let table_id = db
+            .table_definition(CompactionHarness::TABLE)
+            .unwrap()
+            .table_id;
+        let mut rows = 0;
+        for _ in 0..100 {
+            rows = restarted
+                .persisted_files()
+                .get_files(db.id, table_id)
+                .iter()
+                .map(|f| f.row_count)
+                .sum::<u64>();
+            if rows >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(rows, 3, "2 compacted rows + 1 replayed from the WAL");
+    }
+
+    /// Regression test (TAG-2495): a data snapshot gets its sequence number when the WAL is
+    /// flushed, and its snapshot file is written once its parquet files are. A compaction snapshot
+    /// written in between got a higher number, so it became the newest, but it recorded the WAL
+    /// number and `next_file_id` from before that data snapshot. A restart then replayed WAL files
+    /// that were already in parquet and handed out file ids that were already used.
+    #[tokio::test]
+    async fn test_compaction_snapshot_waits_for_data_snapshot_in_progress() {
+        use crate::paths::SnapshotInfoFilePath;
+        use influxdb3_test_helpers::object_store::SynchronizedObjectStore;
+        use influxdb3_wal::SnapshotSequenceNumber;
+        use tokio::sync::Notify;
+
+        // The second data snapshot is held at its snapshot file until released.
+        let held = SnapshotInfoFilePath::new("test-host", SnapshotSequenceNumber::new(2));
+        let reached = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let store = SynchronizedObjectStore::new(Arc::new(InMemory::new())).with_put_notifies(
+            held.as_ref().clone(),
+            Arc::clone(&release),
+            Arc::clone(&reached),
+        );
+        let h = CompactionHarness::with_object_store(Arc::new(store)).await;
+
+        // Data snapshot 1 persists the gen1 file that is compacted below.
+        h.write_gen1("testtable value=1 10000000000\ntesttable value=2 130000000000")
+            .await;
+        // Data snapshot 2 persists value=3. Like the WAL's own flush task, hold its snapshot
+        // permit until the snapshot is done, then clean up.
+        h.write_wal_only("testtable value=3 140000000000").await;
+        let wal = h.write_buffer.wal();
+        let (snapshot_done, data_snapshot, permit) = wal
+            .force_flush_buffer()
+            .await
+            .expect("test setup: no data snapshot");
+        assert_eq!(
+            data_snapshot.snapshot_sequence_number,
+            SnapshotSequenceNumber::new(2),
+            "test setup: the held snapshot file must be this snapshot's"
+        );
+        let snapshot_task = tokio::spawn({
+            let wal = Arc::clone(&wal);
+            async move {
+                snapshot_done.await.expect("snapshot failed");
+                wal.cleanup_snapshot(data_snapshot, permit).await;
+            }
+        });
+        reached.notified().await;
+
+        // Compact while data snapshot 2 is still being written. Run the compaction until it has
+        // reserved its snapshot number (planning and the merge are done by then), then give it
+        // time to write its snapshot, as it did before it waited for data snapshot 2.
+        h.set_now(Duration::from_secs(120));
+        let compaction = h.compact();
+        tokio::pin!(compaction);
+        let mut compacted_first = false;
+        let mut polls = 0;
+        while wal.last_snapshot_sequence_number().await < SnapshotSequenceNumber::new(3) {
+            if tokio::time::timeout(Duration::from_millis(50), &mut compaction)
+                .await
+                .is_ok()
+            {
+                compacted_first = true;
+                break;
+            }
+            polls += 1;
+            assert!(
+                polls < 600,
+                "the compaction never reserved its snapshot number"
+            );
+        }
+        if !compacted_first {
+            compacted_first = tokio::time::timeout(Duration::from_millis(500), &mut compaction)
+                .await
+                .is_ok();
+        }
+        release.notify_one();
+        if !compacted_first {
+            compaction.await;
+        }
+        snapshot_task.await.unwrap();
+
+        assert!(
+            !compacted_first,
+            "the compaction snapshot was written while data snapshot 2 was still being written"
+        );
+        assert_eq!(
+            h.newest_snapshot().await.wal_file_sequence_number,
+            data_snapshot.last_wal_sequence_number,
+            "the newest snapshot must record data snapshot 2's WAL number"
+        );
+    }
+
+    /// Regression test (TAG-2495): a data snapshot with nothing to write writes no snapshot file,
+    /// but the WAL still treats its files as snapshotted and deletes them. A compaction snapshot
+    /// after it must record its WAL number: an older one would make a restart reuse the numbers
+    /// of deleted WAL files.
+    #[tokio::test]
+    async fn test_compaction_snapshot_records_data_snapshots_that_wrote_nothing() {
+        let h = CompactionHarness::new().await;
+        h.write_gen1("testtable value=1 10000000000\ntesttable value=2 130000000000")
+            .await;
+        let persisted_wal = h.newest_snapshot().await.wal_file_sequence_number;
+
+        // The buffer is empty, so this snapshot persists nothing.
+        let (snapshot_done, empty_snapshot, permit) = h
+            .write_buffer
+            .wal()
+            .force_flush_buffer()
+            .await
+            .expect("test setup: no data snapshot");
+        snapshot_done.await.expect("snapshot failed");
+        drop(permit);
+        assert!(
+            empty_snapshot.last_wal_sequence_number > persisted_wal,
+            "test setup: the empty snapshot must cover a later WAL file"
+        );
+        assert_eq!(
+            h.newest_snapshot().await.wal_file_sequence_number,
+            persisted_wal,
+            "test setup: the empty snapshot must not write a snapshot file"
+        );
+
+        h.set_now(Duration::from_secs(120));
+        h.compact().await;
+        assert_eq!(
+            h.newest_snapshot().await.wal_file_sequence_number,
+            empty_snapshot.last_wal_sequence_number
+        );
+    }
+
+    /// Regression test (TAG-2495): the compaction snapshot's upload retries until it succeeds.
+    /// Holding the WAL's snapshot permit through it made a flush that starts a data snapshot,
+    /// and so every write, wait for as long as the object store failed.
+    #[tokio::test]
+    async fn test_flush_does_not_wait_for_compaction_snapshot_upload() {
+        use crate::paths::SnapshotInfoFilePath;
+        use influxdb3_test_helpers::object_store::SynchronizedObjectStore;
+        use influxdb3_wal::SnapshotSequenceNumber;
+        use tokio::sync::Notify;
+
+        // Data snapshot 1 persists the gen1 file; the compaction snapshot is 2 and is held.
+        let held = SnapshotInfoFilePath::new("test-host", SnapshotSequenceNumber::new(2));
+        let reached = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let store = SynchronizedObjectStore::new(Arc::new(InMemory::new())).with_put_notifies(
+            held.as_ref().clone(),
+            Arc::clone(&release),
+            Arc::clone(&reached),
+        );
+        let h = CompactionHarness::with_object_store(Arc::new(store)).await;
+        h.write_gen1("testtable value=1 10000000000\ntesttable value=2 130000000000")
+            .await;
+
+        h.set_now(Duration::from_secs(120));
+        let compaction = h.compact();
+        tokio::pin!(compaction);
+        tokio::select! {
+            _ = &mut compaction => panic!("test setup: the compaction snapshot was not held"),
+            _ = reached.notified() => {}
+        }
+
+        let flushed = tokio::time::timeout(
+            Duration::from_secs(1),
+            h.write_buffer.wal().force_flush_buffer(),
+        )
+        .await;
+        release.notify_one();
+        compaction.await;
+
+        let (snapshot_done, _, permit) = flushed
+            .expect("the flush waited for the compaction snapshot upload")
+            .expect("test setup: no data snapshot");
+        snapshot_done.await.expect("snapshot failed");
+        drop(permit);
     }
 
     /// If writing a later output fails, outputs already uploaded by this attempt are deleted.
@@ -1514,7 +1992,8 @@ mod tests {
 
         // Set up in-memory object store and catalog
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let time_provider: Arc<dyn iox_time::TimeProvider> = Arc::new(MockProvider::new(iox_time::Time::from_timestamp_nanos(0)));
+        let clock = Arc::new(MockProvider::new(iox_time::Time::from_timestamp_nanos(0)));
+        let time_provider: Arc<dyn iox_time::TimeProvider> = Arc::clone(&clock) as _;
         let catalog = Arc::new(
             Catalog::new(
                 "test-host",
@@ -1626,6 +2105,9 @@ mod tests {
             Arc::clone(&time_provider),
             ShutdownManager::new_testing().register(),
         );
+
+        // Windows are compacted once they have ended: move past the 2 minute window [0s, 120s).
+        clock.set(iox_time::Time::from_timestamp_nanos(120_000_000_000));
 
         // Run compaction cycle to identify and execute compaction jobs
         let jobs = compaction_service.identify_compaction_jobs().await.unwrap();

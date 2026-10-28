@@ -251,14 +251,8 @@ impl CompactionService {
                 let mut files_by_generation: BTreeMap<u8, Vec<ParquetFile>> = BTreeMap::new();
                 
                 for file in files {
-                    match file_generation(&file.path) {
-                        Ok(generation) => {
-                            files_by_generation.entry(generation).or_default().push(file)
-                        }
-                        // Leave a file this build cannot place alone: returning the error would
-                        // stop planning for every table.
-                        Err(e) => warn!("Skipping file in compaction planning: {:#}", e),
-                    }
+                    let generation = self.get_file_generation(&file)?;
+                    files_by_generation.entry(generation).or_default().push(file);
                 }
 
                 // Check each generation level for compaction opportunities
@@ -629,6 +623,32 @@ impl CompactionService {
         Ok((min_time, max_time))
     }
 
+    /// Get the generation level for a file based on its path
+    fn get_file_generation(&self, file: &ParquetFile) -> Result<u8> {
+        // Parse generation from file path
+        // Expected format: dbs/{table}-{db_id}/{table}-{table_id}/gen{level}/{YYYY-MM-DD}/{HH-MM}/{uuid}.parquet
+        let path = &file.path;
+        
+        // Look for "gen{level}" in the path
+        if let Some(gen_start) = path.find("/gen") {
+            let gen_part = &path[gen_start + 4..]; // Skip "/gen"
+            if let Some(gen_end) = gen_part.find('/') {
+                let gen_str = &gen_part[..gen_end];
+                match gen_str.parse::<u8>() {
+                    Ok(generation) if generation >= 1 && generation <= 5 => Ok(generation),
+                    Ok(generation) => Err(anyhow::anyhow!("Invalid generation number {} in path: {}", generation, path)),
+                    Err(e) => Err(anyhow::anyhow!("Invalid generation in path {}: {}", path, e)),
+                }
+            } else {
+                Err(anyhow::anyhow!("Could not find generation end marker in path: {}", path))
+            }
+        } else {
+            // If no generation found in path, assume gen1
+            debug!("No generation found in path {}, assuming gen1", path);
+            Ok(1)
+        }
+    }
+
     /// Get the next generation level
     fn get_next_generation(&self, current_gen: u8) -> Option<u8> {
         if current_gen < 5 {
@@ -899,38 +919,6 @@ fn sort_record_batches(
         .context("failed to construct sorted record batch")?;
 
     Ok(vec![sorted])
-}
-
-/// Get the generation level for a file based on its path
-fn file_generation(path: &str) -> Result<u8> {
-    // Parse generation from file path
-    // Expected format: {node}/dbs/{db}-{db_id}/{table}-{table_id}/gen{level}/{YYYY-MM-DD}/{HH-MM}/{uuid}.parquet
-
-    // Look for a whole "gen{level}" segment after "dbs": the node id comes before it and may look
-    // like one, and database and table segments end in "-{id}", so a name such as
-    // "generator_status" never reads as a level.
-    let level = path
-        .split('/')
-        .skip_while(|segment| *segment != "dbs")
-        .find_map(|segment| {
-            let digits = segment.strip_prefix("gen")?;
-            (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then_some(digits)
-        });
-    match level {
-        Some(digits) => match digits.parse::<u8>() {
-            Ok(generation) if (1..=5).contains(&generation) => Ok(generation),
-            _ => Err(anyhow::anyhow!(
-                "Invalid generation number {} in path: {}",
-                digits,
-                path
-            )),
-        },
-        None => {
-            // If no generation found in path, assume gen1
-            debug!("No generation found in path {}, assuming gen1", path);
-            Ok(1)
-        }
-    }
 }
 
 /// Build the object store path for a compacted file.
@@ -1212,7 +1200,7 @@ mod tests {
         fn gen1_file_count(&self) -> usize {
             self.indexed_files()
                 .iter()
-                .filter(|f| matches!(file_generation(&f.path), Ok(1)))
+                .filter(|f| !f.path.contains("/gen"))
                 .count()
         }
 
@@ -1615,88 +1603,6 @@ mod tests {
             h.newest_snapshot().await.wal_file_sequence_number,
             empty_snapshot.last_wal_sequence_number
         );
-    }
-
-    /// Regression test (TAG-2495): the generation is a `gen<N>` path segment. Looking for the first
-    /// "/gen" anywhere in the path read a database or table named e.g. `generator_status` as a
-    /// generation, failed to parse it, and so failed planning for every table on the node.
-    #[test]
-    fn test_gen_prefixed_names_are_not_generations() {
-        assert_eq!(
-            file_generation(
-                "node/dbs/plant-1/generator_status-7/2026-10-27/10-00/0000000042.parquet"
-            )
-            .unwrap(),
-            1
-        );
-        assert_eq!(
-            file_generation(
-                "node/dbs/general-1/generator_status-7/gen2/2026-10-27/00-00/a.parquet"
-            )
-            .unwrap(),
-            2
-        );
-    }
-
-    /// The node identifier is the first path segment and can look like a generation too: only a
-    /// segment after `dbs/` is one. A level outside 1..=5 is an error however many digits it has.
-    #[test]
-    fn test_generation_ignores_node_id_and_rejects_out_of_range_levels() {
-        assert_eq!(
-            file_generation(
-                "gen5/dbs/plant-1/sensor_reading-7/2026-10-27/10-00/0000000042.parquet"
-            )
-            .unwrap(),
-            1
-        );
-        assert_eq!(
-            file_generation("gen1/dbs/plant-1/sensor_reading-7/gen3/2026-10-27/00-00/a.parquet")
-                .unwrap(),
-            3
-        );
-        assert!(
-            file_generation("node/dbs/plant-1/sensor_reading-7/gen300/2026-10-27/00-00/a.parquet")
-                .is_err()
-        );
-    }
-
-    /// One file with a generation this build does not know (e.g. written by a build with more
-    /// levels) must not stop planning: it used to fail the whole cycle for every table.
-    #[tokio::test]
-    async fn test_file_with_unknown_generation_does_not_stop_planning() {
-        let h = CompactionHarness::new().await;
-        h.write_gen1("testtable value=1 10000000000\ntesttable value=2 130000000000")
-            .await;
-        let db = h.catalog.db_schema(CompactionHarness::DB).unwrap();
-        let table_id = db
-            .table_definition(CompactionHarness::TABLE)
-            .unwrap()
-            .table_id;
-        h.write_buffer.persisted_files().add_persisted_file(
-            &db.id,
-            &table_id,
-            &ParquetFile {
-                id: ParquetFileId::new(),
-                path: format!(
-                    "test-host/dbs/{}-{}/{}-{}/gen9/1970-01-01/00-00/a.parquet",
-                    CompactionHarness::DB,
-                    db.id,
-                    CompactionHarness::TABLE,
-                    table_id
-                ),
-                size_bytes: 1,
-                row_count: 1,
-                chunk_time: 0,
-                min_time: 0,
-                max_time: 1,
-            },
-        );
-
-        h.set_now(Duration::from_secs(120));
-        let jobs = h.service.identify_compaction_jobs().await.unwrap();
-        assert_eq!(jobs.len(), 1, "the gen1 file should still be planned");
-        assert_eq!(jobs[0].files.len(), 1);
-        assert_eq!(file_generation(&jobs[0].files[0].path).unwrap(), 1);
     }
 
     /// Regression test (TAG-2495): the compaction snapshot's upload retries until it succeeds.

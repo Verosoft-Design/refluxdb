@@ -850,8 +850,9 @@ fn group_files_by_time_window(
 }
 
 /// Whether the window that `batch` was grouped into (see [`group_files_by_time_window`]) has
-/// ended at `now`. A window is compacted once it has ended, not once its files span it: a gen1
-/// file covers at most one gen1 chunk, so the files in a window never span the whole window.
+/// ended at `now`. A window is compacted once it has ended, not once its files span it: files
+/// are grouped by `min_time`, so a window of shorter source files (e.g. a day of 10 minute gen1
+/// files) never spans the whole window.
 fn window_has_ended(batch: &[ParquetFile], window: Duration, now: i64) -> bool {
     let window_nanos = window.as_nanos() as i64;
     let Some(min_time) = batch.iter().map(|f| f.min_time).min() else {
@@ -1033,6 +1034,25 @@ mod tests {
 
         /// Like [`Self::new`], on the given object store.
         async fn with_object_store(object_store: Arc<dyn ObjectStore>) -> Self {
+            let config = CompactionConfig {
+                enabled: true,
+                interval: Duration::from_secs(1),
+                max_files_per_run: 10,
+                min_files_for_compaction: 1,
+                generation_durations: HashMap::from([
+                    (1, Duration::from_secs(60)),
+                    (2, Duration::from_secs(120)),
+                ]),
+            };
+            Self::build(object_store, config).await
+        }
+
+        /// Like [`Self::new`], with the given compaction config.
+        async fn with_config(config: CompactionConfig) -> Self {
+            Self::build(Arc::new(InMemory::new()), config).await
+        }
+
+        async fn build(object_store: Arc<dyn ObjectStore>, config: CompactionConfig) -> Self {
             // Not `Executor::new_testing()`: that shares a process-wide DedicatedExecutor whose IO
             // runtime is the tokio runtime of whichever test created it first, so running a
             // DataFusion plan after that test ends panics with "IO runtime was shut down". A
@@ -1070,16 +1090,6 @@ mod tests {
             let write_buffer =
                 Self::start_write_buffer(&persister, &catalog, &time_provider, &executor).await;
 
-            let config = CompactionConfig {
-                enabled: true,
-                interval: Duration::from_secs(1),
-                max_files_per_run: 10,
-                min_files_for_compaction: 1,
-                generation_durations: HashMap::from([
-                    (1, Duration::from_secs(60)),
-                    (2, Duration::from_secs(120)),
-                ]),
-            };
             let service = CompactionService::new(
                 config,
                 Arc::clone(&catalog),
@@ -1232,6 +1242,44 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             panic!("no new gen1 file was persisted");
+        }
+
+        /// Index `count` gen1 files of 10 minutes each from `start`, one per gen1 chunk, without
+        /// writing their objects: planning only reads the index. The table must exist. Returns
+        /// their paths.
+        fn index_ten_minute_gen1_files(&self, start: i64, count: i64) -> Vec<String> {
+            const TEN_MINUTES: i64 = 600_000_000_000;
+
+            let db = self.catalog.db_schema(Self::DB).unwrap();
+            let table_id = db.table_definition(Self::TABLE).unwrap().table_id;
+            let persisted_files = self.write_buffer.persisted_files();
+            (0..count)
+                .map(|i| {
+                    let min_time = start + i * TEN_MINUTES;
+                    let file = ParquetFile {
+                        // Not `ParquetFileId::new()`: that advances the process-wide counter
+                        // that other tests assert on. One id per 10 minute slot is unique.
+                        id: ParquetFileId::from((min_time / TEN_MINUTES) as u64),
+                        path: format!(
+                            "test-host/dbs/{}-{}/{}-{}/{}/{:010}.parquet",
+                            Self::DB,
+                            db.id,
+                            Self::TABLE,
+                            table_id,
+                            DateTime::<Utc>::from_timestamp_nanos(min_time)
+                                .format("%Y-%m-%d/%H-%M"),
+                            i
+                        ),
+                        size_bytes: 100,
+                        row_count: 1,
+                        chunk_time: min_time,
+                        min_time,
+                        max_time: min_time + TEN_MINUTES - 1,
+                    };
+                    persisted_files.add_persisted_file(&db.id, &table_id, &file);
+                    file.path
+                })
+                .collect()
         }
 
         /// Write line protocol that only reaches the WAL: no snapshot persists it.
@@ -1416,6 +1464,77 @@ mod tests {
             "gen1 inputs should be replaced by gen2"
         );
         h.assert_index_readable(3).await;
+    }
+
+    /// 2026-09-18T00:00:00Z
+    const DAY_START: i64 = 1_789_689_600_000_000_000;
+    const ONE_DAY: i64 = 86_400_000_000_000;
+
+    /// gen1 -> gen2 into 1 day windows from 10 minute gen1 files, at least 10 files a job, as on
+    /// tagmobi-dev, with room for a whole day of gen1 files in one job.
+    fn daily_gen2_config() -> CompactionConfig {
+        CompactionConfig {
+            enabled: true,
+            interval: Duration::from_secs(1),
+            max_files_per_run: 200,
+            min_files_for_compaction: 10,
+            generation_durations: HashMap::from([
+                (1, Duration::from_secs(600)),
+                (2, Duration::from_secs(86_400)),
+            ]),
+        }
+    }
+
+    /// Regression test (TAG-2495), the case from the issue: a day of 10 minute gen1 files never
+    /// spans the day (the last one ends at 23:59:59.999...), so no job was ever planned. The day
+    /// is one job once it has ended, and none while it is open.
+    #[tokio::test]
+    async fn test_day_of_ten_minute_gen1_files_compacts_once_the_day_has_ended() {
+        let h = CompactionHarness::with_config(daily_gen2_config()).await;
+        h.write_wal_only("testtable value=1 0").await;
+        let mut day = h.index_ten_minute_gen1_files(DAY_START, 144);
+
+        h.set_now(Duration::from_nanos((DAY_START + ONE_DAY - 1) as u64));
+        let open = h.service.identify_compaction_jobs().await.unwrap();
+        assert!(
+            open.is_empty(),
+            "the day has not ended yet: {} jobs",
+            open.len()
+        );
+
+        h.set_now(Duration::from_nanos((DAY_START + ONE_DAY) as u64));
+        let jobs = h.service.identify_compaction_jobs().await.unwrap();
+        assert_eq!(jobs.len(), 1, "expected one job for the ended day");
+        assert_eq!(
+            (jobs[0].source_generation, jobs[0].target_generation),
+            (1, 2)
+        );
+        let mut planned: Vec<_> = jobs[0].files.iter().map(|f| f.path.clone()).collect();
+        planned.sort();
+        day.sort();
+        assert_eq!(planned, day);
+    }
+
+    /// An ended window is compacted only once it holds `min_files_for_compaction` source files.
+    #[tokio::test]
+    async fn test_ended_window_with_too_few_files_is_not_compacted() {
+        let h = CompactionHarness::with_config(daily_gen2_config()).await;
+        h.write_wal_only("testtable value=1 0").await;
+        h.index_ten_minute_gen1_files(DAY_START - ONE_DAY, 9);
+        let mut day = h.index_ten_minute_gen1_files(DAY_START, 144);
+
+        // Both days have ended; only the one with at least 10 files is compacted.
+        h.set_now(Duration::from_nanos((DAY_START + ONE_DAY) as u64));
+        let jobs = h.service.identify_compaction_jobs().await.unwrap();
+        assert_eq!(
+            jobs.len(),
+            1,
+            "expected one job, for the day with 144 files"
+        );
+        let mut planned: Vec<_> = jobs[0].files.iter().map(|f| f.path.clone()).collect();
+        planned.sort();
+        day.sort();
+        assert_eq!(planned, day);
     }
 
     /// Regression test (TAG-2495): startup replays the WAL after the newest snapshot's

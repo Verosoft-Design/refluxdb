@@ -107,9 +107,11 @@ pub trait Wal: Debug + Send + Sync + 'static {
     /// Atomically reserves the next snapshot sequence number under the WAL flush lock.
     async fn reserve_next_snapshot_sequence_number(&self) -> SnapshotSequenceNumber;
 
-    /// Waits until no snapshot is in progress and returns the permit that keeps the next one
-    /// from starting until it is dropped. A snapshot holds this permit from the flush that gives
-    /// it its sequence number until it has been persisted and cleaned up.
+    /// Waits until no snapshot started by a WAL flush is in progress, and returns the permit that
+    /// keeps the next one from starting until it is dropped. Such a snapshot holds this permit
+    /// from the flush that gives it its sequence number until it has been persisted and cleaned
+    /// up. A snapshot re-run during WAL replay may not hold it, so wait only after replay has
+    /// finished (the compaction service starts after the write buffer has replayed the WAL).
     async fn acquire_snapshot_permit(&self) -> OwnedSemaphorePermit;
 
     /// Stop all writes to the WAL and flush the buffer to a WAL file.

@@ -219,7 +219,8 @@ impl CompactionService {
     /// Identify files that need compaction
     async fn identify_compaction_jobs(&self) -> Result<Vec<CompactionJob>> {
         let mut jobs = Vec::new();
-        
+        let now = self.time_provider.now().timestamp_nanos();
+
         // Get all databases and tables
         let databases = self.catalog.list_db_schema();
         
@@ -269,7 +270,7 @@ impl CompactionService {
                                 self.config.min_files_for_compaction,
                                 self.config.max_files_per_run,
                             ) {
-                                if self.can_compact_to_generation(&batch, *target_duration) {
+                                if window_has_ended(&batch, *target_duration, now) {
                                     jobs.push(CompactionJob {
                                         database_id: db_schema.id,
                                         database_name: Arc::clone(&db_schema.name),
@@ -657,20 +658,6 @@ impl CompactionService {
         }
     }
 
-    /// Check if files can be compacted to the target generation
-    fn can_compact_to_generation(&self, files: &[ParquetFile], target_duration: Duration) -> bool {
-        if files.len() < self.config.min_files_for_compaction {
-            return false;
-        }
-
-        // Check if files span the target duration
-        let min_time = files.iter().map(|f| f.min_time).min().unwrap_or(0);
-        let max_time = files.iter().map(|f| f.max_time).max().unwrap_or(0);
-        let span_duration = Duration::from_nanos((max_time - min_time) as u64);
-        
-        span_duration >= target_duration
-    }
-
     /// Calculate chunk time for a generation based on the batch data and target duration
     fn calculate_chunk_time_for_generation(
         &self,
@@ -723,7 +710,13 @@ impl CompactionService {
     ) -> Result<()> {
         let wal = self.write_buffer.wal();
         let snapshot_sequence_number = wal.reserve_next_snapshot_sequence_number().await;
-        let wal_file_sequence_number = wal.last_wal_sequence_number().await;
+        // This snapshot becomes the newest, and startup replays the WAL after its
+        // `wal_file_sequence_number`. It persists no WAL data, so it carries the number of the last
+        // snapshot that did: the last WAL file written would skip rows that exist only in the WAL.
+        let wal_file_sequence_number = self
+            .persisted_files()
+            .last_persisted_wal_sequence_number()
+            .unwrap_or_default();
         let mut snapshot = PersistedSnapshot::new(
             self.node_identifier_prefix.clone(),
             snapshot_sequence_number,
@@ -844,6 +837,21 @@ fn group_files_by_time_window(
         }
     }
     batches
+}
+
+/// Whether the window that `batch` was grouped into (see [`group_files_by_time_window`]) has
+/// ended at `now`. A window is compacted once it has ended, not once its files span it: a gen1
+/// file covers at most one gen1 chunk, so the files in a window never span the whole window.
+fn window_has_ended(batch: &[ParquetFile], window: Duration, now: i64) -> bool {
+    let window_nanos = window.as_nanos() as i64;
+    let Some(min_time) = batch.iter().map(|f| f.min_time).min() else {
+        return false;
+    };
+    if window_nanos <= 0 {
+        return false;
+    }
+    let window_start = (min_time / window_nanos) * window_nanos;
+    window_start.saturating_add(window_nanos) <= now
 }
 
 /// Sort a collection of record batches by the given sort key.
@@ -1671,7 +1679,8 @@ mod tests {
 
         // Set up in-memory object store and catalog
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let time_provider: Arc<dyn iox_time::TimeProvider> = Arc::new(MockProvider::new(iox_time::Time::from_timestamp_nanos(0)));
+        let clock = Arc::new(MockProvider::new(iox_time::Time::from_timestamp_nanos(0)));
+        let time_provider: Arc<dyn iox_time::TimeProvider> = Arc::clone(&clock) as _;
         let catalog = Arc::new(
             Catalog::new(
                 "test-host",
@@ -1783,6 +1792,9 @@ mod tests {
             Arc::clone(&time_provider),
             ShutdownManager::new_testing().register(),
         );
+
+        // Windows are compacted once they have ended: move past the 2 minute window [0s, 120s).
+        clock.set(iox_time::Time::from_timestamp_nanos(120_000_000_000));
 
         // Run compaction cycle to identify and execute compaction jobs
         let jobs = compaction_service.identify_compaction_jobs().await.unwrap();

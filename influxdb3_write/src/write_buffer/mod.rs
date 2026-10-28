@@ -491,8 +491,11 @@ pub fn cache_parquet_files<T: AsRef<ParquetFile>>(
 ///
 /// Queries merge rows with the same primary key only within a partition. The same row can be in
 /// the buffer, a gen1 file and a compacted file, whose chunk times differ (a gen1 chunk, a day, a
-/// week), so a partition per chunk time returned every copy. Within the one partition, chunks
-/// are still only merged where their time ranges overlap.
+/// week), so a partition per chunk time returned every copy. Within the one partition, IOx
+/// de-duplicates each group of chunks whose time ranges overlap. A group of more than one chunk
+/// (e.g. a compacted file and a leftover gen1 file) is sorted and de-duplicated, and a query with
+/// more of those groups than `iox.max_dedup_split` (default 100) is planned as a single
+/// de-duplication over all of its chunks.
 pub(crate) fn query_partition_id() -> data_types::partition::TransitionPartitionId {
     data_types::partition::TransitionPartitionId::from_parts(
         PartitionId::new(0),

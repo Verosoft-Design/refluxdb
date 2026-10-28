@@ -1316,10 +1316,10 @@ mod tests {
                 .compacted_files
         }
 
-        /// Rows that `SELECT *` on the test table returns, planned the way the server plans it
-        /// (`QueryTable::scan`): every buffer and parquet chunk goes into one `ProviderBuilder`,
-        /// so duplicate rows are merged as in a real query.
-        async fn query_row_count(&self) -> usize {
+        /// Run `SELECT *` on the test table and return `(chunks queried, rows returned)`. As in
+        /// `QueryTable::scan`, every buffer and parquet chunk goes into one `ProviderBuilder`, so
+        /// duplicate rows are merged as in a real query.
+        async fn select_all(&self) -> (usize, usize) {
             use crate::{ChunkContainer, ChunkFilter};
             use iox_query::provider::ProviderBuilder;
 
@@ -1342,6 +1342,7 @@ mod tests {
                     &ctx.inner().state(),
                 )
                 .unwrap();
+            let chunk_count = chunks.len();
             let mut builder =
                 ProviderBuilder::new(Arc::clone(&table_def.table_name), table_def.schema.clone());
             for chunk in chunks {
@@ -1355,7 +1356,7 @@ mod tests {
                 .await
                 .unwrap();
             let batches = ctx.collect(plan).await.unwrap();
-            batches.iter().map(|b| b.num_rows()).sum()
+            (chunk_count, batches.iter().map(|b| b.num_rows()).sum())
         }
 
         /// Every indexed file must exist with exactly the indexed size, and its footer must parse
@@ -1604,12 +1605,21 @@ mod tests {
         h.compact().await;
 
         h.write_gen1(&row_at_half_past_midnight()).await;
+        let files = h.indexed_files();
         assert_eq!(
-            h.indexed_files().len(),
-            2,
-            "test setup: one gen2 file and one gen1 copy"
+            files.iter().filter(|f| f.path.contains("/gen2/")).count(),
+            1,
+            "test setup: one gen2 file: {files:?}"
         );
-        assert_eq!(h.query_row_count().await, 1);
+        assert_eq!(
+            h.gen1_file_count(),
+            1,
+            "test setup: one gen1 copy: {files:?}"
+        );
+
+        let (chunks, rows) = h.select_all().await;
+        assert_eq!(chunks, 2, "test setup: both files must be queried");
+        assert_eq!(rows, 1);
     }
 
     /// Regression test (TAG-2504): the same for a row that is in a gen2 file and in the buffer,
@@ -1622,7 +1632,18 @@ mod tests {
         h.compact().await;
 
         h.write_wal_only(&row_at_half_past_midnight()).await;
-        assert_eq!(h.query_row_count().await, 1);
+        let files = h.indexed_files();
+        assert!(
+            files.len() == 1 && files[0].path.contains("/gen2/"),
+            "test setup: only the gen2 file is persisted, the copy is in the buffer: {files:?}"
+        );
+
+        let (chunks, rows) = h.select_all().await;
+        assert_eq!(
+            chunks, 2,
+            "test setup: the gen2 file and the buffer must be queried"
+        );
+        assert_eq!(rows, 1);
     }
 
     /// Regression test (TAG-2495): startup replays the WAL after the newest snapshot's

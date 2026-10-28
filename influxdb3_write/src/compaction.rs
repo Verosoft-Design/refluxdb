@@ -982,10 +982,23 @@ mod tests {
         assert_eq!(Uuid::parse_str(stem).unwrap(), id);
     }
 
+    use crate::persister::{DEFAULT_OBJECT_STORE_URL, Persister};
+    use crate::write_buffer::{WriteBufferImpl, WriteBufferImplArgs};
+    use influxdb3_cache::distinct_cache::DistinctCacheProvider;
+    use influxdb3_cache::last_cache::LastCacheProvider;
+    use influxdb3_shutdown::ShutdownManager;
+    use influxdb3_wal::WalConfig;
+    use iox_time::MockProvider;
+    use metric::Registry;
+    use object_store::memory::InMemory;
+
     struct CompactionHarness {
         object_store: Arc<dyn ObjectStore>,
         catalog: Arc<Catalog>,
-        write_buffer: Arc<crate::write_buffer::WriteBufferImpl>,
+        persister: Arc<Persister>,
+        time: Arc<MockProvider>,
+        executor: Arc<Executor>,
+        write_buffer: Arc<WriteBufferImpl>,
         service: CompactionService,
     }
 
@@ -994,18 +1007,9 @@ mod tests {
         const TABLE: &'static str = "testtable";
 
         /// In-memory object store + real `WriteBufferImpl` + `CompactionService` that compacts
-        /// gen1 -> gen2 into 2 minute windows as soon as a single gen1 file exists.
+        /// gen1 -> gen2 into 2 minute windows once a window has ended and holds a gen1 file.
+        /// The clock starts at 0; move it with [`Self::set_now`].
         async fn new() -> Self {
-            use crate::persister::{DEFAULT_OBJECT_STORE_URL, Persister};
-            use crate::write_buffer::{WriteBufferImpl, WriteBufferImplArgs};
-            use influxdb3_cache::distinct_cache::DistinctCacheProvider;
-            use influxdb3_cache::last_cache::LastCacheProvider;
-            use influxdb3_shutdown::ShutdownManager;
-            use influxdb3_wal::WalConfig;
-            use iox_time::MockProvider;
-            use metric::Registry;
-            use object_store::memory::InMemory;
-
             // Not `Executor::new_testing()`: that shares a process-wide DedicatedExecutor whose IO
             // runtime is the tokio runtime of whichever test created it first, so running a
             // DataFusion plan after that test ends panics with "IO runtime was shut down". A
@@ -1022,8 +1026,8 @@ mod tests {
             ));
 
             let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-            let time_provider: Arc<dyn TimeProvider> =
-                Arc::new(MockProvider::new(iox_time::Time::from_timestamp_nanos(0)));
+            let time = Arc::new(MockProvider::new(iox_time::Time::from_timestamp_nanos(0)));
+            let time_provider: Arc<dyn TimeProvider> = Arc::clone(&time) as _;
             let catalog = Arc::new(
                 Catalog::new(
                     "test-host",
@@ -1041,33 +1045,8 @@ mod tests {
                 "test-host",
                 Arc::clone(&time_provider),
             ));
-            let last_cache = LastCacheProvider::new_from_catalog(Arc::clone(&catalog))
-                .await
-                .unwrap();
-            let distinct_cache = DistinctCacheProvider::new_from_catalog(
-                Arc::clone(&time_provider),
-                Arc::clone(&catalog),
-            )
-            .await
-            .unwrap();
-            let write_buffer = WriteBufferImpl::new(WriteBufferImplArgs {
-                persister: Arc::clone(&persister),
-                catalog: Arc::clone(&catalog),
-                last_cache,
-                distinct_cache,
-                time_provider: Arc::clone(&time_provider),
-                executor: Arc::clone(&executor),
-                wal_config: WalConfig::test_config(),
-                parquet_cache: None,
-                metric_registry: Arc::new(Registry::default()),
-                snapshotted_wal_files_to_keep: 10,
-                query_file_limit: None,
-                n_snapshots_to_load_on_start: 1,
-                shutdown: ShutdownManager::new_testing().register(),
-                wal_replay_concurrency_limit: None,
-            })
-            .await
-            .unwrap();
+            let write_buffer =
+                Self::start_write_buffer(&persister, &catalog, &time_provider, &executor).await;
 
             let config = CompactionConfig {
                 enabled: true,
@@ -1084,8 +1063,8 @@ mod tests {
                 Arc::clone(&catalog),
                 Arc::clone(&write_buffer) as Arc<dyn WriteBuffer>,
                 write_buffer.persisted_files(),
-                persister,
-                executor,
+                Arc::clone(&persister),
+                Arc::clone(&executor),
                 // As the server sets it (influxdb3_clap_blocks datafusion config): without this,
                 // iox_query encodes a size hint that plain object stores reject.
                 HashMap::from([(
@@ -1102,8 +1081,82 @@ mod tests {
             Self {
                 object_store,
                 catalog,
+                persister,
+                time,
+                executor,
                 write_buffer,
                 service,
+            }
+        }
+
+        /// Build a write buffer the way the server does on startup: load the newest snapshot,
+        /// then replay the WAL files after its `wal_file_sequence_number`.
+        async fn start_write_buffer(
+            persister: &Arc<Persister>,
+            catalog: &Arc<Catalog>,
+            time_provider: &Arc<dyn TimeProvider>,
+            executor: &Arc<Executor>,
+        ) -> Arc<WriteBufferImpl> {
+            let last_cache = LastCacheProvider::new_from_catalog(Arc::clone(catalog))
+                .await
+                .unwrap();
+            let distinct_cache = DistinctCacheProvider::new_from_catalog(
+                Arc::clone(time_provider),
+                Arc::clone(catalog),
+            )
+            .await
+            .unwrap();
+            WriteBufferImpl::new(WriteBufferImplArgs {
+                persister: Arc::clone(persister),
+                catalog: Arc::clone(catalog),
+                last_cache,
+                distinct_cache,
+                time_provider: Arc::clone(time_provider),
+                executor: Arc::clone(executor),
+                wal_config: WalConfig::test_config(),
+                parquet_cache: None,
+                metric_registry: Arc::new(Registry::default()),
+                snapshotted_wal_files_to_keep: 10,
+                query_file_limit: None,
+                n_snapshots_to_load_on_start: 1,
+                shutdown: ShutdownManager::new_testing().register(),
+                wal_replay_concurrency_limit: None,
+            })
+            .await
+            .unwrap()
+        }
+
+        /// Start a second server on the same object store, as a pod restart does. Returns its
+        /// catalog and write buffer once the WAL replay has finished.
+        async fn restart(&self) -> (Arc<Catalog>, Arc<WriteBufferImpl>) {
+            let time_provider: Arc<dyn TimeProvider> = Arc::clone(&self.time) as _;
+            let catalog = Arc::new(
+                Catalog::new(
+                    "test-host",
+                    Arc::clone(&self.object_store),
+                    Arc::clone(&time_provider),
+                    Default::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            let write_buffer =
+                Self::start_write_buffer(&self.persister, &catalog, &time_provider, &self.executor)
+                    .await;
+            (catalog, write_buffer)
+        }
+
+        fn set_now(&self, since_epoch: Duration) {
+            let nanos = since_epoch.as_nanos() as i64;
+            self.time.set(iox_time::Time::from_timestamp_nanos(nanos));
+        }
+
+        /// The newest persisted snapshot: startup replays the WAL after its
+        /// `wal_file_sequence_number`.
+        async fn newest_snapshot(&self) -> PersistedSnapshot {
+            let snapshots = self.persister.load_snapshots(1).await.unwrap();
+            match snapshots.into_iter().next().expect("no snapshot persisted") {
+                PersistedSnapshotVersion::V1(snapshot) => snapshot,
             }
         }
 
@@ -1153,6 +1206,23 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             panic!("no new gen1 file was persisted");
+        }
+
+        /// Write line protocol that only reaches the WAL: no snapshot persists it.
+        async fn write_wal_only(&self, lp: &str) {
+            use data_types::NamespaceName;
+
+            self.write_buffer
+                .write_lp(
+                    NamespaceName::new(Self::DB).unwrap(),
+                    lp,
+                    iox_time::Time::from_timestamp_nanos(0),
+                    false,
+                    crate::Precision::Nanosecond,
+                    false,
+                )
+                .await
+                .unwrap();
         }
 
         /// Plan and run all compaction jobs through the real service code path.
@@ -1245,8 +1315,10 @@ mod tests {
     #[tokio::test]
     async fn test_recompacting_same_window_keeps_all_files_readable() {
         let h = CompactionHarness::new().await;
+        // Both compactions below target the 2 minute gen2 window starting at t=0, which has ended.
+        h.set_now(Duration::from_secs(120));
 
-        // gen1 data spanning the 2 minute gen2 window starting at t=0 (span must be >= 120s).
+        // gen1 data for the 2 minute gen2 window starting at t=0.
         h.write_gen1(
             "testtable value=1 10000000000\ntesttable value=2 30000000000\n\
              testtable value=3 20000000000\ntesttable value=4 40000000000\n\
@@ -1290,6 +1362,91 @@ mod tests {
         );
 
         h.assert_index_readable(8).await;
+    }
+
+    /// Regression test (TAG-2495): a gen1 file covers at most one gen1 chunk, so the files grouped
+    /// into one target window never span the whole window. Compaction used to wait for that span
+    /// and never ran; it must start once the window has ended.
+    #[tokio::test]
+    async fn test_window_of_short_gen1_files_compacts_once_it_has_ended() {
+        let h = CompactionHarness::new().await;
+
+        // Three gen1 files in the 2 minute window [0s, 120s), together spanning only 40s.
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 30000000000").await;
+        h.write_gen1("testtable value=3 50000000000").await;
+        assert_eq!(h.gen1_file_count(), 3);
+
+        h.set_now(Duration::from_secs(119));
+        let open = h.service.identify_compaction_jobs().await.unwrap();
+        assert!(open.is_empty(), "the window has not ended yet: {open:?}");
+
+        h.set_now(Duration::from_secs(120));
+        let compacted = h.compact().await;
+        assert_eq!(compacted.len(), 1);
+        assert_eq!(
+            h.gen1_file_count(),
+            0,
+            "gen1 inputs should be replaced by gen2"
+        );
+        h.assert_index_readable(3).await;
+    }
+
+    /// Regression test (TAG-2495): startup replays the WAL after the newest snapshot's
+    /// `wal_file_sequence_number`. The compaction snapshot used to record the last WAL file
+    /// written there, so a restart after a compaction skipped the WAL files that had not been
+    /// persisted yet, and their rows were gone.
+    #[tokio::test]
+    async fn test_restart_after_compaction_replays_unpersisted_wal() {
+        let h = CompactionHarness::new().await;
+        // One gen1 file spanning the whole window, so this test does not depend on the
+        // window-has-ended fix above.
+        h.write_gen1("testtable value=1 10000000000\ntesttable value=2 130000000000")
+            .await;
+        let persisted_wal = h.newest_snapshot().await.wal_file_sequence_number;
+
+        h.write_wal_only("testtable value=3 140000000000").await;
+        assert!(
+            h.write_buffer.wal().last_wal_sequence_number().await > persisted_wal,
+            "test setup: the WAL must hold a file the snapshot did not persist"
+        );
+
+        h.set_now(Duration::from_secs(120));
+        h.compact().await;
+        let compaction_snapshot = h.newest_snapshot().await;
+        assert!(
+            !compaction_snapshot.removed_files.is_empty(),
+            "test setup: the newest snapshot should be the compaction's"
+        );
+        assert_eq!(
+            compaction_snapshot.wal_file_sequence_number, persisted_wal,
+            "the compaction snapshot moved the WAL replay start past an unpersisted WAL file"
+        );
+
+        // A restart must replay value=3 from the WAL; persist it to count it with the rest.
+        let (catalog, restarted) = h.restart().await;
+        if let Some((snapshot_done, _, _permit)) = restarted.wal().force_flush_buffer().await {
+            snapshot_done.await.expect("snapshot failed");
+        }
+        let db = catalog.db_schema(CompactionHarness::DB).unwrap();
+        let table_id = db
+            .table_definition(CompactionHarness::TABLE)
+            .unwrap()
+            .table_id;
+        let mut rows = 0;
+        for _ in 0..100 {
+            rows = restarted
+                .persisted_files()
+                .get_files(db.id, table_id)
+                .iter()
+                .map(|f| f.row_count)
+                .sum::<u64>();
+            if rows >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(rows, 3, "2 compacted rows + 1 replayed from the WAL");
     }
 
     /// If writing a later output fails, outputs already uploaded by this attempt are deleted.

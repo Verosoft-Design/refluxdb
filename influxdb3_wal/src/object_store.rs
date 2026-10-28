@@ -661,6 +661,16 @@ impl Wal for WalObjectStore {
             .increment_snapshot_sequence_number()
     }
 
+    async fn acquire_snapshot_permit(&self) -> OwnedSemaphorePermit {
+        // Release the flush buffer lock before waiting: a flush that starts a snapshot holds it
+        // while it waits for this permit.
+        let snapshot_semaphore = Arc::clone(&self.flush_buffer.lock().await.snapshot_semaphore);
+        snapshot_semaphore
+            .acquire_owned()
+            .await
+            .expect("snapshot semaphore permit")
+    }
+
     async fn shutdown(&self) {
         // stop accepting writes
         self.flush_buffer

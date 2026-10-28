@@ -628,24 +628,24 @@ impl CompactionService {
         // Parse generation from file path
         // Expected format: dbs/{table}-{db_id}/{table}-{table_id}/gen{level}/{YYYY-MM-DD}/{HH-MM}/{uuid}.parquet
         let path = &file.path;
-        
-        // Look for "gen{level}" in the path
-        if let Some(gen_start) = path.find("/gen") {
-            let gen_part = &path[gen_start + 4..]; // Skip "/gen"
-            if let Some(gen_end) = gen_part.find('/') {
-                let gen_str = &gen_part[..gen_end];
-                match gen_str.parse::<u8>() {
-                    Ok(generation) if generation >= 1 && generation <= 5 => Ok(generation),
-                    Ok(generation) => Err(anyhow::anyhow!("Invalid generation number {} in path: {}", generation, path)),
-                    Err(e) => Err(anyhow::anyhow!("Invalid generation in path {}: {}", path, e)),
-                }
-            } else {
-                Err(anyhow::anyhow!("Could not find generation end marker in path: {}", path))
+
+        // Look for a whole "gen{level}" segment: database and table segments end in "-{id}", so
+        // a name such as "generator_status" never parses as a level.
+        let level = path
+            .split('/')
+            .find_map(|segment| segment.strip_prefix("gen")?.parse::<u8>().ok());
+        match level {
+            Some(generation) if (1..=5).contains(&generation) => Ok(generation),
+            Some(generation) => Err(anyhow::anyhow!(
+                "Invalid generation number {} in path: {}",
+                generation,
+                path
+            )),
+            None => {
+                // If no generation found in path, assume gen1
+                debug!("No generation found in path {}, assuming gen1", path);
+                Ok(1)
             }
-        } else {
-            // If no generation found in path, assume gen1
-            debug!("No generation found in path {}, assuming gen1", path);
-            Ok(1)
         }
     }
 
@@ -710,6 +710,11 @@ impl CompactionService {
     ) -> Result<()> {
         let wal = self.write_buffer.wal();
         let snapshot_sequence_number = wal.reserve_next_snapshot_sequence_number().await;
+        // A data snapshot with a lower sequence number may still be writing its files; it holds
+        // the WAL's snapshot permit until it is done. Wait for it, so that this snapshot records
+        // its WAL number and a `next_file_id` above its file ids. The number is reserved first
+        // because a flush that starts a snapshot waits for this permit while holding the WAL lock.
+        let snapshot_permit = wal.acquire_snapshot_permit().await;
         // This snapshot becomes the newest, and startup replays the WAL after its
         // `wal_file_sequence_number`. It persists no WAL data, so it carries the number of the last
         // snapshot that did: the last WAL file written would skip rows that exist only in the WAL.
@@ -746,6 +751,7 @@ impl CompactionService {
                 }
             }
         }
+        drop(snapshot_permit);
 
         let persisted_files = self.persisted_files();
         for file in new_files {
@@ -1018,6 +1024,11 @@ mod tests {
         /// gen1 -> gen2 into 2 minute windows once a window has ended and holds a gen1 file.
         /// The clock starts at 0; move it with [`Self::set_now`].
         async fn new() -> Self {
+            Self::with_object_store(Arc::new(InMemory::new())).await
+        }
+
+        /// Like [`Self::new`], on the given object store.
+        async fn with_object_store(object_store: Arc<dyn ObjectStore>) -> Self {
             // Not `Executor::new_testing()`: that shares a process-wide DedicatedExecutor whose IO
             // runtime is the tokio runtime of whichever test created it first, so running a
             // DataFusion plan after that test ends panics with "IO runtime was shut down". A
@@ -1033,7 +1044,6 @@ mod tests {
                 ),
             ));
 
-            let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
             let time = Arc::new(MockProvider::new(iox_time::Time::from_timestamp_nanos(0)));
             let time_provider: Arc<dyn TimeProvider> = Arc::clone(&time) as _;
             let catalog = Arc::new(
@@ -1455,6 +1465,146 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert_eq!(rows, 3, "2 compacted rows + 1 replayed from the WAL");
+    }
+
+    /// Regression test (TAG-2495): a data snapshot gets its sequence number when the WAL is
+    /// flushed, and its snapshot file is written once its parquet files are. A compaction snapshot
+    /// written in between got a higher number, so it became the newest, but it recorded the WAL
+    /// number and `next_file_id` from before that data snapshot. A restart then replayed WAL files
+    /// that were already in parquet and handed out file ids that were already used.
+    #[tokio::test]
+    async fn test_compaction_snapshot_waits_for_data_snapshot_in_progress() {
+        use crate::paths::SnapshotInfoFilePath;
+        use influxdb3_test_helpers::object_store::SynchronizedObjectStore;
+        use influxdb3_wal::SnapshotSequenceNumber;
+        use tokio::sync::Notify;
+
+        // The second data snapshot is held at its snapshot file until released.
+        let held = SnapshotInfoFilePath::new("test-host", SnapshotSequenceNumber::new(2));
+        let reached = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let store = SynchronizedObjectStore::new(Arc::new(InMemory::new())).with_put_notifies(
+            held.as_ref().clone(),
+            Arc::clone(&release),
+            Arc::clone(&reached),
+        );
+        let h = CompactionHarness::with_object_store(Arc::new(store)).await;
+
+        // Data snapshot 1 persists the gen1 file that is compacted below.
+        h.write_gen1("testtable value=1 10000000000\ntesttable value=2 130000000000")
+            .await;
+        // Data snapshot 2 persists value=3. Like the WAL's own flush task, hold its snapshot
+        // permit until the snapshot is done, then clean up.
+        h.write_wal_only("testtable value=3 140000000000").await;
+        let wal = h.write_buffer.wal();
+        let (snapshot_done, data_snapshot, permit) = wal
+            .force_flush_buffer()
+            .await
+            .expect("test setup: no data snapshot");
+        assert_eq!(
+            data_snapshot.snapshot_sequence_number,
+            SnapshotSequenceNumber::new(2),
+            "test setup: the held snapshot file must be this snapshot's"
+        );
+        let snapshot_task = tokio::spawn({
+            let wal = Arc::clone(&wal);
+            async move {
+                snapshot_done.await.expect("snapshot failed");
+                wal.cleanup_snapshot(data_snapshot, permit).await;
+            }
+        });
+        reached.notified().await;
+
+        // Compact while data snapshot 2 is still being written.
+        h.set_now(Duration::from_secs(120));
+        let compaction = h.compact();
+        tokio::pin!(compaction);
+        let compacted_first = tokio::time::timeout(Duration::from_secs(1), &mut compaction)
+            .await
+            .is_ok();
+        release.notify_one();
+        if !compacted_first {
+            compaction.await;
+        }
+        snapshot_task.await.unwrap();
+
+        assert!(
+            !compacted_first,
+            "the compaction snapshot was written while data snapshot 2 was still being written"
+        );
+        assert_eq!(
+            h.newest_snapshot().await.wal_file_sequence_number,
+            data_snapshot.last_wal_sequence_number,
+            "the newest snapshot must record data snapshot 2's WAL number"
+        );
+    }
+
+    /// Regression test (TAG-2495): a data snapshot with nothing to write writes no snapshot file,
+    /// but the WAL still treats its files as snapshotted and deletes them. A compaction snapshot
+    /// after it must record its WAL number: an older one would make a restart reuse the numbers
+    /// of deleted WAL files.
+    #[tokio::test]
+    async fn test_compaction_snapshot_records_data_snapshots_that_wrote_nothing() {
+        let h = CompactionHarness::new().await;
+        h.write_gen1("testtable value=1 10000000000\ntesttable value=2 130000000000")
+            .await;
+        let persisted_wal = h.newest_snapshot().await.wal_file_sequence_number;
+
+        // The buffer is empty, so this snapshot persists nothing.
+        let (snapshot_done, empty_snapshot, permit) = h
+            .write_buffer
+            .wal()
+            .force_flush_buffer()
+            .await
+            .expect("test setup: no data snapshot");
+        snapshot_done.await.expect("snapshot failed");
+        drop(permit);
+        assert!(
+            empty_snapshot.last_wal_sequence_number > persisted_wal,
+            "test setup: the empty snapshot must cover a later WAL file"
+        );
+        assert_eq!(
+            h.newest_snapshot().await.wal_file_sequence_number,
+            persisted_wal,
+            "test setup: the empty snapshot must not write a snapshot file"
+        );
+
+        h.set_now(Duration::from_secs(120));
+        h.compact().await;
+        assert_eq!(
+            h.newest_snapshot().await.wal_file_sequence_number,
+            empty_snapshot.last_wal_sequence_number
+        );
+    }
+
+    /// Regression test (TAG-2495): the generation is a `gen<N>` path segment. Looking for the first
+    /// "/gen" anywhere in the path read a database or table named e.g. `generator_status` as a
+    /// generation, failed to parse it, and so failed planning for every table on the node.
+    #[tokio::test]
+    async fn test_gen_prefixed_names_are_not_generations() {
+        let h = CompactionHarness::new().await;
+        let generation = |path: &str| {
+            h.service.get_file_generation(&ParquetFile {
+                id: ParquetFileId::new(),
+                path: path.to_string(),
+                size_bytes: 1,
+                row_count: 1,
+                chunk_time: 0,
+                min_time: 0,
+                max_time: 0,
+            })
+        };
+
+        assert_eq!(
+            generation("node/dbs/plant-1/generator_status-7/2026-10-27/10-00/0000000042.parquet")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            generation("node/dbs/general-1/generator_status-7/gen2/2026-10-27/00-00/a.parquet")
+                .unwrap(),
+            2
+        );
     }
 
     /// If writing a later output fails, outputs already uploaded by this attempt are deleted.

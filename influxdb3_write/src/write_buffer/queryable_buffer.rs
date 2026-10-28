@@ -413,9 +413,6 @@ impl QueryableBuffer {
                 loop {
                     match persister.persist_snapshot(&persisted_snapshot).await {
                         Ok(_) => {
-                            persisted_files.set_last_persisted_wal_sequence_number(
-                                snapshot_details.last_wal_sequence_number,
-                            );
                             let persisted_snapshot = Some(persisted_snapshot.clone());
                             notify_snapshot_tx
                                 .send(persisted_snapshot)
@@ -429,6 +426,10 @@ impl QueryableBuffer {
                     }
                 }
             }
+            // The WAL files up to this snapshot's are now in parquet or held nothing to persist,
+            // and the WAL deletes them either way, so record the number even without a file.
+            persisted_files
+                .set_last_persisted_wal_sequence_number(snapshot_details.last_wal_sequence_number);
 
             let _ = sender.send(snapshot_details);
         });

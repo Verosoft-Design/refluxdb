@@ -209,6 +209,7 @@ impl ObjectStore for RequestCountedObjectStore {
 pub struct SynchronizedObjectStore {
     inner: Arc<dyn ObjectStore>,
     get_notifies: Option<(Arc<Notify>, Arc<Notify>)>,
+    put_notifies: Option<(Path, Arc<Notify>, Arc<Notify>)>,
 }
 
 impl SynchronizedObjectStore {
@@ -216,6 +217,7 @@ impl SynchronizedObjectStore {
         Self {
             inner,
             get_notifies: None,
+            put_notifies: None,
         }
     }
 
@@ -224,6 +226,28 @@ impl SynchronizedObjectStore {
     pub fn with_get_notifies(mut self, inbound: Arc<Notify>, outbound: Arc<Notify>) -> Self {
         self.get_notifies = Some((inbound, outbound));
         self
+    }
+
+    /// Add notifiers for `put` requests to `location` so that async execution can be halted to
+    /// synchronize other processes before the request is forwarded to the inner object store.
+    /// Puts to other locations are forwarded straight away.
+    pub fn with_put_notifies(
+        mut self,
+        location: Path,
+        inbound: Arc<Notify>,
+        outbound: Arc<Notify>,
+    ) -> Self {
+        self.put_notifies = Some((location, inbound, outbound));
+        self
+    }
+
+    async fn wait_for_put(&self, location: &Path) {
+        if let Some((held, inbound, outbound)) = &self.put_notifies {
+            if held == location {
+                outbound.notify_one();
+                inbound.notified().await;
+            }
+        }
     }
 }
 
@@ -236,6 +260,7 @@ impl std::fmt::Display for SynchronizedObjectStore {
 #[async_trait]
 impl ObjectStore for SynchronizedObjectStore {
     async fn put(&self, location: &Path, bytes: PutPayload) -> object_store::Result<PutResult> {
+        self.wait_for_put(location).await;
         self.inner.put(location, bytes).await
     }
 
@@ -245,6 +270,7 @@ impl ObjectStore for SynchronizedObjectStore {
         bytes: PutPayload,
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
+        self.wait_for_put(location).await;
         self.inner.put_opts(location, bytes, opts).await
     }
 

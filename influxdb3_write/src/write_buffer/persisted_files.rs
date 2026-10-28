@@ -68,15 +68,15 @@ impl PersistedFiles {
         }
     }
 
-    /// The `wal_file_sequence_number` of the newest snapshot that persisted WAL data: every WAL
-    /// file up to it is in parquet, and the ones after it exist only in the WAL. Startup replays
-    /// the WAL after the newest snapshot's number, so a snapshot that persists no WAL data (a
-    /// compaction's) must record this number, never a later one. `None` until a snapshot exists.
+    /// The WAL number of the newest completed data snapshot: every WAL file up to it is in
+    /// parquet (or held nothing to persist), and the ones after it exist only in the WAL. Startup
+    /// replays the WAL after the newest snapshot's number, so a snapshot that persists no WAL data
+    /// (a compaction's) must record this number, never a later one. `None` until a snapshot exists.
     pub fn last_persisted_wal_sequence_number(&self) -> Option<WalFileSequenceNumber> {
         self.inner.read().last_persisted_wal_sequence_number
     }
 
-    /// Record that a snapshot persisting the WAL up to `wal_file_sequence_number` was written.
+    /// Record that a data snapshot covering the WAL up to `wal_file_sequence_number` completed.
     /// The number never moves backwards.
     pub fn set_last_persisted_wal_sequence_number(
         &self,

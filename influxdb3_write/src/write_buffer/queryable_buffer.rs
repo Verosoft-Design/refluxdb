@@ -116,7 +116,7 @@ impl QueryableBuffer {
             .partitioned_record_batches(Arc::clone(&table_def), buffer_filter)
             .map_err(|e| DataFusionError::Execution(format!("error getting batches {e}")))?
             .into_iter()
-            .map(|(gen_time, (ts_min_max, batches))| {
+            .map(|(_, (ts_min_max, batches))| {
                 let row_count = batches.iter().map(|b| b.num_rows()).sum::<usize>();
                 let chunk_stats = create_chunk_statistics(
                     Some(row_count),
@@ -128,13 +128,7 @@ impl QueryableBuffer {
                     batches,
                     schema: influx_schema.clone(),
                     stats: Arc::new(chunk_stats),
-                    partition_id: TransitionPartitionId::from_parts(
-                        PartitionId::new(0),
-                        Some(PartitionHashId::new(
-                            data_types::TableId::new(0),
-                            &PartitionKey::from(gen_time.to_string()),
-                        )),
-                    ),
+                    partition_id: super::query_partition_id(),
                     sort_key: None,
                     id: ChunkId::new(),
                     chunk_order: ChunkOrder::new(i64::MAX),

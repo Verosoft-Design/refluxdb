@@ -40,6 +40,8 @@ pub struct WalObjectStore {
     added_file_notifiers: parking_lot::Mutex<Vec<Arc<dyn WalFileNotifier>>>,
     /// Buffered wal ops go in here along with the state to track when to snapshot
     flush_buffer: Mutex<FlushBuffer>,
+    /// The flush buffer's snapshot semaphore, reachable without taking its lock
+    snapshot_semaphore: Arc<Semaphore>,
     /// number of snapshotted wal files to retain in object store
     snapshotted_wal_files_to_keep: u64,
     wal_remover: WalFileRemover,
@@ -108,30 +110,33 @@ impl WalObjectStore {
     ) -> Self {
         let wal_file_sequence_number = last_wal_sequence_number.unwrap_or_default().next();
         let oldest_wal_file_num = oldest_wal_file_num(all_wal_file_paths);
+        let flush_buffer = FlushBuffer::new(
+            Arc::clone(&time_provider),
+            WalBuffer {
+                time_provider,
+                state: WalBufferState::AcceptingWrites,
+                wal_file_sequence_number,
+                op_limit: config.max_write_buffer_size,
+                op_count: 0,
+                database_to_write_batch: Default::default(),
+                write_op_responses: vec![],
+                no_op: None,
+            },
+            SnapshotTracker::new(
+                config.snapshot_size,
+                config.gen1_duration,
+                last_snapshot_sequence_number,
+            ),
+        );
+        let snapshot_semaphore = Arc::clone(&flush_buffer.snapshot_semaphore);
 
         Self {
             object_store,
             node_identifier_prefix: node_identifier_prefix.into(),
             file_notifier,
             added_file_notifiers: Default::default(),
-            flush_buffer: Mutex::new(FlushBuffer::new(
-                Arc::clone(&time_provider),
-                WalBuffer {
-                    time_provider,
-                    state: WalBufferState::AcceptingWrites,
-                    wal_file_sequence_number,
-                    op_limit: config.max_write_buffer_size,
-                    op_count: 0,
-                    database_to_write_batch: Default::default(),
-                    write_op_responses: vec![],
-                    no_op: None,
-                },
-                SnapshotTracker::new(
-                    config.snapshot_size,
-                    config.gen1_duration,
-                    last_snapshot_sequence_number,
-                ),
-            )),
+            flush_buffer: Mutex::new(flush_buffer),
+            snapshot_semaphore,
             snapshotted_wal_files_to_keep: num_wal_files_to_keep,
             wal_remover: WalFileRemover {
                 inner: parking_lot::Mutex::new(WalFileRemoverInner {
@@ -237,7 +242,15 @@ impl WalObjectStore {
                         let snapshot_info = {
                             let mut buffer = self.flush_buffer.lock().await;
 
-                            match buffer.snapshot_tracker.snapshot(snapshot_details.forced) {
+                            let snapshot_info =
+                                buffer.snapshot_tracker.snapshot(snapshot_details.forced);
+                            // Numbers reserved by compaction and never written leave gaps in the
+                            // WAL, so counting markers can fall behind: keep the counter at least
+                            // at this snapshot's number so it is not handed out again.
+                            buffer.snapshot_tracker.raise_snapshot_sequence_number(
+                                snapshot_details.snapshot_sequence_number,
+                            );
+                            match snapshot_info {
                                 None => None,
                                 Some(info) => {
                                     let semaphore = Arc::clone(&buffer.snapshot_semaphore);
@@ -662,10 +675,9 @@ impl Wal for WalObjectStore {
     }
 
     async fn acquire_snapshot_permit(&self) -> OwnedSemaphorePermit {
-        // Release the flush buffer lock before waiting: a flush that starts a snapshot holds it
-        // while it waits for this permit.
-        let snapshot_semaphore = Arc::clone(&self.flush_buffer.lock().await.snapshot_semaphore);
-        snapshot_semaphore
+        // Without the flush buffer lock: a flush that starts a snapshot holds it while it waits
+        // for this permit.
+        Arc::clone(&self.snapshot_semaphore)
             .acquire_owned()
             .await
             .expect("snapshot semaphore permit")
@@ -1892,6 +1904,71 @@ mod tests {
                 .ok()
                 .unwrap();
         }
+    }
+
+    /// A compaction reserves snapshot numbers that no WAL file records, so the numbers in the WAL
+    /// can skip one. If the process stops before a reserved number is written, replay must still
+    /// move the counter to the snapshot numbers it replays, or the next snapshot reuses one and
+    /// overwrites its file.
+    #[tokio::test]
+    async fn replay_moves_snapshot_sequence_to_replayed_snapshots() {
+        let time_provider: Arc<dyn TimeProvider> =
+            Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let notifier: Arc<dyn WalFileNotifier> = Arc::new(TestNotifier::default());
+
+        // Snapshot 9 was the last one written; 10 was reserved and never written. WAL file 2
+        // records snapshot 11, which had not been written either.
+        let wal_file = wal_path("my_host", WalFileSequenceNumber::new(2));
+        let contents = WalContents {
+            persist_timestamp_ms: 0,
+            min_timestamp_ns: 0,
+            max_timestamp_ns: 1,
+            wal_file_number: WalFileSequenceNumber::new(2),
+            ops: vec![],
+            snapshot: Some(SnapshotDetails {
+                snapshot_sequence_number: SnapshotSequenceNumber::new(11),
+                end_time_marker: 60_000_000_000,
+                first_wal_sequence_number: WalFileSequenceNumber::new(2),
+                last_wal_sequence_number: WalFileSequenceNumber::new(2),
+                forced: true,
+            }),
+        };
+        object_store
+            .put(
+                &wal_file,
+                crate::serialize::serialize_to_file_bytes(&contents)
+                    .unwrap()
+                    .into(),
+            )
+            .await
+            .unwrap();
+
+        let paths = vec![wal_file];
+        let wal = WalObjectStore::new_without_replay(
+            Arc::clone(&time_provider),
+            Arc::clone(&object_store),
+            "my_host",
+            notifier,
+            WalConfig {
+                snapshot_size: 2,
+                gen1_duration: Gen1Duration::new_1m(),
+                ..Default::default()
+            },
+            Some(WalFileSequenceNumber::new(1)),
+            Some(SnapshotSequenceNumber::new(9)),
+            &paths,
+            10,
+            CancellationToken::new(),
+        );
+        wal.replay(Some(WalFileSequenceNumber::new(1)), &paths, None, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            wal.last_snapshot_sequence_number().await,
+            SnapshotSequenceNumber::new(11)
+        );
     }
 
     #[derive(Debug, Default)]

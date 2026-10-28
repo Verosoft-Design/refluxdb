@@ -251,8 +251,14 @@ impl CompactionService {
                 let mut files_by_generation: BTreeMap<u8, Vec<ParquetFile>> = BTreeMap::new();
                 
                 for file in files {
-                    let generation = self.get_file_generation(&file)?;
-                    files_by_generation.entry(generation).or_default().push(file);
+                    match file_generation(&file.path) {
+                        Ok(generation) => {
+                            files_by_generation.entry(generation).or_default().push(file)
+                        }
+                        // Leave a file this build cannot place alone: returning the error would
+                        // stop planning for every table.
+                        Err(e) => warn!("Skipping file in compaction planning: {:#}", e),
+                    }
                 }
 
                 // Check each generation level for compaction opportunities
@@ -623,32 +629,6 @@ impl CompactionService {
         Ok((min_time, max_time))
     }
 
-    /// Get the generation level for a file based on its path
-    fn get_file_generation(&self, file: &ParquetFile) -> Result<u8> {
-        // Parse generation from file path
-        // Expected format: dbs/{table}-{db_id}/{table}-{table_id}/gen{level}/{YYYY-MM-DD}/{HH-MM}/{uuid}.parquet
-        let path = &file.path;
-
-        // Look for a whole "gen{level}" segment: database and table segments end in "-{id}", so
-        // a name such as "generator_status" never parses as a level.
-        let level = path
-            .split('/')
-            .find_map(|segment| segment.strip_prefix("gen")?.parse::<u8>().ok());
-        match level {
-            Some(generation) if (1..=5).contains(&generation) => Ok(generation),
-            Some(generation) => Err(anyhow::anyhow!(
-                "Invalid generation number {} in path: {}",
-                generation,
-                path
-            )),
-            None => {
-                // If no generation found in path, assume gen1
-                debug!("No generation found in path {}, assuming gen1", path);
-                Ok(1)
-            }
-        }
-    }
-
     /// Get the next generation level
     fn get_next_generation(&self, current_gen: u8) -> Option<u8> {
         if current_gen < 5 {
@@ -739,6 +719,11 @@ impl CompactionService {
             .entry(job.table_id)
             .or_default()
             .extend(old_files.iter().cloned());
+        // Release the permit before the upload, which retries until it succeeds: a flush that
+        // starts a data snapshot waits for it while holding the WAL lock, and so does every write.
+        // A data snapshot that starts now gets a higher number than this one, so it is newer
+        // whichever of the two is written first.
+        drop(snapshot_permit);
 
         // Persist snapshot before mutating catalog or deleting old parquet objects.
         let persisted_snapshot = PersistedSnapshotVersion::V1(snapshot);
@@ -751,7 +736,6 @@ impl CompactionService {
                 }
             }
         }
-        drop(snapshot_permit);
 
         let persisted_files = self.persisted_files();
         for file in new_files {
@@ -915,6 +899,38 @@ fn sort_record_batches(
         .context("failed to construct sorted record batch")?;
 
     Ok(vec![sorted])
+}
+
+/// Get the generation level for a file based on its path
+fn file_generation(path: &str) -> Result<u8> {
+    // Parse generation from file path
+    // Expected format: {node}/dbs/{db}-{db_id}/{table}-{table_id}/gen{level}/{YYYY-MM-DD}/{HH-MM}/{uuid}.parquet
+
+    // Look for a whole "gen{level}" segment after "dbs": the node id comes before it and may look
+    // like one, and database and table segments end in "-{id}", so a name such as
+    // "generator_status" never reads as a level.
+    let level = path
+        .split('/')
+        .skip_while(|segment| *segment != "dbs")
+        .find_map(|segment| {
+            let digits = segment.strip_prefix("gen")?;
+            (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then_some(digits)
+        });
+    match level {
+        Some(digits) => match digits.parse::<u8>() {
+            Ok(generation) if (1..=5).contains(&generation) => Ok(generation),
+            _ => Err(anyhow::anyhow!(
+                "Invalid generation number {} in path: {}",
+                digits,
+                path
+            )),
+        },
+        None => {
+            // If no generation found in path, assume gen1
+            debug!("No generation found in path {}, assuming gen1", path);
+            Ok(1)
+        }
+    }
 }
 
 /// Build the object store path for a compacted file.
@@ -1146,6 +1162,10 @@ mod tests {
 
         /// Start a second server on the same object store, as a pod restart does. Returns its
         /// catalog and write buffer once the WAL replay has finished.
+        ///
+        /// The original write buffer keeps running, so don't write to it afterwards: both WALs
+        /// would try to create the same WAL file. Starting a write buffer also resets the
+        /// process-wide parquet file id counter to the newest snapshot's `next_file_id`.
         async fn restart(&self) -> (Arc<Catalog>, Arc<WriteBufferImpl>) {
             let time_provider: Arc<dyn TimeProvider> = Arc::clone(&self.time) as _;
             let catalog = Arc::new(
@@ -1192,7 +1212,7 @@ mod tests {
         fn gen1_file_count(&self) -> usize {
             self.indexed_files()
                 .iter()
-                .filter(|f| !f.path.contains("/gen"))
+                .filter(|f| matches!(file_generation(&f.path), Ok(1)))
                 .count()
         }
 
@@ -1515,13 +1535,33 @@ mod tests {
         });
         reached.notified().await;
 
-        // Compact while data snapshot 2 is still being written.
+        // Compact while data snapshot 2 is still being written. Run the compaction until it has
+        // reserved its snapshot number (planning and the merge are done by then), then give it
+        // time to write its snapshot, as it did before it waited for data snapshot 2.
         h.set_now(Duration::from_secs(120));
         let compaction = h.compact();
         tokio::pin!(compaction);
-        let compacted_first = tokio::time::timeout(Duration::from_secs(1), &mut compaction)
-            .await
-            .is_ok();
+        let mut compacted_first = false;
+        let mut polls = 0;
+        while wal.last_snapshot_sequence_number().await < SnapshotSequenceNumber::new(3) {
+            if tokio::time::timeout(Duration::from_millis(50), &mut compaction)
+                .await
+                .is_ok()
+            {
+                compacted_first = true;
+                break;
+            }
+            polls += 1;
+            assert!(
+                polls < 600,
+                "the compaction never reserved its snapshot number"
+            );
+        }
+        if !compacted_first {
+            compacted_first = tokio::time::timeout(Duration::from_millis(500), &mut compaction)
+                .await
+                .is_ok();
+        }
         release.notify_one();
         if !compacted_first {
             compaction.await;
@@ -1580,31 +1620,129 @@ mod tests {
     /// Regression test (TAG-2495): the generation is a `gen<N>` path segment. Looking for the first
     /// "/gen" anywhere in the path read a database or table named e.g. `generator_status` as a
     /// generation, failed to parse it, and so failed planning for every table on the node.
+    #[test]
+    fn test_gen_prefixed_names_are_not_generations() {
+        assert_eq!(
+            file_generation(
+                "node/dbs/plant-1/generator_status-7/2026-10-27/10-00/0000000042.parquet"
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            file_generation(
+                "node/dbs/general-1/generator_status-7/gen2/2026-10-27/00-00/a.parquet"
+            )
+            .unwrap(),
+            2
+        );
+    }
+
+    /// The node identifier is the first path segment and can look like a generation too: only a
+    /// segment after `dbs/` is one. A level outside 1..=5 is an error however many digits it has.
+    #[test]
+    fn test_generation_ignores_node_id_and_rejects_out_of_range_levels() {
+        assert_eq!(
+            file_generation(
+                "gen5/dbs/plant-1/sensor_reading-7/2026-10-27/10-00/0000000042.parquet"
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            file_generation("gen1/dbs/plant-1/sensor_reading-7/gen3/2026-10-27/00-00/a.parquet")
+                .unwrap(),
+            3
+        );
+        assert!(
+            file_generation("node/dbs/plant-1/sensor_reading-7/gen300/2026-10-27/00-00/a.parquet")
+                .is_err()
+        );
+    }
+
+    /// One file with a generation this build does not know (e.g. written by a build with more
+    /// levels) must not stop planning: it used to fail the whole cycle for every table.
     #[tokio::test]
-    async fn test_gen_prefixed_names_are_not_generations() {
+    async fn test_file_with_unknown_generation_does_not_stop_planning() {
         let h = CompactionHarness::new().await;
-        let generation = |path: &str| {
-            h.service.get_file_generation(&ParquetFile {
+        h.write_gen1("testtable value=1 10000000000\ntesttable value=2 130000000000")
+            .await;
+        let db = h.catalog.db_schema(CompactionHarness::DB).unwrap();
+        let table_id = db
+            .table_definition(CompactionHarness::TABLE)
+            .unwrap()
+            .table_id;
+        h.write_buffer.persisted_files().add_persisted_file(
+            &db.id,
+            &table_id,
+            &ParquetFile {
                 id: ParquetFileId::new(),
-                path: path.to_string(),
+                path: format!(
+                    "test-host/dbs/{}-{}/{}-{}/gen9/1970-01-01/00-00/a.parquet",
+                    CompactionHarness::DB,
+                    db.id,
+                    CompactionHarness::TABLE,
+                    table_id
+                ),
                 size_bytes: 1,
                 row_count: 1,
                 chunk_time: 0,
                 min_time: 0,
-                max_time: 0,
-            })
-        };
+                max_time: 1,
+            },
+        );
 
-        assert_eq!(
-            generation("node/dbs/plant-1/generator_status-7/2026-10-27/10-00/0000000042.parquet")
-                .unwrap(),
-            1
+        h.set_now(Duration::from_secs(120));
+        let jobs = h.service.identify_compaction_jobs().await.unwrap();
+        assert_eq!(jobs.len(), 1, "the gen1 file should still be planned");
+        assert_eq!(jobs[0].files.len(), 1);
+        assert_eq!(file_generation(&jobs[0].files[0].path).unwrap(), 1);
+    }
+
+    /// Regression test (TAG-2495): the compaction snapshot's upload retries until it succeeds.
+    /// Holding the WAL's snapshot permit through it made a flush that starts a data snapshot,
+    /// and so every write, wait for as long as the object store failed.
+    #[tokio::test]
+    async fn test_flush_does_not_wait_for_compaction_snapshot_upload() {
+        use crate::paths::SnapshotInfoFilePath;
+        use influxdb3_test_helpers::object_store::SynchronizedObjectStore;
+        use influxdb3_wal::SnapshotSequenceNumber;
+        use tokio::sync::Notify;
+
+        // Data snapshot 1 persists the gen1 file; the compaction snapshot is 2 and is held.
+        let held = SnapshotInfoFilePath::new("test-host", SnapshotSequenceNumber::new(2));
+        let reached = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let store = SynchronizedObjectStore::new(Arc::new(InMemory::new())).with_put_notifies(
+            held.as_ref().clone(),
+            Arc::clone(&release),
+            Arc::clone(&reached),
         );
-        assert_eq!(
-            generation("node/dbs/general-1/generator_status-7/gen2/2026-10-27/00-00/a.parquet")
-                .unwrap(),
-            2
-        );
+        let h = CompactionHarness::with_object_store(Arc::new(store)).await;
+        h.write_gen1("testtable value=1 10000000000\ntesttable value=2 130000000000")
+            .await;
+
+        h.set_now(Duration::from_secs(120));
+        let compaction = h.compact();
+        tokio::pin!(compaction);
+        tokio::select! {
+            _ = &mut compaction => panic!("test setup: the compaction snapshot was not held"),
+            _ = reached.notified() => {}
+        }
+
+        let flushed = tokio::time::timeout(
+            Duration::from_secs(1),
+            h.write_buffer.wal().force_flush_buffer(),
+        )
+        .await;
+        release.notify_one();
+        compaction.await;
+
+        let (snapshot_done, _, permit) = flushed
+            .expect("the flush waited for the compaction snapshot upload")
+            .expect("test setup: no data snapshot");
+        snapshot_done.await.expect("snapshot failed");
+        drop(permit);
     }
 
     /// If writing a later output fails, outputs already uploaded by this attempt are deleted.

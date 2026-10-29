@@ -1316,6 +1316,49 @@ mod tests {
                 .compacted_files
         }
 
+        /// Run `SELECT *` on the test table and return `(chunks queried, rows returned)`. As in
+        /// `QueryTable::scan`, every buffer and parquet chunk goes into one `ProviderBuilder`, so
+        /// duplicate rows are merged as in a real query.
+        async fn select_all(&self) -> (usize, usize) {
+            use crate::{ChunkContainer, ChunkFilter};
+            use iox_query::provider::ProviderBuilder;
+
+            let db = self.catalog.db_schema(Self::DB).unwrap();
+            let table_def = db.table_definition(Self::TABLE).unwrap();
+            let ctx = {
+                let mut session_config = self.service.executor.new_session_config();
+                for (key, value) in &self.service.datafusion_config {
+                    session_config = session_config.with_config_option(key, value);
+                }
+                session_config.build()
+            };
+            let chunks = self
+                .write_buffer
+                .get_table_chunks(
+                    Arc::clone(&db),
+                    Arc::clone(&table_def),
+                    &ChunkFilter::default(),
+                    None,
+                    &ctx.inner().state(),
+                )
+                .unwrap();
+            let chunk_count = chunks.len();
+            let mut builder =
+                ProviderBuilder::new(Arc::clone(&table_def.table_name), table_def.schema.clone());
+            for chunk in chunks {
+                builder = builder.add_chunk(chunk);
+            }
+            ctx.inner()
+                .register_table(Self::TABLE, Arc::new(builder.build().unwrap()))
+                .unwrap();
+            let plan = ctx
+                .sql_to_physical_plan(&format!("SELECT * FROM {}", Self::TABLE))
+                .await
+                .unwrap();
+            let batches = ctx.collect(plan).await.unwrap();
+            (chunk_count, batches.iter().map(|b| b.num_rows()).sum())
+        }
+
         /// Every indexed file must exist with exactly the indexed size, and its footer must parse
         /// to the indexed row count. Then scan all indexed files the way queries do (object
         /// size taken from the index) and check the total row count.
@@ -1535,6 +1578,72 @@ mod tests {
         planned.sort();
         day.sort();
         assert_eq!(planned, day);
+    }
+
+    /// Compacts gen1 into 1 day gen2 windows as soon as a window has ended and holds one file.
+    fn daily_gen2_any_files_config() -> CompactionConfig {
+        CompactionConfig {
+            min_files_for_compaction: 1,
+            ..daily_gen2_config()
+        }
+    }
+
+    /// A row at 00:30 on `DAY_START`: in its own gen1 chunk, inside the gen2 window of that day.
+    fn row_at_half_past_midnight() -> String {
+        format!("testtable value=1 {}", DAY_START + 30 * 60 * 1_000_000_000)
+    }
+
+    /// Regression test (TAG-2504): queries merge duplicate rows only within a partition, and each
+    /// parquet file's partition came from its chunk time: its gen1 chunk for a gen1 file, the day
+    /// for a gen2 file. A row compacted into gen2 and persisted again as gen1 (as replaying WAL
+    /// that was already persisted does) was returned twice.
+    #[tokio::test]
+    async fn test_row_in_gen2_and_gen1_files_is_returned_once() {
+        let h = CompactionHarness::with_config(daily_gen2_any_files_config()).await;
+        h.write_gen1(&row_at_half_past_midnight()).await;
+        h.set_now(Duration::from_nanos((DAY_START + ONE_DAY) as u64));
+        h.compact().await;
+
+        h.write_gen1(&row_at_half_past_midnight()).await;
+        let files = h.indexed_files();
+        assert_eq!(
+            files.iter().filter(|f| f.path.contains("/gen2/")).count(),
+            1,
+            "test setup: one gen2 file: {files:?}"
+        );
+        assert_eq!(
+            h.gen1_file_count(),
+            1,
+            "test setup: one gen1 copy: {files:?}"
+        );
+
+        let (chunks, rows) = h.select_all().await;
+        assert_eq!(chunks, 2, "test setup: both files must be queried");
+        assert_eq!(rows, 1);
+    }
+
+    /// Regression test (TAG-2504): the same for a row that is in a gen2 file and in the buffer,
+    /// whose chunks were partitioned by their gen1 chunk time too.
+    #[tokio::test]
+    async fn test_row_in_gen2_file_and_buffer_is_returned_once() {
+        let h = CompactionHarness::with_config(daily_gen2_any_files_config()).await;
+        h.write_gen1(&row_at_half_past_midnight()).await;
+        h.set_now(Duration::from_nanos((DAY_START + ONE_DAY) as u64));
+        h.compact().await;
+
+        h.write_wal_only(&row_at_half_past_midnight()).await;
+        let files = h.indexed_files();
+        assert!(
+            files.len() == 1 && files[0].path.contains("/gen2/"),
+            "test setup: only the gen2 file is persisted, the copy is in the buffer: {files:?}"
+        );
+
+        let (chunks, rows) = h.select_all().await;
+        assert_eq!(
+            chunks, 2,
+            "test setup: the gen2 file and the buffer must be queried"
+        );
+        assert_eq!(rows, 1);
     }
 
     /// Regression test (TAG-2495): startup replays the WAL after the newest snapshot's

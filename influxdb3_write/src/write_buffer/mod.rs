@@ -487,6 +487,25 @@ pub fn cache_parquet_files<T: AsRef<ParquetFile>>(
     }
 }
 
+/// The partition of every chunk a table query reads, buffer and parquet alike.
+///
+/// Queries merge rows with the same primary key only within a partition. The same row can be in
+/// the buffer, a gen1 file and a compacted file, whose chunk times differ (a gen1 chunk, a day, a
+/// week), so a partition per chunk time returned every copy. Within the one partition, IOx
+/// de-duplicates each group of chunks whose time ranges overlap. A group of more than one chunk
+/// (e.g. a compacted file and a leftover gen1 file) is sorted and de-duplicated, and a query with
+/// more of those groups than `iox.max_dedup_split` (default 100) is planned as a single
+/// de-duplication over all of its chunks.
+pub(crate) fn query_partition_id() -> data_types::partition::TransitionPartitionId {
+    data_types::partition::TransitionPartitionId::from_parts(
+        PartitionId::new(0),
+        Some(PartitionHashId::new(
+            data_types::TableId::new(0),
+            &data_types::PartitionKey::from("table"),
+        )),
+    )
+}
+
 pub fn parquet_chunk_from_file(
     parquet_file: &ParquetFile,
     table_schema: &Schema,
@@ -494,14 +513,7 @@ pub fn parquet_chunk_from_file(
     object_store: Arc<dyn ObjectStore>,
     chunk_order: i64,
 ) -> ParquetChunk {
-    let partition_key = data_types::PartitionKey::from(parquet_file.chunk_time.to_string());
-    let partition_id = data_types::partition::TransitionPartitionId::from_parts(
-        PartitionId::new(0),
-        Some(PartitionHashId::new(
-            data_types::TableId::new(0),
-            &partition_key,
-        )),
-    );
+    let partition_id = query_partition_id();
 
     let chunk_stats = create_chunk_statistics(
         Some(parquet_file.row_count as usize),

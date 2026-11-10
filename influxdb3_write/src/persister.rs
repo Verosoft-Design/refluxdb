@@ -154,13 +154,15 @@ impl Persister {
             list.push(item?);
         }
         let listed = list.len();
+        let list_elapsed = total_start.elapsed();
 
         // Listings can arrive out of order, so sort (unstable is faster and there are no
         // duplicates). Snapshot names are u64::MAX - sequence number, so ascending order by
         // location is the most recent snapshot first.
+        let sort_start = std::time::Instant::now();
         list.sort_unstable_by(|a, b| a.location.cmp(&b.location));
         list.truncate(most_recent_n);
-        let list_elapsed = total_start.elapsed();
+        let sort_elapsed = sort_start.elapsed();
 
         let fetch_start = std::time::Instant::now();
         let mut results = Vec::with_capacity(list.len());
@@ -176,6 +178,7 @@ impl Persister {
             loaded = results.len(),
             requested = most_recent_n,
             list_ms = list_elapsed.as_millis() as u64,
+            sort_ms = sort_elapsed.as_millis() as u64,
             fetch_ms = fetch_start.elapsed().as_millis() as u64,
             total_ms = total_start.elapsed().as_millis() as u64,
             "loaded snapshots"
@@ -458,7 +461,7 @@ mod tests {
     }
 
     #[tokio::test]
-    /// This test makes sure that the logic for offset lists works
+    /// This test makes sure that more than 1,000 snapshots are all listed and loaded
     async fn persist_and_load_over_1000_snapshot_info_files() {
         let local_disk =
             LocalFileSystem::new_with_prefix(test_helpers::tmp_dir().unwrap()).unwrap();
@@ -559,6 +562,10 @@ mod tests {
         lists: std::sync::atomic::AtomicUsize,
         in_flight: std::sync::atomic::AtomicUsize,
         max_in_flight: std::sync::atomic::AtomicUsize,
+        /// GETs of a path containing this text fail
+        fail_get_containing: std::sync::Mutex<Option<String>>,
+        /// Listings end with an error item
+        fail_list: std::sync::atomic::AtomicBool,
     }
 
     impl CountingStore {
@@ -568,6 +575,8 @@ mod tests {
                 lists: Default::default(),
                 in_flight: Default::default(),
                 max_in_flight: Default::default(),
+                fail_get_containing: Default::default(),
+                fail_list: Default::default(),
             }
         }
     }
@@ -607,7 +616,20 @@ mod tests {
             self.max_in_flight.fetch_max(now, SeqCst);
             // Yield so concurrent GETs overlap
             tokio::task::yield_now().await;
-            let res = self.inner.get_opts(location, options).await;
+            let fails = self
+                .fail_get_containing
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|text| location.as_ref().contains(text));
+            let res = if fails {
+                Err(object_store::Error::Generic {
+                    store: "CountingStore",
+                    source: "injected GET failure".into(),
+                })
+            } else {
+                self.inner.get_opts(location, options).await
+            };
             self.in_flight.fetch_sub(1, SeqCst);
             res
         }
@@ -622,6 +644,17 @@ mod tests {
         ) -> futures_util::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
         {
             self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_list.load(std::sync::atomic::Ordering::SeqCst) {
+                let error = object_store::Error::Generic {
+                    store: "CountingStore",
+                    source: "injected list failure".into(),
+                };
+                return self
+                    .inner
+                    .list(prefix)
+                    .chain(futures_util::stream::once(async { Err(error) }))
+                    .boxed();
+            }
             self.inner.list(prefix)
         }
 
@@ -730,6 +763,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_snapshots_returns_an_error_when_a_get_fails() {
+        let (persister, store) = persister_with_snapshots(50).await;
+        // the 5th newest of the 10 requested
+        let seq_of_fifth_newest = 45;
+        let path = SnapshotInfoFilePath::new(
+            "test_host",
+            SnapshotSequenceNumber::new(seq_of_fifth_newest),
+        );
+        *store.fail_get_containing.lock().unwrap() = Some(path.as_ref().to_string());
+
+        assert!(persister.load_snapshots(10).await.is_err());
+        // the same failing snapshot outside the requested newest N is never fetched
+        assert_eq!(persister.load_snapshots(4).await.unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn load_snapshots_returns_an_error_for_a_corrupt_snapshot() {
+        let (persister, _store) = persister_with_snapshots(50).await;
+        let path = SnapshotInfoFilePath::new("test_host", SnapshotSequenceNumber::new(45));
+        persister
+            .object_store
+            .put(path.as_ref(), object_store::PutPayload::from("not json"))
+            .await
+            .unwrap();
+
+        assert!(persister.load_snapshots(10).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn load_snapshots_returns_an_error_when_the_listing_fails() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (persister, store) = persister_with_snapshots(50).await;
+        store.fail_list.store(true, SeqCst);
+
+        assert!(persister.load_snapshots(10).await.is_err());
+    }
+
+    #[tokio::test]
     async fn load_snapshots_bounds_get_concurrency() {
         use std::sync::atomic::Ordering::SeqCst;
         let (persister, store) = persister_with_snapshots(300).await;
@@ -738,8 +809,8 @@ mod tests {
 
         assert_eq!(snapshots.len(), 300);
         let max = store.max_in_flight.load(SeqCst);
-        assert!(max <= FETCH_CONCURRENCY, "peak in-flight GETs was {max}");
-        assert!(max > 1, "GETs never overlapped, test proves nothing");
+        // 300 snapshots is more than the bound, so the loader must reach it, and never pass it
+        assert_eq!(max, FETCH_CONCURRENCY, "peak in-flight GETs was {max}");
     }
 
     /// The per-1,000-chunk loader from before TAG-2629 (`16ff968`), kept as the reference the

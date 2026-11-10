@@ -85,6 +85,9 @@ pub struct Persister {
     pub(crate) mem_pool: Arc<dyn MemoryPool>,
 }
 
+/// Maximum number of snapshot GETs in flight at once when loading snapshots.
+const FETCH_CONCURRENCY: usize = 64;
+
 impl Persister {
     pub fn new(
         object_store: Arc<dyn ObjectStore>,
@@ -125,15 +128,16 @@ impl Persister {
         &self,
         most_recent_n: usize,
     ) -> Result<Vec<PersistedSnapshotVersion>> {
-        /// Maximum number of snapshot GETs in flight at once.
-        const FETCH_CONCURRENCY: usize = 64;
-
         async fn get_snapshot(
             location: ObjPath,
             object_store: Arc<dyn ObjectStore>,
         ) -> Result<PersistedSnapshotVersion> {
             let bytes = object_store.get(&location).await?.bytes().await?;
             serde_json::from_slice(&bytes).map_err(Into::into)
+        }
+
+        if most_recent_n == 0 {
+            return Ok(Vec::new());
         }
 
         let total_start = std::time::Instant::now();
@@ -716,8 +720,13 @@ mod tests {
 
     #[tokio::test]
     async fn load_snapshots_zero_returns_nothing() {
-        let (persister, _store) = persister_with_snapshots(5).await;
+        use std::sync::atomic::Ordering::SeqCst;
+        let (persister, store) = persister_with_snapshots(5).await;
+        let lists_before = store.lists.load(SeqCst);
+
         assert!(persister.load_snapshots(0).await.unwrap().is_empty());
+        // asking for nothing must not list the folder
+        assert_eq!(store.lists.load(SeqCst), lists_before);
     }
 
     #[tokio::test]
@@ -729,7 +738,7 @@ mod tests {
 
         assert_eq!(snapshots.len(), 300);
         let max = store.max_in_flight.load(SeqCst);
-        assert!(max <= 64, "peak in-flight GETs was {max}");
+        assert!(max <= FETCH_CONCURRENCY, "peak in-flight GETs was {max}");
         assert!(max > 1, "GETs never overlapped, test proves nothing");
     }
 

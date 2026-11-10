@@ -733,6 +733,185 @@ mod tests {
         assert!(max > 1, "GETs never overlapped, test proves nothing");
     }
 
+    /// The per-1,000-chunk loader from before TAG-2629 (`16ff968`), kept as the reference the
+    /// single listing must match.
+    async fn load_snapshots_per_chunk_listing(
+        persister: &Persister,
+        mut most_recent_n: usize,
+    ) -> Vec<PersistedSnapshotVersion> {
+        use futures_util::stream::FuturesOrdered;
+        let mut futures = FuturesOrdered::new();
+        let mut offset: Option<ObjPath> = None;
+
+        while most_recent_n > 0 {
+            let count = if most_recent_n > 1000 {
+                most_recent_n -= 1000;
+                1000
+            } else {
+                let count = most_recent_n;
+                most_recent_n = 0;
+                count
+            };
+
+            let mut snapshot_list = if let Some(offset) = offset {
+                persister.object_store.list_with_offset(
+                    Some(&SnapshotInfoFilePath::dir(
+                        &persister.node_identifier_prefix,
+                    )),
+                    &offset,
+                )
+            } else {
+                persister.object_store.list(Some(&SnapshotInfoFilePath::dir(
+                    &persister.node_identifier_prefix,
+                )))
+            };
+
+            let mut list = Vec::new();
+            while let Some(item) = snapshot_list.next().await {
+                list.push(item.unwrap());
+            }
+
+            list.sort_unstable_by(|a, b| a.location.cmp(&b.location));
+
+            let len = list.len();
+            let end = if len <= count { len } else { count };
+
+            async fn get_snapshot(
+                location: ObjPath,
+                object_store: Arc<dyn ObjectStore>,
+            ) -> PersistedSnapshotVersion {
+                let bytes = object_store
+                    .get(&location)
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap();
+                serde_json::from_slice(&bytes).unwrap()
+            }
+
+            for item in &list[0..end] {
+                futures.push_back(get_snapshot(
+                    item.location.clone(),
+                    Arc::clone(&persister.object_store),
+                ));
+            }
+
+            if end == 0 {
+                break;
+            }
+
+            offset = Some(list[end - 1].location.clone());
+        }
+
+        let mut results = Vec::new();
+        while let Some(result) = futures.next().await {
+            results.push(result);
+        }
+        results
+    }
+
+    fn parquet_file(id: u64, path: &str, min_time: i64) -> ParquetFile {
+        ParquetFile {
+            id: ParquetFileId::from(id),
+            path: path.to_string(),
+            size_bytes: 100 + id,
+            row_count: 10,
+            chunk_time: min_time,
+            min_time,
+            max_time: min_time + 1,
+        }
+    }
+
+    fn tables_with(files: Vec<ParquetFile>) -> SerdeVecMap<DbId, DatabaseTables> {
+        let mut tables = SerdeVecMap::new();
+        tables.insert(TableId::new(1), files);
+        let mut dbs = SerdeVecMap::new();
+        dbs.insert(DbId::new(1), DatabaseTables { tables });
+        dbs
+    }
+
+    /// Persists `count` snapshots. Each adds one file; every 5th removes the file added three
+    /// snapshots earlier; every 7th reuses the path of the file the snapshot before it added (a
+    /// same-path duplicate with a new id).
+    async fn persist_snapshots_with_files(count: u64) -> Persister {
+        let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
+        let persister = Persister::new(Arc::new(InMemory::new()), "test_host", time_provider);
+        for id in 0..count {
+            let path = if id > 0 && id % 7 == 0 {
+                format!("file_{}.parquet", id - 1)
+            } else {
+                format!("file_{id}.parquet")
+            };
+            let added = vec![parquet_file(id, &path, id as i64 * 10)];
+            let removed = if id >= 3 && id % 5 == 0 {
+                tables_with(vec![parquet_file(
+                    id - 3,
+                    &format!("file_{}.parquet", id - 3),
+                    (id as i64 - 3) * 10,
+                )])
+            } else {
+                SerdeVecMap::new()
+            };
+            let snapshot = PersistedSnapshotVersion::V1(PersistedSnapshot {
+                node_id: "test_host".to_string(),
+                next_file_id: ParquetFileId::from(id + 1),
+                snapshot_sequence_number: SnapshotSequenceNumber::new(id),
+                wal_file_sequence_number: WalFileSequenceNumber::new(id * 2),
+                catalog_sequence_number: CatalogSequenceNumber::new(id),
+                databases: tables_with(added),
+                removed_files: removed,
+                min_time: 0,
+                max_time: 1,
+                row_count: 10,
+                parquet_size_bytes: 100,
+            });
+            persister.persist_snapshot(&snapshot).await.unwrap();
+        }
+        persister
+    }
+
+    #[tokio::test]
+    async fn load_snapshots_matches_the_per_chunk_listing_loader() {
+        use crate::write_buffer::persisted_files::PersistedFiles;
+        use influxdb3_telemetry::ParquetMetrics;
+
+        let persister = persist_snapshots_with_files(2300).await;
+
+        for n in [0, 1, 999, 1000, 1001, 1999, 2000, 2001, 2300, 5000] {
+            let old = load_snapshots_per_chunk_listing(&persister, n).await;
+            let new = persister.load_snapshots(n).await.unwrap();
+            assert_eq!(old, new, "snapshot sequence differs for n = {n}");
+
+            let to_files = |versions: Vec<PersistedSnapshotVersion>| {
+                PersistedFiles::new_from_persisted_snapshots(
+                    versions
+                        .into_iter()
+                        .map(|v| match v {
+                            PersistedSnapshotVersion::V1(ps) => ps,
+                        })
+                        .collect(),
+                )
+            };
+            let (old_files, new_files) = (to_files(old), to_files(new));
+            assert_eq!(
+                old_files.get_metrics().0,
+                new_files.get_metrics().0,
+                "parquet file count differs for n = {n}"
+            );
+            assert_eq!(
+                old_files.last_persisted_wal_sequence_number(),
+                new_files.last_persisted_wal_sequence_number(),
+                "last persisted wal sequence number differs for n = {n}"
+            );
+            assert_eq!(
+                old_files.get_files(DbId::new(1), TableId::new(1)),
+                new_files.get_files(DbId::new(1), TableId::new(1)),
+                "indexed files differ for n = {n}"
+            );
+        }
+    }
+
     #[test]
     fn persisted_snapshot_structure() {
         let databases = [

@@ -15,12 +15,13 @@ use datafusion::execution::memory_pool::UnboundedMemoryPool;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures_util::pin_mut;
+use futures_util::stream::StreamExt;
 use futures_util::stream::TryStreamExt;
-use futures_util::stream::{FuturesOrdered, StreamExt};
 use influxdb3_cache::parquet_cache::ParquetFileDataToCache;
 use iox_time::TimeProvider;
 use object_store::ObjectStore;
 use object_store::path::Path as ObjPath;
+use observability_deps::tracing::info;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -84,6 +85,9 @@ pub struct Persister {
     pub(crate) mem_pool: Arc<dyn MemoryPool>,
 }
 
+/// Maximum number of snapshot GETs in flight at once when loading snapshots.
+const FETCH_CONCURRENCY: usize = 64;
+
 impl Persister {
     pub fn new(
         object_store: Arc<dyn ObjectStore>,
@@ -118,82 +122,67 @@ impl Persister {
 
     /// Loads the most recently persisted N snapshot parquet file lists from object storage.
     ///
-    /// This is intended to be used on server start.
+    /// This is intended to be used on server start. The snapshot folder is listed once, and the
+    /// snapshots are fetched with a bounded number of concurrent GETs.
     pub async fn load_snapshots(
         &self,
-        mut most_recent_n: usize,
+        most_recent_n: usize,
     ) -> Result<Vec<PersistedSnapshotVersion>> {
-        let mut futures = FuturesOrdered::new();
-        let mut offset: Option<ObjPath> = None;
-
-        while most_recent_n > 0 {
-            let count = if most_recent_n > 1000 {
-                most_recent_n -= 1000;
-                1000
-            } else {
-                let count = most_recent_n;
-                most_recent_n = 0;
-                count
-            };
-
-            let mut snapshot_list = if let Some(offset) = offset {
-                self.object_store.list_with_offset(
-                    Some(&SnapshotInfoFilePath::dir(&self.node_identifier_prefix)),
-                    &offset,
-                )
-            } else {
-                self.object_store.list(Some(&SnapshotInfoFilePath::dir(
-                    &self.node_identifier_prefix,
-                )))
-            };
-
-            // Why not collect into a Result<Vec<ObjectMeta>, object_store::Error>>
-            // like we could with Iterators? Well because it's a stream it ends up
-            // using different traits and can't really do that. So we need to loop
-            // through to return any errors that might have occurred, then do an
-            // unstable sort (which is faster and we know won't have any
-            // duplicates) since these can arrive out of order, and then issue gets
-            // on the n most recent snapshots that we want and is returned in order
-            // of the moste recent to least.
-            let mut list = Vec::new();
-            while let Some(item) = snapshot_list.next().await {
-                list.push(item?);
-            }
-
-            list.sort_unstable_by(|a, b| a.location.cmp(&b.location));
-
-            let len = list.len();
-            let end = if len <= count { len } else { count };
-
-            async fn get_snapshot(
-                location: ObjPath,
-                object_store: Arc<dyn ObjectStore>,
-            ) -> Result<PersistedSnapshotVersion> {
-                let bytes = object_store.get(&location).await?.bytes().await?;
-                serde_json::from_slice(&bytes).map_err(Into::into)
-            }
-
-            for item in &list[0..end] {
-                futures.push_back(get_snapshot(
-                    item.location.clone(),
-                    Arc::clone(&self.object_store),
-                ));
-            }
-
-            if end == 0 {
-                break;
-            }
-
-            // Get the last path in the array to use as an offset. This assumes
-            // we sorted the list as we can't guarantee otherwise the order of
-            // the list call to the object store.
-            offset = Some(list[end - 1].location.clone());
+        async fn get_snapshot(
+            location: ObjPath,
+            object_store: Arc<dyn ObjectStore>,
+        ) -> Result<PersistedSnapshotVersion> {
+            let bytes = object_store.get(&location).await?.bytes().await?;
+            serde_json::from_slice(&bytes).map_err(Into::into)
         }
 
-        let mut results = Vec::new();
-        while let Some(result) = futures.next().await {
+        if most_recent_n == 0 {
+            return Ok(Vec::new());
+        }
+
+        let total_start = std::time::Instant::now();
+
+        // Why not collect into a Result<Vec<ObjectMeta>, object_store::Error>>
+        // like we could with Iterators? Well because it's a stream it ends up
+        // using different traits and can't really do that. So we need to loop
+        // through to return any errors that might have occurred.
+        let mut snapshot_list = self.object_store.list(Some(&SnapshotInfoFilePath::dir(
+            &self.node_identifier_prefix,
+        )));
+        let mut list = Vec::new();
+        while let Some(item) = snapshot_list.next().await {
+            list.push(item?);
+        }
+        let listed = list.len();
+        let list_elapsed = total_start.elapsed();
+
+        // Listings can arrive out of order, so sort (unstable is faster and there are no
+        // duplicates). Snapshot names are u64::MAX - sequence number, so ascending order by
+        // location is the most recent snapshot first.
+        let sort_start = std::time::Instant::now();
+        list.sort_unstable_by(|a, b| a.location.cmp(&b.location));
+        list.truncate(most_recent_n);
+        let sort_elapsed = sort_start.elapsed();
+
+        let fetch_start = std::time::Instant::now();
+        let mut results = Vec::with_capacity(list.len());
+        let mut fetches = futures_util::stream::iter(list)
+            .map(|item| get_snapshot(item.location, Arc::clone(&self.object_store)))
+            .buffered(FETCH_CONCURRENCY);
+        while let Some(result) = fetches.next().await {
             results.push(result?);
         }
+
+        info!(
+            listed,
+            loaded = results.len(),
+            requested = most_recent_n,
+            list_ms = list_elapsed.as_millis() as u64,
+            sort_ms = sort_elapsed.as_millis() as u64,
+            fetch_ms = fetch_start.elapsed().as_millis() as u64,
+            total_ms = total_start.elapsed().as_millis() as u64,
+            "loaded snapshots"
+        );
         Ok(results)
     }
 
@@ -472,7 +461,7 @@ mod tests {
     }
 
     #[tokio::test]
-    /// This test makes sure that the logic for offset lists works
+    /// This test makes sure that more than 1,000 snapshots are all listed and loaded
     async fn persist_and_load_over_1000_snapshot_info_files() {
         let local_disk =
             LocalFileSystem::new_with_prefix(test_helpers::tmp_dir().unwrap()).unwrap();
@@ -564,6 +553,443 @@ mod tests {
 
         let snapshots = persister.load_snapshots(100).await.unwrap();
         assert!(snapshots.is_empty());
+    }
+
+    /// Wraps a store, counting listings and tracking the peak number of in-flight GETs.
+    #[derive(Debug)]
+    struct CountingStore {
+        inner: InMemory,
+        lists: std::sync::atomic::AtomicUsize,
+        in_flight: std::sync::atomic::AtomicUsize,
+        max_in_flight: std::sync::atomic::AtomicUsize,
+        /// GETs of a path containing this text fail
+        fail_get_containing: std::sync::Mutex<Option<String>>,
+        /// Listings end with an error item
+        fail_list: std::sync::atomic::AtomicBool,
+    }
+
+    impl CountingStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemory::new(),
+                lists: Default::default(),
+                in_flight: Default::default(),
+                max_in_flight: Default::default(),
+                fail_get_containing: Default::default(),
+                fail_list: Default::default(),
+            }
+        }
+    }
+
+    impl std::fmt::Display for CountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CountingStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for CountingStore {
+        async fn put_opts(
+            &self,
+            location: &ObjPath,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            opts: object_store::PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+            self.max_in_flight.fetch_max(now, SeqCst);
+            // Yield so concurrent GETs overlap
+            tokio::task::yield_now().await;
+            let fails = self
+                .fail_get_containing
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|text| location.as_ref().contains(text));
+            let res = if fails {
+                Err(object_store::Error::Generic {
+                    store: "CountingStore",
+                    source: "injected GET failure".into(),
+                })
+            } else {
+                self.inner.get_opts(location, options).await
+            };
+            self.in_flight.fetch_sub(1, SeqCst);
+            res
+        }
+
+        async fn delete(&self, location: &ObjPath) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> futures_util::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_list.load(std::sync::atomic::Ordering::SeqCst) {
+                let error = object_store::Error::Generic {
+                    store: "CountingStore",
+                    source: "injected list failure".into(),
+                };
+                return self
+                    .inner
+                    .list(prefix)
+                    .chain(futures_util::stream::once(async { Err(error) }))
+                    .boxed();
+            }
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&ObjPath>,
+            offset: &ObjPath,
+        ) -> futures_util::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &ObjPath, to: &ObjPath) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &ObjPath,
+            to: &ObjPath,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    async fn persister_with_snapshots(count: u64) -> (Persister, Arc<CountingStore>) {
+        let store = Arc::new(CountingStore::new());
+        let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
+        let persister = Persister::new(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            "test_host",
+            time_provider,
+        );
+        for id in 0..count {
+            let info_file = PersistedSnapshotVersion::V1(PersistedSnapshot {
+                node_id: "test_host".to_string(),
+                next_file_id: ParquetFileId::from(id),
+                snapshot_sequence_number: SnapshotSequenceNumber::new(id),
+                wal_file_sequence_number: WalFileSequenceNumber::new(id),
+                catalog_sequence_number: CatalogSequenceNumber::new(id),
+                databases: SerdeVecMap::new(),
+                removed_files: SerdeVecMap::new(),
+                min_time: 0,
+                max_time: 1,
+                row_count: 0,
+                parquet_size_bytes: 0,
+            });
+            persister.persist_snapshot(&info_file).await.unwrap();
+        }
+        (persister, store)
+    }
+
+    #[tokio::test]
+    async fn load_snapshots_lists_once_and_returns_newest_first() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (persister, store) = persister_with_snapshots(2600).await;
+
+        let snapshots = persister.load_snapshots(2500).await.unwrap();
+
+        assert_eq!(store.lists.load(SeqCst), 1);
+        assert_eq!(snapshots.len(), 2500);
+        let seqs: Vec<u64> = snapshots
+            .iter()
+            .map(|s| s.v1_ref().snapshot_sequence_number.as_u64())
+            .collect();
+        let expected: Vec<u64> = (100..2600).rev().collect();
+        assert_eq!(seqs, expected);
+    }
+
+    #[tokio::test]
+    async fn load_snapshots_n_above_and_below_object_count() {
+        let (persister, _store) = persister_with_snapshots(5).await;
+
+        let above = persister.load_snapshots(50).await.unwrap();
+        let above: Vec<u64> = above
+            .iter()
+            .map(|s| s.v1_ref().snapshot_sequence_number.as_u64())
+            .collect();
+        assert_eq!(above, vec![4, 3, 2, 1, 0]);
+
+        let below = persister.load_snapshots(3).await.unwrap();
+        let below: Vec<u64> = below
+            .iter()
+            .map(|s| s.v1_ref().snapshot_sequence_number.as_u64())
+            .collect();
+        assert_eq!(below, vec![4, 3, 2]);
+    }
+
+    #[tokio::test]
+    async fn load_snapshots_zero_returns_nothing() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (persister, store) = persister_with_snapshots(5).await;
+        let lists_before = store.lists.load(SeqCst);
+
+        assert!(persister.load_snapshots(0).await.unwrap().is_empty());
+        // asking for nothing must not list the folder
+        assert_eq!(store.lists.load(SeqCst), lists_before);
+    }
+
+    #[tokio::test]
+    async fn load_snapshots_returns_an_error_when_a_get_fails() {
+        let (persister, store) = persister_with_snapshots(50).await;
+        // the 5th newest of the 10 requested
+        let seq_of_fifth_newest = 45;
+        let path = SnapshotInfoFilePath::new(
+            "test_host",
+            SnapshotSequenceNumber::new(seq_of_fifth_newest),
+        );
+        *store.fail_get_containing.lock().unwrap() = Some(path.as_ref().to_string());
+
+        assert!(persister.load_snapshots(10).await.is_err());
+        // the same failing snapshot outside the requested newest N is never fetched
+        assert_eq!(persister.load_snapshots(4).await.unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn load_snapshots_returns_an_error_for_a_corrupt_snapshot() {
+        let (persister, _store) = persister_with_snapshots(50).await;
+        let path = SnapshotInfoFilePath::new("test_host", SnapshotSequenceNumber::new(45));
+        persister
+            .object_store
+            .put(path.as_ref(), object_store::PutPayload::from("not json"))
+            .await
+            .unwrap();
+
+        assert!(persister.load_snapshots(10).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn load_snapshots_returns_an_error_when_the_listing_fails() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (persister, store) = persister_with_snapshots(50).await;
+        store.fail_list.store(true, SeqCst);
+
+        assert!(persister.load_snapshots(10).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn load_snapshots_bounds_get_concurrency() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (persister, store) = persister_with_snapshots(300).await;
+
+        let snapshots = persister.load_snapshots(300).await.unwrap();
+
+        assert_eq!(snapshots.len(), 300);
+        let max = store.max_in_flight.load(SeqCst);
+        // 300 snapshots is more than the bound, so the loader must reach it, and never pass it
+        assert_eq!(max, FETCH_CONCURRENCY, "peak in-flight GETs was {max}");
+    }
+
+    /// The per-1,000-chunk loader from before TAG-2629 (`16ff968`), kept as the reference the
+    /// single listing must match.
+    async fn load_snapshots_per_chunk_listing(
+        persister: &Persister,
+        mut most_recent_n: usize,
+    ) -> Vec<PersistedSnapshotVersion> {
+        use futures_util::stream::FuturesOrdered;
+        let mut futures = FuturesOrdered::new();
+        let mut offset: Option<ObjPath> = None;
+
+        while most_recent_n > 0 {
+            let count = if most_recent_n > 1000 {
+                most_recent_n -= 1000;
+                1000
+            } else {
+                let count = most_recent_n;
+                most_recent_n = 0;
+                count
+            };
+
+            let mut snapshot_list = if let Some(offset) = offset {
+                persister.object_store.list_with_offset(
+                    Some(&SnapshotInfoFilePath::dir(
+                        &persister.node_identifier_prefix,
+                    )),
+                    &offset,
+                )
+            } else {
+                persister.object_store.list(Some(&SnapshotInfoFilePath::dir(
+                    &persister.node_identifier_prefix,
+                )))
+            };
+
+            let mut list = Vec::new();
+            while let Some(item) = snapshot_list.next().await {
+                list.push(item.unwrap());
+            }
+
+            list.sort_unstable_by(|a, b| a.location.cmp(&b.location));
+
+            let len = list.len();
+            let end = if len <= count { len } else { count };
+
+            async fn get_snapshot(
+                location: ObjPath,
+                object_store: Arc<dyn ObjectStore>,
+            ) -> PersistedSnapshotVersion {
+                let bytes = object_store
+                    .get(&location)
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap();
+                serde_json::from_slice(&bytes).unwrap()
+            }
+
+            for item in &list[0..end] {
+                futures.push_back(get_snapshot(
+                    item.location.clone(),
+                    Arc::clone(&persister.object_store),
+                ));
+            }
+
+            if end == 0 {
+                break;
+            }
+
+            offset = Some(list[end - 1].location.clone());
+        }
+
+        let mut results = Vec::new();
+        while let Some(result) = futures.next().await {
+            results.push(result);
+        }
+        results
+    }
+
+    fn parquet_file(id: u64, path: &str, min_time: i64) -> ParquetFile {
+        ParquetFile {
+            id: ParquetFileId::from(id),
+            path: path.to_string(),
+            size_bytes: 100 + id,
+            row_count: 10,
+            chunk_time: min_time,
+            min_time,
+            max_time: min_time + 1,
+        }
+    }
+
+    fn tables_with(files: Vec<ParquetFile>) -> SerdeVecMap<DbId, DatabaseTables> {
+        let mut tables = SerdeVecMap::new();
+        tables.insert(TableId::new(1), files);
+        let mut dbs = SerdeVecMap::new();
+        dbs.insert(DbId::new(1), DatabaseTables { tables });
+        dbs
+    }
+
+    /// Persists `count` snapshots. Each adds one file; every 5th removes the file added three
+    /// snapshots earlier; every 7th reuses the path of the file the snapshot before it added (a
+    /// same-path duplicate with a new id).
+    async fn persist_snapshots_with_files(count: u64) -> Persister {
+        let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
+        let persister = Persister::new(Arc::new(InMemory::new()), "test_host", time_provider);
+        for id in 0..count {
+            let path = if id > 0 && id % 7 == 0 {
+                format!("file_{}.parquet", id - 1)
+            } else {
+                format!("file_{id}.parquet")
+            };
+            let added = vec![parquet_file(id, &path, id as i64 * 10)];
+            let removed = if id >= 3 && id % 5 == 0 {
+                tables_with(vec![parquet_file(
+                    id - 3,
+                    &format!("file_{}.parquet", id - 3),
+                    (id as i64 - 3) * 10,
+                )])
+            } else {
+                SerdeVecMap::new()
+            };
+            let snapshot = PersistedSnapshotVersion::V1(PersistedSnapshot {
+                node_id: "test_host".to_string(),
+                next_file_id: ParquetFileId::from(id + 1),
+                snapshot_sequence_number: SnapshotSequenceNumber::new(id),
+                wal_file_sequence_number: WalFileSequenceNumber::new(id * 2),
+                catalog_sequence_number: CatalogSequenceNumber::new(id),
+                databases: tables_with(added),
+                removed_files: removed,
+                min_time: 0,
+                max_time: 1,
+                row_count: 10,
+                parquet_size_bytes: 100,
+            });
+            persister.persist_snapshot(&snapshot).await.unwrap();
+        }
+        persister
+    }
+
+    #[tokio::test]
+    async fn load_snapshots_matches_the_per_chunk_listing_loader() {
+        use crate::write_buffer::persisted_files::PersistedFiles;
+        use influxdb3_telemetry::ParquetMetrics;
+
+        let persister = persist_snapshots_with_files(2300).await;
+
+        for n in [0, 1, 999, 1000, 1001, 1999, 2000, 2001, 2300, 5000] {
+            let old = load_snapshots_per_chunk_listing(&persister, n).await;
+            let new = persister.load_snapshots(n).await.unwrap();
+            assert_eq!(old, new, "snapshot sequence differs for n = {n}");
+
+            let to_files = |versions: Vec<PersistedSnapshotVersion>| {
+                PersistedFiles::new_from_persisted_snapshots(
+                    versions
+                        .into_iter()
+                        .map(|v| match v {
+                            PersistedSnapshotVersion::V1(ps) => ps,
+                        })
+                        .collect(),
+                )
+            };
+            let (old_files, new_files) = (to_files(old), to_files(new));
+            assert_eq!(
+                old_files.get_metrics().0,
+                new_files.get_metrics().0,
+                "parquet file count differs for n = {n}"
+            );
+            assert_eq!(
+                old_files.last_persisted_wal_sequence_number(),
+                new_files.last_persisted_wal_sequence_number(),
+                "last persisted wal sequence number differs for n = {n}"
+            );
+            assert_eq!(
+                old_files.get_files(DbId::new(1), TableId::new(1)),
+                new_files.get_files(DbId::new(1), TableId::new(1)),
+                "indexed files differ for n = {n}"
+            );
+        }
     }
 
     #[test]

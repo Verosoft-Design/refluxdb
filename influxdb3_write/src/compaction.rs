@@ -1018,7 +1018,51 @@ mod tests {
         time: Arc<MockProvider>,
         executor: Arc<Executor>,
         write_buffer: Arc<WriteBufferImpl>,
-        service: CompactionService,
+        service: Arc<CompactionService>,
+    }
+
+    /// gen1 -> gen2 into 2 minute windows once a window has ended and holds a gen1 file.
+    fn two_minute_gen2_config() -> CompactionConfig {
+        CompactionConfig {
+            enabled: true,
+            interval: Duration::from_secs(1),
+            max_files_per_run: 10,
+            min_files_for_compaction: 1,
+            generation_durations: HashMap::from([
+                (1, Duration::from_secs(60)),
+                (2, Duration::from_secs(120)),
+            ]),
+        }
+    }
+
+    fn new_test_service(
+        config: CompactionConfig,
+        catalog: &Arc<Catalog>,
+        write_buffer: &Arc<WriteBufferImpl>,
+        persister: &Arc<Persister>,
+        executor: &Arc<Executor>,
+        object_store: &Arc<dyn ObjectStore>,
+        time_provider: Arc<dyn TimeProvider>,
+    ) -> CompactionService {
+        CompactionService::new(
+            config,
+            Arc::clone(catalog),
+            Arc::clone(write_buffer) as Arc<dyn WriteBuffer>,
+            write_buffer.persisted_files(),
+            Arc::clone(persister),
+            Arc::clone(executor),
+            // As the server sets it (influxdb3_clap_blocks datafusion config): without this,
+            // iox_query encodes a size hint that plain object stores reject.
+            HashMap::from([(
+                "iox.hint_known_object_size_to_object_store".to_string(),
+                false.to_string(),
+            )]),
+            Arc::clone(object_store),
+            ObjectStoreUrl::parse(DEFAULT_OBJECT_STORE_URL).unwrap(),
+            "test-host",
+            time_provider,
+            ShutdownManager::new_testing().register(),
+        )
     }
 
     impl CompactionHarness {
@@ -1034,17 +1078,7 @@ mod tests {
 
         /// Like [`Self::new`], on the given object store.
         async fn with_object_store(object_store: Arc<dyn ObjectStore>) -> Self {
-            let config = CompactionConfig {
-                enabled: true,
-                interval: Duration::from_secs(1),
-                max_files_per_run: 10,
-                min_files_for_compaction: 1,
-                generation_durations: HashMap::from([
-                    (1, Duration::from_secs(60)),
-                    (2, Duration::from_secs(120)),
-                ]),
-            };
-            Self::build(object_store, config).await
+            Self::build(object_store, two_minute_gen2_config()).await
         }
 
         /// Like [`Self::new`], with the given compaction config.
@@ -1088,27 +1122,17 @@ mod tests {
                 Arc::clone(&time_provider),
             ));
             let write_buffer =
-                Self::start_write_buffer(&persister, &catalog, &time_provider, &executor).await;
+                Self::start_write_buffer(&persister, &catalog, &time_provider, &executor, 1).await;
 
-            let service = CompactionService::new(
+            let service = Arc::new(new_test_service(
                 config,
-                Arc::clone(&catalog),
-                Arc::clone(&write_buffer) as Arc<dyn WriteBuffer>,
-                write_buffer.persisted_files(),
-                Arc::clone(&persister),
-                Arc::clone(&executor),
-                // As the server sets it (influxdb3_clap_blocks datafusion config): without this,
-                // iox_query encodes a size hint that plain object stores reject.
-                HashMap::from([(
-                    "iox.hint_known_object_size_to_object_store".to_string(),
-                    false.to_string(),
-                )]),
-                Arc::clone(&object_store),
-                ObjectStoreUrl::parse(DEFAULT_OBJECT_STORE_URL).unwrap(),
-                "test-host",
+                &catalog,
+                &write_buffer,
+                &persister,
+                &executor,
+                &object_store,
                 time_provider,
-                ShutdownManager::new_testing().register(),
-            );
+            ));
 
             Self {
                 object_store,
@@ -1121,13 +1145,29 @@ mod tests {
             }
         }
 
-        /// Build a write buffer the way the server does on startup: load the newest snapshot,
-        /// then replay the WAL files after its `wal_file_sequence_number`.
+        /// A compaction service on this harness's catalog, write buffer, index and object store,
+        /// with the given config.
+        fn service_with_config(&self, config: CompactionConfig) -> Arc<CompactionService> {
+            Arc::new(new_test_service(
+                config,
+                &self.catalog,
+                &self.write_buffer,
+                &self.persister,
+                &self.executor,
+                &self.object_store,
+                Arc::clone(&self.time) as _,
+            ))
+        }
+
+        /// Build a write buffer the way the server does on startup: load the newest
+        /// `n_snapshots` snapshots, then replay the WAL files after the newest one's
+        /// `wal_file_sequence_number`.
         async fn start_write_buffer(
             persister: &Arc<Persister>,
             catalog: &Arc<Catalog>,
             time_provider: &Arc<dyn TimeProvider>,
             executor: &Arc<Executor>,
+            n_snapshots: usize,
         ) -> Arc<WriteBufferImpl> {
             let last_cache = LastCacheProvider::new_from_catalog(Arc::clone(catalog))
                 .await
@@ -1150,7 +1190,7 @@ mod tests {
                 metric_registry: Arc::new(Registry::default()),
                 snapshotted_wal_files_to_keep: 10,
                 query_file_limit: None,
-                n_snapshots_to_load_on_start: 1,
+                n_snapshots_to_load_on_start: n_snapshots,
                 shutdown: ShutdownManager::new_testing().register(),
                 wal_replay_concurrency_limit: None,
             })
@@ -1165,6 +1205,19 @@ mod tests {
         /// would try to create the same WAL file. Starting a write buffer also resets the
         /// process-wide parquet file id counter to the newest snapshot's `next_file_id`.
         async fn restart(&self) -> (Arc<Catalog>, Arc<WriteBufferImpl>) {
+            self.restart_loading(1).await
+        }
+
+        /// Like [`Self::restart`], loading every snapshot: an index entry that any snapshot
+        /// still lists comes back, as it does on a server whose lookback covers that snapshot.
+        async fn restart_loading_all(&self) -> (Arc<Catalog>, Arc<WriteBufferImpl>) {
+            self.restart_loading(10_000).await
+        }
+
+        async fn restart_loading(
+            &self,
+            n_snapshots: usize,
+        ) -> (Arc<Catalog>, Arc<WriteBufferImpl>) {
             let time_provider: Arc<dyn TimeProvider> = Arc::clone(&self.time) as _;
             let catalog = Arc::new(
                 Catalog::new(
@@ -1176,10 +1229,37 @@ mod tests {
                 .await
                 .unwrap(),
             );
-            let write_buffer =
-                Self::start_write_buffer(&self.persister, &catalog, &time_provider, &self.executor)
-                    .await;
+            let write_buffer = Self::start_write_buffer(
+                &self.persister,
+                &catalog,
+                &time_provider,
+                &self.executor,
+                n_snapshots,
+            )
+            .await;
             (catalog, write_buffer)
+        }
+
+        /// Paths in the test table's index of a write buffer started by [`Self::restart`].
+        fn paths_after_restart(catalog: &Catalog, write_buffer: &WriteBufferImpl) -> Vec<String> {
+            let db = catalog.db_schema(Self::DB).unwrap();
+            let table_id = db.table_definition(Self::TABLE).unwrap().table_id;
+            sorted_paths(&write_buffer.persisted_files().get_files(db.id, table_id))
+        }
+
+        /// The test table's indexed file whose `min_time` is `min_time`.
+        fn indexed_file_at(&self, min_time: i64) -> ParquetFile {
+            self.indexed_files()
+                .into_iter()
+                .find(|f| f.min_time == min_time)
+                .unwrap_or_else(|| panic!("no indexed file at {min_time}"))
+        }
+
+        async fn delete_object(&self, file: &ParquetFile) {
+            self.object_store
+                .delete(&ObjPath::from(file.path.as_str()))
+                .await
+                .unwrap();
         }
 
         fn set_now(&self, since_epoch: Duration) {
@@ -1877,6 +1957,148 @@ mod tests {
             .expect("test setup: no data snapshot");
         snapshot_done.await.expect("snapshot failed");
         drop(permit);
+    }
+
+    fn sorted_paths(files: &[ParquetFile]) -> Vec<String> {
+        let mut paths: Vec<_> = files.iter().map(|f| f.path.clone()).collect();
+        paths.sort();
+        paths
+    }
+
+    /// Regression test (TAG-2507): a job prunes an input whose object is missing from the index,
+    /// but only in memory. The compaction snapshot's `removed_files` lists the inputs it compacted,
+    /// so a restart loaded the pruned entry again from the older snapshot that added it.
+    #[tokio::test]
+    async fn test_entry_pruned_by_a_job_stays_pruned_after_restart() {
+        let h = CompactionHarness::new().await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 20000000000").await;
+        let missing = h.indexed_file_at(10_000_000_000);
+        h.delete_object(&missing).await;
+
+        h.set_now(Duration::from_secs(120));
+        let compacted = h.compact().await;
+        assert_eq!(
+            sorted_paths(&h.indexed_files()),
+            sorted_paths(&compacted),
+            "test setup: the job prunes the missing input and compacts the other"
+        );
+
+        let (catalog, restarted) = h.restart_loading_all().await;
+        assert_eq!(
+            CompactionHarness::paths_after_restart(&catalog, &restarted),
+            sorted_paths(&compacted),
+            "the pruned entry came back after a restart"
+        );
+    }
+
+    /// Regression test (TAG-2507): the same when the job stops after its drift check, because too
+    /// few inputs are left: no compaction snapshot is written at all.
+    #[tokio::test]
+    async fn test_entry_pruned_by_a_skipped_job_stays_pruned_after_restart() {
+        let h = CompactionHarness::with_config(CompactionConfig {
+            min_files_for_compaction: 2,
+            ..two_minute_gen2_config()
+        })
+        .await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 20000000000").await;
+        let missing = h.indexed_file_at(10_000_000_000);
+        let kept = h.indexed_file_at(20_000_000_000);
+        h.delete_object(&missing).await;
+
+        h.set_now(Duration::from_secs(120));
+        let jobs = h.service.identify_compaction_jobs().await.unwrap();
+        assert_eq!(jobs.len(), 1, "test setup: one job for the two files");
+        let result = h
+            .service
+            .execute_compaction_job(jobs.into_iter().next().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            result.compacted_files.is_empty() && h.indexed_files() == vec![kept.clone()],
+            "test setup: the job prunes the missing input, then stops below the minimum"
+        );
+
+        let (catalog, restarted) = h.restart_loading_all().await;
+        assert_eq!(
+            CompactionHarness::paths_after_restart(&catalog, &restarted),
+            vec![kept.path],
+            "the pruned entry came back after a restart"
+        );
+    }
+
+    /// Regression test (TAG-2507): pruning ran only inside a compaction job, and a window with
+    /// fewer files than `min_files_for_compaction` never gets one. That covers leftover gen1
+    /// files and most gen2 files (a 7 day gen3 window holds about 7), as on tagmobi-dev where a
+    /// day window with 2 gen1 entries and two gen2 entries kept pointing at missing objects. The
+    /// compaction service checks every index entry once when it starts, prunes the ones whose
+    /// object is missing, and records that in a snapshot without moving the WAL replay start.
+    #[tokio::test]
+    async fn test_startup_index_check_prunes_missing_files_below_the_compaction_minimum() {
+        let h = CompactionHarness::new().await;
+        // A gen2 file, listed by the compaction snapshot that wrote it.
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.set_now(Duration::from_secs(120));
+        let gen2 = h.compact().await.remove(0);
+        // gen1 files in two later windows.
+        h.write_gen1("testtable value=2 130000000000").await;
+        h.write_gen1("testtable value=3 250000000000").await;
+        let gen1_missing = h.indexed_file_at(130_000_000_000);
+        let gen1_kept = h.indexed_file_at(250_000_000_000);
+        h.delete_object(&gen2).await;
+        h.delete_object(&gen1_missing).await;
+        // A row only the WAL holds: the check's snapshot must not move the replay start past it.
+        h.write_wal_only("testtable value=4 260000000000").await;
+        let persisted_wal = h
+            .write_buffer
+            .persisted_files()
+            .last_persisted_wal_sequence_number()
+            .unwrap();
+        assert!(
+            h.write_buffer.wal().last_wal_sequence_number().await > persisted_wal,
+            "test setup: the WAL must hold a file no snapshot persisted"
+        );
+
+        // With a minimum of 10 files no window gets a job, so only the startup check can prune.
+        let service = h.service_with_config(CompactionConfig {
+            min_files_for_compaction: 10,
+            ..two_minute_gen2_config()
+        });
+        let task = Arc::clone(&service).start();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while h.indexed_files().len() > 1 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        task.abort();
+        assert_eq!(
+            sorted_paths(&h.indexed_files()),
+            vec![gen1_kept.path.clone()],
+            "the startup check did not prune the entries whose objects are missing"
+        );
+
+        let snapshot = h.newest_snapshot().await;
+        assert!(
+            snapshot.databases.is_empty(),
+            "the check's snapshot only removes entries"
+        );
+        let removed: Vec<ParquetFile> = snapshot
+            .removed_files
+            .values()
+            .flat_map(|db| db.tables.values().flatten().cloned())
+            .collect();
+        assert_eq!(sorted_paths(&removed), sorted_paths(&[gen2, gen1_missing]));
+        assert_eq!(
+            snapshot.wal_file_sequence_number, persisted_wal,
+            "the check's snapshot moved the WAL replay start past an unpersisted WAL file"
+        );
+
+        let (catalog, restarted) = h.restart_loading_all().await;
+        assert_eq!(
+            CompactionHarness::paths_after_restart(&catalog, &restarted),
+            vec![gen1_kept.path],
+            "the pruned entries came back after a restart"
+        );
     }
 
     /// If writing a later output fails, outputs already uploaded by this attempt are deleted.

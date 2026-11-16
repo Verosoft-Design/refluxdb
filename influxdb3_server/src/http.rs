@@ -14,7 +14,7 @@ use datafusion::execution::RecordBatchStream;
 use datafusion::execution::memory_pool::UnboundedMemoryPool;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::FutureExt;
-use futures::{StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use http::header::ACCESS_CONTROL_ALLOW_ORIGIN;
 use hyper::HeaderMap;
 use hyper::header::AUTHORIZATION;
@@ -1751,6 +1751,36 @@ pub enum ValidateDbNameError {
     Empty,
 }
 
+/// Start a streamed response body from the encoded `stream`.
+///
+/// The status line goes out with the first bytes of the body, so the stream is read up to its
+/// first non-empty chunk first: a query that fails before then (for example on a parquet object
+/// that is missing) returns its error here, and the handler answers with an error status. After
+/// that the status can't change. A later error is logged at error level and ends the body, so
+/// hyper closes the connection without the final chunk and the client sees an incomplete
+/// response, not a complete one.
+async fn start_response_body<S, E>(stream: S) -> Result<ResponseBody, E>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let mut stream = Box::pin(stream.fuse());
+    let mut first = None;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if !chunk.is_empty() {
+            first = Some(chunk);
+            break;
+        }
+    }
+    let rest = stream.inspect_err(|error| {
+        error!(%error, "query failed after its response started; ending the response early");
+    });
+    Ok(stream_results_to_response_body(
+        futures::stream::iter(first.map(Ok)).chain(rest),
+    ))
+}
+
 async fn record_batch_stream_to_body(
     mut stream: Pin<Box<dyn RecordBatchStream + Send>>,
     format: QueryFormat,
@@ -1825,9 +1855,8 @@ async fn record_batch_stream_to_body(
                 first_poll: true,
                 stream,
             };
-            Ok(stream_results_to_response_body(futures::stream::poll_fn(
-                move |ctx| future.poll_unpin(ctx),
-            )))
+            let encoded = futures::stream::poll_fn(move |ctx| future.poll_unpin(ctx));
+            Ok(start_response_body(encoded).await?)
         }
         QueryFormat::Json => {
             struct JsonFuture {
@@ -1922,9 +1951,8 @@ async fn record_batch_stream_to_body(
                 state: State::FirstPoll,
                 stream,
             };
-            Ok(stream_results_to_response_body(futures::stream::poll_fn(
-                move |ctx| future.poll_unpin(ctx),
-            )))
+            let encoded = futures::stream::poll_fn(move |ctx| future.poll_unpin(ctx));
+            Ok(start_response_body(encoded).await?)
         }
         QueryFormat::JsonLines => {
             let stream = futures::stream::poll_fn(move |ctx| match stream.poll_next_unpin(ctx) {
@@ -1946,7 +1974,7 @@ async fn record_batch_stream_to_body(
                 Poll::Ready(None) => Poll::Ready(None),
                 Poll::Pending => Poll::Pending,
             });
-            Ok(stream_results_to_response_body(stream))
+            Ok(start_response_body(stream).await?)
         }
     }
 }

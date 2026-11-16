@@ -2475,6 +2475,128 @@ mod tests {
         ));
     }
 
+    const MISSING_OBJECT: &str = "Object at location test/missing.parquet not found";
+
+    /// Batches with `batch_sizes` rows each, then the error a scan of a missing parquet object
+    /// fails with. Like a real scan, the error is not ready at once, so a server flushes what it
+    /// has before it arrives.
+    fn make_stream_failing_after(batch_sizes: Vec<usize>) -> SendableRecordBatchStream {
+        use futures::StreamExt;
+
+        let schema = record_batch!(("a", Int32, [1])).unwrap().schema();
+        let batches: Vec<datafusion::error::Result<RecordBatch>> = batch_sizes
+            .into_iter()
+            .map(|size| {
+                Ok(RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int32Array::from_iter_values(vec![1; size]))],
+                )
+                .unwrap())
+            })
+            .collect();
+        let error = futures::stream::once(async {
+            tokio::task::yield_now().await;
+            Err(datafusion::error::DataFusionError::Execution(
+                MISSING_OBJECT.to_string(),
+            ))
+        });
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(batches).chain(error),
+        ))
+    }
+
+    /// Regression test (TAG-2507): the streaming formats sent the 200 status line before reading
+    /// the first batch, so a query that failed before producing any bytes ended a 200 response
+    /// early. The error must come back from `record_batch_stream_to_body`, so the handler answers
+    /// with an error status. For JSON and JSON lines a batch without rows produces no bytes, so an
+    /// error after one is still before the response starts. (A CSV response starts with the header
+    /// of the first batch, rows or not.)
+    #[tokio::test]
+    async fn test_error_before_the_response_starts_is_returned() {
+        let cases = [
+            (QueryFormat::Json, vec![]),
+            (QueryFormat::Json, vec![0]),
+            (QueryFormat::JsonLines, vec![]),
+            (QueryFormat::JsonLines, vec![0]),
+            (QueryFormat::Csv, vec![]),
+        ];
+        for (format, sizes) in cases {
+            let result =
+                record_batch_stream_to_body(make_stream_failing_after(sizes.clone()), format).await;
+            let err = result.err().unwrap_or_else(|| {
+                panic!("{format:?} after batches {sizes:?}: the error was left to the body")
+            });
+            assert!(err.to_string().contains(MISSING_OBJECT), "{err}");
+        }
+    }
+
+    /// Once bytes are sent the status can't change, so an error after that ends the response
+    /// early. Over HTTP/1.1 that is a chunked body without its last chunk, which a client reports
+    /// as an error, not as a complete (empty) response. This already held before TAG-2507; the
+    /// test keeps it that way.
+    #[tokio::test]
+    async fn test_error_after_the_response_starts_leaves_it_incomplete() {
+        for format in [QueryFormat::Json, QueryFormat::JsonLines, QueryFormat::Csv] {
+            let body = record_batch_stream_to_body(make_stream_failing_after(vec![1]), format)
+                .await
+                .unwrap();
+            let (status, body) = serve_once_over_tcp(body).await;
+            assert_eq!(status, http::StatusCode::OK);
+            assert!(
+                body.is_err(),
+                "{format:?}: the client read a complete response: {body:?}"
+            );
+        }
+    }
+
+    /// Regression test (TAG-2507): an error after the response started was only passed to hyper,
+    /// which logs it at debug level, so the server logged nothing.
+    #[tokio::test]
+    async fn test_error_after_the_response_starts_is_logged_at_error_level() {
+        for format in [QueryFormat::Json, QueryFormat::JsonLines, QueryFormat::Csv] {
+            let capture = test_helpers::tracing::TracingCapture::new();
+            let body = record_batch_stream_to_body(make_stream_failing_after(vec![1]), format)
+                .await
+                .unwrap();
+            assert!(hyper::body::to_bytes(body).await.is_err());
+            let logs = capture.to_string();
+            assert!(
+                logs.lines()
+                    .any(|l| l.contains("level = ERROR") && l.contains(MISSING_OBJECT)),
+                "{format:?}: no error-level log of the error: {logs}"
+            );
+        }
+    }
+
+    /// Serve `body` as the response to one request on a loopback socket and read it with a real
+    /// client. Returns the status and the body, or the client's error reading it.
+    async fn serve_once_over_tcp(
+        body: iox_http_util::ResponseBody,
+    ) -> (http::StatusCode, Result<bytes::Bytes, hyper::Error>) {
+        let body = Arc::new(std::sync::Mutex::new(Some(body)));
+        let make_service = hyper::service::make_service_fn(move |_| {
+            let body = Arc::clone(&body);
+            async move {
+                Ok::<_, std::convert::Infallible>(hyper::service::service_fn(move |_| {
+                    let body = body.lock().unwrap().take().expect("one request");
+                    async move { Ok::<_, std::convert::Infallible>(hyper::Response::new(body)) }
+                }))
+            }
+        });
+        let server = hyper::Server::bind(&([127, 0, 0, 1], 0).into()).serve(make_service);
+        let url = format!("http://{}/", server.local_addr());
+        let server = tokio::spawn(server);
+        let res = hyper::Client::new()
+            .get(url.parse().unwrap())
+            .await
+            .expect("request failed");
+        let status = res.status();
+        let body = hyper::body::to_bytes(res.into_body()).await;
+        server.abort();
+        (status, body)
+    }
+
     fn make_record_stream(records: Option<usize>) -> SendableRecordBatchStream {
         match records {
             None => make_record_stream_with_sizes(vec![]),

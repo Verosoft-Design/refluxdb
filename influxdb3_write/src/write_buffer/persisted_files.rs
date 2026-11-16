@@ -141,6 +141,29 @@ impl PersistedFiles {
         inner.subtract(&removed);
     }
 
+    /// The entries of `files` that are in the table's index now, matched by id and path as
+    /// [`Self::remove_persisted_files`] matches them.
+    pub fn indexed(
+        &self,
+        db_id: DbId,
+        table_id: TableId,
+        files: &[ParquetFile],
+    ) -> Vec<ParquetFile> {
+        let inner = self.inner.read();
+        let Some(table_files) = inner.files.get(&db_id).and_then(|t| t.get(&table_id)) else {
+            return vec![];
+        };
+        let indexed: HashSet<(ParquetFileId, &str)> = table_files
+            .iter()
+            .map(|f| (f.id, f.path.as_str()))
+            .collect();
+        files
+            .iter()
+            .filter(|f| indexed.contains(&(f.id, f.path.as_str())))
+            .cloned()
+            .collect()
+    }
+
     /// Get the list of files for a given database and table, always return in descending order of min_time
     pub fn get_files(&self, db_id: DbId, table_id: TableId) -> Vec<ParquetFile> {
         self.get_files_filtered(db_id, table_id, &ChunkFilter::default())

@@ -5,8 +5,10 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion_util::stream_from_batches;
+use futures::StreamExt;
 use influxdb3_catalog::catalog::Catalog;
 use influxdb3_id::{DbId, TableId};
+use influxdb3_wal::SnapshotSequenceNumber;
 use iox_query::exec::Executor;
 use iox_query::frontend::reorg::ReorgPlanner;
 use iox_time::TimeProvider;
@@ -70,6 +72,25 @@ pub struct CompactionResult {
     pub total_size_reduction: u64,
     pub total_rows_compacted: u64,
 }
+
+/// HEAD requests in flight at once while [`CompactionService::check_index_for_missing_files`]
+/// runs.
+const INDEX_CHECK_CONCURRENCY: usize = 16;
+
+/// What object storage says about an index entry.
+#[derive(Debug)]
+enum ObjectCheck {
+    /// The object exists with the indexed size.
+    Present,
+    /// The object is missing (NotFound), or its size differs from the indexed size (it was
+    /// overwritten after the entry was recorded; reading it fails with "Corrupt footer").
+    Stale,
+    /// The request failed some other way, e.g. a timeout. Says nothing about the entry.
+    Unknown(object_store::Error),
+}
+
+/// Index entries to prune, by table.
+type StaleEntries = BTreeMap<(DbId, TableId), Vec<ParquetFile>>;
 
 #[cfg(test)]
 mod drift_tests;
@@ -150,7 +171,16 @@ impl CompactionService {
             }
 
             info!("Starting compaction service with interval: {:?}", self.config.interval);
-            
+
+            // Before the first cycle, in this task: no job runs while the check does.
+            tokio::select! {
+                _ = self.check_index_for_missing_files() => {}
+                _ = self.shutdown_token.wait_for_shutdown() => {
+                    info!("Shutdown signal received, stopping compaction service");
+                    return;
+                }
+            }
+
             let mut interval = tokio::time::interval(self.config.interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -316,34 +346,24 @@ impl CompactionService {
             let mut existing = Vec::with_capacity(job.files.len());
             let mut stale = Vec::new();
             for file in &job.files {
-                let path = ObjPath::from(file.path.as_str());
-                match self.object_store.head(&path).await {
-                    Ok(meta) if meta.size as u64 == file.size_bytes => existing.push(file.clone()),
-                    Ok(meta) => {
-                        // Pruning drops the entry, so the object's rows stop being queryable.
-                        // The object itself is left in place; the path logged here is enough
-                        // to re-index or inspect it manually.
-                        warn!(
-                            "Skipping parquet file whose size does not match the catalog: {} (catalog {} bytes, object store {} bytes)",
-                            file.path, file.size_bytes, meta.size
-                        );
-                        stale.push(file.clone());
-                    }
-                    Err(object_store::Error::NotFound { .. }) => {
-                        warn!("Skipping missing parquet file in catalog: {}", file.path);
-                        stale.push(file.clone());
-                    }
-                    Err(e) => return Err(e.into()),
+                match self.check_object(file).await {
+                    ObjectCheck::Present => existing.push(file.clone()),
+                    ObjectCheck::Stale => stale.push(file.clone()),
+                    ObjectCheck::Unknown(e) => return Err(e.into()),
                 }
             }
             if !stale.is_empty() {
-                // Removal is by file id, so pruning a stale entry never drops a valid entry that
-                // shares its path.
-                self.persisted_files()
-                    .remove_persisted_files(&job.database_id, &job.table_id, &stale);
+                // Persisted now, not with the compaction snapshot: the job may still stop below
+                // the minimum or fail, and the prune must survive a restart either way.
+                let pruned = self
+                    .prune_index_entries(StaleEntries::from([(
+                        (job.database_id, job.table_id),
+                        stale,
+                    )]))
+                    .await;
                 info!(
                     "Pruned {} stale catalog entries for db={} table={}",
-                    stale.len(), job.database_id, job.table_name
+                    pruned, job.database_id, job.table_name
                 );
             }
             if existing.len() < self.config.min_files_for_compaction {
@@ -701,13 +721,13 @@ impl CompactionService {
         )
     }
 
-    /// Update catalog for compaction: persist snapshot, then update catalog and remove old files.
-    async fn update_catalog_for_compaction(
+    /// Write a snapshot that records index changes made outside a data snapshot (a compaction's
+    /// outputs and inputs, or pruned entries), filled in by `record`. Callers change the
+    /// in-memory index only after this returns, so a restart sees every change the index made.
+    async fn persist_index_snapshot(
         &self,
-        job: &CompactionJob,
-        new_files: &[ParquetFile],
-        old_files: &[ParquetFile],
-    ) -> Result<()> {
+        record: impl FnOnce(&mut PersistedSnapshot),
+    ) -> SnapshotSequenceNumber {
         let wal = self.write_buffer.wal();
         let snapshot_sequence_number = wal.reserve_next_snapshot_sequence_number().await;
         // A data snapshot with a lower sequence number may still be writing its files; it holds
@@ -728,24 +748,13 @@ impl CompactionService {
             wal_file_sequence_number,
             self.catalog.sequence_number(),
         );
-        for file in new_files {
-            snapshot.add_parquet_file(job.database_id, job.table_id, file.clone());
-        }
-        snapshot
-            .removed_files
-            .entry(job.database_id)
-            .or_default()
-            .tables
-            .entry(job.table_id)
-            .or_default()
-            .extend(old_files.iter().cloned());
+        record(&mut snapshot);
         // Release the permit before the upload, which retries until it succeeds: a flush that
         // starts a data snapshot waits for it while holding the WAL lock, and so does every write.
         // A data snapshot that starts now gets a higher number than this one, so it is newer
         // whichever of the two is written first.
         drop(snapshot_permit);
 
-        // Persist snapshot before mutating catalog or deleting old parquet objects.
         let persisted_snapshot = PersistedSnapshotVersion::V1(snapshot);
         loop {
             match self.persister.persist_snapshot(&persisted_snapshot).await {
@@ -756,6 +765,162 @@ impl CompactionService {
                 }
             }
         }
+        snapshot_sequence_number
+    }
+
+    /// HEAD the object of an index entry. Logs a stale entry; an `Unknown` result is left to the
+    /// caller.
+    async fn check_object(&self, file: &ParquetFile) -> ObjectCheck {
+        match self
+            .object_store
+            .head(&ObjPath::from(file.path.as_str()))
+            .await
+        {
+            Ok(meta) if meta.size as u64 == file.size_bytes => ObjectCheck::Present,
+            Ok(meta) => {
+                // Pruning drops the entry, so the object's rows stop being queryable. The object
+                // itself is left in place; the path logged here is enough to re-index or inspect
+                // it manually.
+                warn!(
+                    "Skipping parquet file whose size does not match the catalog: {} (catalog {} bytes, object store {} bytes)",
+                    file.path, file.size_bytes, meta.size
+                );
+                ObjectCheck::Stale
+            }
+            Err(object_store::Error::NotFound { .. }) => {
+                warn!("Skipping missing parquet file in catalog: {}", file.path);
+                ObjectCheck::Stale
+            }
+            Err(e) => ObjectCheck::Unknown(e),
+        }
+    }
+
+    /// Remove stale index entries durably: a snapshot lists them in `removed_files` before they
+    /// leave the in-memory index, so a restart does not load them again from the snapshot that
+    /// added them. Entries that are no longer indexed (compaction or retention removed them
+    /// meanwhile) are left out; if none is left, no snapshot is written. Returns how many entries
+    /// were removed.
+    async fn prune_index_entries(&self, stale: StaleEntries) -> usize {
+        let persisted_files = self.persisted_files();
+        let indexed: StaleEntries = stale
+            .into_iter()
+            .map(|((db_id, table_id), files)| {
+                let files = persisted_files.indexed(db_id, table_id, &files);
+                ((db_id, table_id), files)
+            })
+            .filter(|(_, files)| !files.is_empty())
+            .collect();
+        let count = indexed.values().map(Vec::len).sum();
+        if count == 0 {
+            return 0;
+        }
+
+        let snapshot_sequence_number = self
+            .persist_index_snapshot(|snapshot| {
+                for ((db_id, table_id), files) in &indexed {
+                    snapshot
+                        .removed_files
+                        .entry(*db_id)
+                        .or_default()
+                        .tables
+                        .entry(*table_id)
+                        .or_default()
+                        .extend(files.iter().cloned());
+                }
+            })
+            .await;
+        for ((db_id, table_id), files) in &indexed {
+            persisted_files.remove_persisted_files(db_id, table_id, files);
+        }
+        info!(
+            count,
+            snapshot_sequence_number = snapshot_sequence_number.as_u64(),
+            "removed stale parquet index entries and recorded the removal in a snapshot"
+        );
+        count
+    }
+
+    /// Check every index entry against object storage once and prune the ones whose object is
+    /// missing or has another size. Compaction checks only the inputs of its jobs, and a window
+    /// with fewer files than `min_files_for_compaction` never gets a job: leftover gen1 files,
+    /// most gen2 files and every file of the top generation would keep stale entries forever.
+    ///
+    /// One HEAD per entry, at most [`INDEX_CHECK_CONCURRENCY`] at a time. Only a NotFound or a
+    /// size mismatch prunes; an entry whose HEAD fails some other way is kept. Run once as the
+    /// service starts, before the first cycle, so no job runs at the same time. Entries indexed
+    /// after the check starts are not checked: their objects were written before they were indexed.
+    async fn check_index_for_missing_files(&self) {
+        let started = std::time::Instant::now();
+        let mut entries = Vec::new();
+        for db_schema in self.catalog.list_db_schema() {
+            if db_schema.deleted {
+                continue;
+            }
+            for table_def in db_schema.tables() {
+                if table_def.deleted {
+                    continue;
+                }
+                let key = (db_schema.id, table_def.table_id);
+                for file in self.write_buffer.parquet_files(key.0, key.1) {
+                    entries.push((key, file));
+                }
+            }
+        }
+        let checked = entries.len();
+
+        let mut stale = StaleEntries::new();
+        let mut unknown = 0_usize;
+        let mut results = futures::stream::iter(entries)
+            .map(|(key, file)| async move {
+                let check = self.check_object(&file).await;
+                (key, file, check)
+            })
+            .buffer_unordered(INDEX_CHECK_CONCURRENCY);
+        while let Some((key, file, check)) = results.next().await {
+            match check {
+                ObjectCheck::Present => {}
+                ObjectCheck::Stale => stale.entry(key).or_default().push(file),
+                ObjectCheck::Unknown(e) => {
+                    if unknown == 0 {
+                        warn!(path = %file.path, error = %e, "could not check a parquet index entry; keeping it");
+                    }
+                    unknown += 1;
+                }
+            }
+        }
+
+        let pruned = self.prune_index_entries(stale).await;
+        info!(
+            checked,
+            pruned,
+            unknown,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "checked the parquet index against object storage"
+        );
+    }
+
+    /// Update catalog for compaction: persist snapshot, then update catalog and remove old files.
+    async fn update_catalog_for_compaction(
+        &self,
+        job: &CompactionJob,
+        new_files: &[ParquetFile],
+        old_files: &[ParquetFile],
+    ) -> Result<()> {
+        // Persist snapshot before mutating catalog or deleting old parquet objects.
+        self.persist_index_snapshot(|snapshot| {
+            for file in new_files {
+                snapshot.add_parquet_file(job.database_id, job.table_id, file.clone());
+            }
+            snapshot
+                .removed_files
+                .entry(job.database_id)
+                .or_default()
+                .tables
+                .entry(job.table_id)
+                .or_default()
+                .extend(old_files.iter().cloned());
+        })
+        .await;
 
         let persisted_files = self.persisted_files();
         for file in new_files {
@@ -1260,6 +1425,10 @@ mod tests {
                 .delete(&ObjPath::from(file.path.as_str()))
                 .await
                 .unwrap();
+        }
+
+        async fn snapshot_count(&self) -> usize {
+            self.persister.load_snapshots(10_000).await.unwrap().len()
         }
 
         fn set_now(&self, since_epoch: Duration) {
@@ -2099,6 +2268,129 @@ mod tests {
             vec![gen1_kept.path],
             "the pruned entries came back after a restart"
         );
+    }
+
+    /// The startup check prunes only on a NotFound or a size mismatch. An entry whose HEAD fails
+    /// any other way (a timeout, an unreachable store) is kept, and a check that finds nothing
+    /// stale writes no snapshot.
+    #[tokio::test]
+    async fn test_startup_index_check_keeps_entries_it_cannot_check() {
+        let store = Arc::new(HeadFailingObjectStore::new(Arc::new(InMemory::new())));
+        let h = CompactionHarness::with_object_store(Arc::clone(&store) as _).await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 20000000000").await;
+        store.fail_head(&h.indexed_file_at(10_000_000_000).path);
+        let indexed = sorted_paths(&h.indexed_files());
+        let snapshots = h.snapshot_count().await;
+
+        h.service.check_index_for_missing_files().await;
+
+        assert_eq!(
+            sorted_paths(&h.indexed_files()),
+            indexed,
+            "an entry whose HEAD failed with an error other than NotFound was pruned"
+        );
+        assert_eq!(
+            h.snapshot_count().await,
+            snapshots,
+            "a check that found nothing stale wrote a snapshot"
+        );
+    }
+
+    /// Forwards to `inner`, except that HEAD of the path set with [`Self::fail_head`] fails with
+    /// an error other than NotFound.
+    #[derive(Debug)]
+    struct HeadFailingObjectStore {
+        inner: Arc<dyn ObjectStore>,
+        failing: parking_lot::Mutex<Option<ObjPath>>,
+    }
+
+    impl HeadFailingObjectStore {
+        fn new(inner: Arc<dyn ObjectStore>) -> Self {
+            Self {
+                inner,
+                failing: Default::default(),
+            }
+        }
+
+        fn fail_head(&self, path: &str) {
+            *self.failing.lock() = Some(ObjPath::from(path));
+        }
+    }
+
+    impl std::fmt::Display for HeadFailingObjectStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "HeadFailingObjectStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for HeadFailingObjectStore {
+        async fn put_opts(
+            &self,
+            location: &ObjPath,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            opts: object_store::PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn head(&self, location: &ObjPath) -> object_store::Result<object_store::ObjectMeta> {
+            if self.failing.lock().as_ref() == Some(location) {
+                return Err(object_store::Error::Generic {
+                    store: "test",
+                    source: "connection reset".into(),
+                });
+            }
+            self.inner.head(location).await
+        }
+
+        async fn delete(&self, location: &ObjPath) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &ObjPath, to: &ObjPath) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &ObjPath,
+            to: &ObjPath,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
     }
 
     /// If writing a later output fails, outputs already uploaded by this attempt are deleted.

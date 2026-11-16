@@ -1523,7 +1523,19 @@ mod tests {
                 per_query_mem_pool_config: PerQueryMemoryPoolConfig::Disabled,
                 heap_memory_limit: None,
             },
-            DedicatedExecutor::new_testing(),
+            // Not `DedicatedExecutor::new_testing()`: that one is shared by the whole process and
+            // does its IO on the runtime of whichever test created it first, so reading a parquet
+            // file after that test ended panics with "IO runtime was shut down". A per-test
+            // executor does its IO on this test's runtime.
+            DedicatedExecutor::new(
+                "server-test",
+                {
+                    let mut runtime_builder = tokio::runtime::Builder::new_current_thread();
+                    runtime_builder.enable_time();
+                    runtime_builder
+                },
+                Arc::clone(&metrics),
+            ),
         ));
         let node_identifier_prefix = "test_host";
         let persister = Arc::new(Persister::new(

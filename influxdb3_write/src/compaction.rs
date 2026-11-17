@@ -1025,7 +1025,7 @@ impl CompactionService {
     /// One HEAD per entry, at most [`INDEX_CHECK_CONCURRENCY`] at a time. Only a NotFound or a
     /// size mismatch prunes, and only if a second HEAD after `stale_recheck_delay` says the same;
     /// an entry whose HEAD fails some other way is kept. Nothing is pruned if more than
-    /// `index_check_max_prune_percent` of the entries checked are stale.
+    /// `index_check_max_prune_percent` of the entries that got a definite answer are stale.
     ///
     /// Runs once as the service starts, alongside the compaction cycles, so a large index does
     /// not hold compaction back. That is safe: a job removes its inputs from the index before it
@@ -1078,12 +1078,16 @@ impl CompactionService {
         unknown += confirmed.unknown.len();
         let stale = confirmed.stale.len();
         let max_percent = usize::from(self.config.index_check_max_prune_percent);
-        let refused = stale * 100 > checked * max_percent;
+        // Only entries with a definite answer (present, missing, other size) say anything about
+        // the index; a store that times out on most requests must not make the rest look small.
+        let definite = checked - unknown;
+        let refused = stale * 100 > definite * max_percent;
         let (pruned, not_logged) = if refused {
             // Far more than drift leaves behind: more likely object storage answering NotFound
             // for objects it holds. Pruning would hide their rows for good, so keep everything.
             error!(
                 checked,
+                definite,
                 stale,
                 max_prune_percent = max_percent,
                 sample = ?confirmed.stale.iter().take(5).map(|e| e.file.path.as_str()).collect::<Vec<_>>(),
@@ -2642,6 +2646,43 @@ mod tests {
         );
     }
 
+    /// The limit counts only entries that got a definite answer. Entries whose HEAD failed some
+    /// other way say nothing about the index, so a store that times out on most requests and
+    /// answers NotFound for the rest must trip the limit, not pass it.
+    #[tokio::test]
+    async fn test_startup_index_check_limit_ignores_entries_it_could_not_check() {
+        let store = Arc::new(HeadFailingObjectStore::new(Arc::new(InMemory::new())));
+        let h = CompactionHarness::with_object_store(Arc::clone(&store) as _).await;
+        for i in 0..5_u64 {
+            h.write_gen1(&format!(
+                "testtable value={i} {}",
+                (10 + 60 * i) * 1_000_000_000
+            ))
+            .await;
+        }
+        let files = h.indexed_files();
+        for file in &files[..3] {
+            store.fail_head(&file.path);
+        }
+        for file in &files[3..] {
+            h.delete_object(file).await;
+        }
+        let indexed = sorted_paths(&files);
+        let limited = h.service_with_config(CompactionConfig {
+            index_check_max_prune_percent: 50,
+            ..two_minute_gen2_config()
+        });
+
+        limited.check_index_for_missing_files().await;
+
+        assert_eq!(
+            sorted_paths(&h.indexed_files()),
+            indexed,
+            "2 of 2 definite answers were stale, and the check pruned them because 3 more could not be checked"
+        );
+        assert_eq!(*limited.index_check.lock(), IndexCheckState::Refused);
+    }
+
     /// With `index_check_enabled` off, the service starts without checking the index.
     #[tokio::test]
     async fn test_disabled_index_check_does_not_run() {
@@ -2868,7 +2909,7 @@ mod tests {
     #[derive(Debug)]
     struct HeadFailingObjectStore {
         inner: Arc<dyn ObjectStore>,
-        failing: parking_lot::Mutex<Option<ObjPath>>,
+        failing: parking_lot::Mutex<HashSet<ObjPath>>,
         not_found_once: parking_lot::Mutex<HashSet<ObjPath>>,
         held: parking_lot::Mutex<Option<(ObjPath, Arc<tokio::sync::Semaphore>)>>,
         held_waiting: std::sync::atomic::AtomicBool,
@@ -2898,7 +2939,7 @@ mod tests {
         }
 
         fn fail_head(&self, path: &str) {
-            *self.failing.lock() = Some(ObjPath::from(path));
+            self.failing.lock().insert(ObjPath::from(path));
         }
 
         fn not_found_once(&self, path: &str) {
@@ -2940,7 +2981,7 @@ mod tests {
         }
 
         async fn head(&self, location: &ObjPath) -> object_store::Result<object_store::ObjectMeta> {
-            if self.failing.lock().as_ref() == Some(location) {
+            if self.failing.lock().contains(location) {
                 return Err(object_store::Error::Generic {
                     store: "test",
                     source: "connection reset".into(),

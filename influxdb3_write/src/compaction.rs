@@ -181,6 +181,9 @@ pub struct CompactionService {
     node_identifier_prefix: String,
     time_provider: Arc<dyn TimeProvider>,
     shutdown_token: influxdb3_shutdown::ShutdownToken,
+    /// Index entries a job left out as stale, by id and path. Planning skips them until an index
+    /// check run decides: pruned, or present after all. In memory only; a restart forgets them.
+    left_out: parking_lot::Mutex<HashSet<(ParquetFileId, String)>>,
 }
 
 impl CompactionService {
@@ -211,6 +214,7 @@ impl CompactionService {
             node_identifier_prefix: node_identifier_prefix.into(),
             time_provider,
             shutdown_token,
+            left_out: Default::default(),
         }
     }
 
@@ -223,8 +227,16 @@ impl CompactionService {
         &self,
         _db_id: DbId,
         _table_id: TableId,
-        files: Vec<ParquetFile>,
+        mut files: Vec<ParquetFile>,
     ) -> Result<Vec<ParquetFile>> {
+        // Skip entries a job already left out as stale, until an index check run decides on
+        // them; otherwise their window is planned again every cycle and takes job slots.
+        {
+            let left_out = self.left_out.lock();
+            if !left_out.is_empty() {
+                files.retain(|f| !left_out.contains(&(f.id, f.path.clone())));
+            }
+        }
         // Checking every catalog entry against object store (object_store.head per file) is
         // O(n) HTTP requests and prohibitively slow for large catalogs (e.g. 477k files → minutes
         // of sequential HEAD calls before a single job can be identified). Trust the catalog
@@ -446,6 +458,7 @@ impl CompactionService {
                     ObjectCheck::Present => {}
                     ObjectCheck::Stale(_) => {
                         excluded.insert((file.id, file.path.as_str()));
+                        self.left_out.lock().insert((file.id, file.path.clone()));
                     }
                     ObjectCheck::Unknown(e) => return Err(e.into()),
                 }
@@ -1035,6 +1048,8 @@ impl CompactionService {
 
         let mut candidates = Vec::new();
         let mut unknown = 0_usize;
+        // Entries this run can't decide on; any a job left out stay skipped by planning.
+        let mut undecided: HashSet<(ParquetFileId, String)> = HashSet::new();
         let mut results = futures::stream::iter(entries)
             .map(|(key, file)| async move {
                 let check = self.check_object(&file).await;
@@ -1050,6 +1065,7 @@ impl CompactionService {
                         warn!(path = %file.path, error = %e, "could not check a parquet index entry; keeping it");
                     }
                     unknown += 1;
+                    undecided.insert((file.id, file.path.clone()));
                 }
             }
         }
@@ -1068,6 +1084,12 @@ impl CompactionService {
             );
         }
         unknown += confirmed.unknown.len();
+        undecided.extend(
+            confirmed
+                .unknown
+                .iter()
+                .map(|(e, _)| (e.file.id, e.file.path.clone())),
+        );
         let stale = confirmed.stale.len();
         let max_percent = usize::from(self.config.index_check_max_prune_percent);
         // Only entries with a definite answer (present, missing, other size) say anything about
@@ -1081,6 +1103,14 @@ impl CompactionService {
             );
         }
         let refused = stale * 100 > definite * max_percent;
+        if refused {
+            undecided.extend(
+                confirmed
+                    .stale
+                    .iter()
+                    .map(|e| (e.file.id, e.file.path.clone())),
+            );
+        }
         let (pruned, not_logged) = if refused {
             // Far more than drift leaves behind: more likely object storage answering NotFound
             // for objects it holds. Pruning would hide their rows for good, so keep everything.
@@ -1105,6 +1135,8 @@ impl CompactionService {
             let pruned = self.prune_index_entries(by_table(confirmed.stale)).await;
             (pruned, not_logged)
         };
+        // Entries this run pruned or found present come off the planning skip list.
+        self.left_out.lock().retain(|key| undecided.contains(key));
         info!(
             checked,
             stale,
@@ -2938,6 +2970,69 @@ mod tests {
             line.contains("level = WARN") && line.contains(&flaky.path),
             "{line}"
         );
+    }
+
+    /// Planning skips inputs a job left out as stale, so a window whose inputs are all stale is not
+    /// planned again every cycle (taking job slots from real compaction) while it waits for the
+    /// index check. The check's prune then takes them off the list.
+    #[tokio::test]
+    async fn test_planning_skips_inputs_a_job_left_out_until_the_index_check_decides() {
+        let h = CompactionHarness::with_config(CompactionConfig {
+            min_files_for_compaction: 2,
+            ..two_minute_gen2_config()
+        })
+        .await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 20000000000").await;
+        for file in h.indexed_files() {
+            h.delete_object(&file).await;
+        }
+        h.set_now(Duration::from_secs(120));
+        let job = h
+            .service
+            .identify_compaction_jobs()
+            .await
+            .unwrap()
+            .remove(0);
+        h.service.execute_compaction_job(job).await.unwrap();
+
+        assert!(
+            h.service
+                .identify_compaction_jobs()
+                .await
+                .unwrap()
+                .is_empty(),
+            "the window of the left-out inputs was planned again"
+        );
+        h.service.check_index_for_missing_files().await;
+        assert!(h.indexed_files().is_empty());
+        assert!(h.service.left_out.lock().is_empty());
+    }
+
+    /// An input left out after a wrong NotFound is planned again once an index check run finds its
+    /// object present.
+    #[tokio::test]
+    async fn test_planning_includes_a_left_out_input_again_once_the_index_check_finds_it_present() {
+        let store = Arc::new(HeadFailingObjectStore::new(Arc::new(InMemory::new())));
+        let h = CompactionHarness::with_object_store(Arc::clone(&store) as _).await;
+        let service = h.service_with_config(CompactionConfig {
+            min_files_for_compaction: 2,
+            ..two_minute_gen2_config()
+        });
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 20000000000").await;
+        store.not_found_once(&h.indexed_file_at(10_000_000_000).path);
+        h.set_now(Duration::from_secs(120));
+        let job = service.identify_compaction_jobs().await.unwrap().remove(0);
+        service.execute_compaction_job(job).await.unwrap();
+        assert!(
+            service.identify_compaction_jobs().await.unwrap().is_empty(),
+            "test setup: the left-out input is skipped, leaving the window below the minimum"
+        );
+
+        service.check_index_for_missing_files().await;
+
+        assert_eq!(service.identify_compaction_jobs().await.unwrap().len(), 1);
     }
 
     /// With `index_check_enabled` off, the service starts without checking the index.

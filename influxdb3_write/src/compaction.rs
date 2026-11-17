@@ -17,7 +17,7 @@ use object_store::path::Path as ObjPath;
 use observability_deps::tracing::{debug, error, info, warn};
 use schema::Schema;
 use schema::sort::SortKey;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinSet;
@@ -44,8 +44,9 @@ pub struct CompactionConfig {
     pub index_check_enabled: bool,
     /// Run the index check again this long after each run ends. Zero runs it only at startup.
     pub index_check_interval: Duration,
-    /// A run of the index check prunes nothing, and logs an error, when more than this
-    /// percentage of the entries it could check are stale. 100 lifts the limit.
+    /// A run of the index check prunes none of a database's entries, and logs an error, when
+    /// more than this percentage of that database's entries it could check are stale. 100 lifts
+    /// the limit.
     pub index_check_max_prune_percent: u8,
 }
 
@@ -1010,25 +1011,27 @@ impl CompactionService {
     }
 
     /// Check every index entry against object storage and prune the ones whose object is
-    /// missing or has another size. Compaction checks only the inputs of its jobs, and a window
-    /// with fewer files than `min_files_for_compaction` never gets a job: leftover gen1 files,
-    /// most gen2 files and every file of the top generation would keep stale entries forever.
+    /// missing or has another size. Compaction jobs only leave such inputs out; this is the only
+    /// place that prunes. It also covers windows that never get a job (fewer files than
+    /// `min_files_for_compaction`: leftover gen1 files, most gen2 files, every top-generation
+    /// file).
     ///
     /// One HEAD per entry, at most [`INDEX_CHECK_CONCURRENCY`] at a time. Only a NotFound or a
-    /// size mismatch prunes, and only if a second HEAD after `stale_recheck_delay` says the same;
-    /// an entry whose HEAD fails some other way is kept. Nothing is pruned if more than
-    /// `index_check_max_prune_percent` of the entries that got a definite answer are stale, or if
-    /// the run saw object storage answer inconsistently (more entries flipped back to present
-    /// than stayed missing, or most HEADs failed).
+    /// size mismatch prunes, and only if a second HEAD after `stale_recheck_delay` agrees and the
+    /// index still holds the entry with the size that was checked. An entry whose HEAD fails some
+    /// other way is kept. A database's entries are not pruned if more than
+    /// `index_check_max_prune_percent` of its entries that got a definite answer are stale, and
+    /// nothing is pruned if the run saw object storage answer inconsistently (more entries
+    /// flipped back to present than stayed missing, or most HEADs failed).
     ///
-    /// Runs as the service starts and then every `index_check_interval`, alongside the compaction
-    /// cycles, so a large index does not hold compaction back and entries that go stale while
-    /// the server runs are pruned without a restart. Each run applies the limit to its own
-    /// count; a refused run is followed by another after the interval. That is safe: a job removes its inputs from the index before it
-    /// deletes their objects, and only entries the index still holds after the second look are
-    /// logged, counted or pruned, so inputs a job compacts meanwhile drop out. Jobs never prune;
-    /// they leave stale inputs out for this check to prune. Entries indexed
-    /// after the check starts are not checked: their objects were written before they were indexed.
+    /// Runs as the service starts and then every `index_check_interval`, alongside the
+    /// compaction cycles, so a large index does not hold compaction back and entries that go
+    /// stale while the server runs are pruned without a restart. A refused run is followed by
+    /// another after the interval. Running alongside jobs is safe: a job removes its inputs from
+    /// the index before it deletes their objects, and only entries the index still holds after
+    /// the second look are logged, counted or pruned, so inputs a job compacts meanwhile drop
+    /// out. Entries indexed after a run starts are not checked in that run: their objects were
+    /// written before they were indexed.
     async fn check_index_for_missing_files(&self) {
         let started = std::time::Instant::now();
         let mut entries = Vec::new();
@@ -1052,6 +1055,8 @@ impl CompactionService {
         let mut unknown = 0_usize;
         // Entries this run can't decide on; any a job left out stay skipped by planning.
         let mut undecided: HashSet<(ParquetFileId, String)> = HashSet::new();
+        // Entries checked and HEADs that failed, per database, for the per-database limit.
+        let mut per_db: HashMap<DbId, (usize, usize)> = HashMap::new();
         let mut results = futures::stream::iter(entries)
             .map(|(key, file)| async move {
                 let check = self.check_object(&file).await;
@@ -1059,10 +1064,12 @@ impl CompactionService {
             })
             .buffer_unordered(INDEX_CHECK_CONCURRENCY);
         while let Some((key, file, check)) = results.next().await {
+            per_db.entry(key.0).or_default().0 += 1;
             match check {
                 ObjectCheck::Present => {}
                 ObjectCheck::Stale(reason) => candidates.push(StaleEntry { key, file, reason }),
                 ObjectCheck::Unknown(e) => {
+                    per_db.entry(key.0).or_default().1 += 1;
                     if unknown == 0 {
                         warn!(path = %file.path, error = %e, "could not check a parquet index entry; keeping it");
                     }
@@ -1086,6 +1093,9 @@ impl CompactionService {
             );
         }
         unknown += confirmed.unknown.len();
+        for (entry, _) in &confirmed.unknown {
+            per_db.entry(entry.key.0).or_default().1 += 1;
+        }
         undecided.extend(
             confirmed
                 .unknown
@@ -1109,50 +1119,63 @@ impl CompactionService {
         // failed. Prune nothing then, whatever the limit; the next run tries again.
         let cleared = confirmed.cleared.len();
         let unstable = stale > 0 && (cleared > stale || unknown * 2 > checked);
-        let over_limit = stale * 100 > definite * max_percent;
-        let refused = unstable || over_limit;
-        if refused {
-            undecided.extend(
-                confirmed
-                    .stale
-                    .iter()
-                    .map(|e| (e.file.id, e.file.path.clone())),
-            );
+        // The limit applies per database, which also bounds the whole index: a fault that hides
+        // one database's objects is a minority of the index but all of that database.
+        let mut stale_by_db: HashMap<DbId, usize> = HashMap::new();
+        for entry in &confirmed.stale {
+            *stale_by_db.entry(entry.key.0).or_default() += 1;
         }
-        let (pruned, not_logged) = if unstable {
+        let over_limit: BTreeSet<DbId> = stale_by_db
+            .iter()
+            .filter(|(db, stale_db)| {
+                let (checked_db, unknown_db) = per_db.get(*db).copied().unwrap_or_default();
+                **stale_db * 100 > (checked_db - unknown_db) * max_percent
+            })
+            .map(|(db, _)| *db)
+            .collect();
+        let (prunable, kept): (Vec<StaleEntry>, Vec<StaleEntry>) = if unstable {
+            (Vec::new(), confirmed.stale)
+        } else {
+            confirmed
+                .stale
+                .into_iter()
+                .partition(|e| !over_limit.contains(&e.key.0))
+        };
+        undecided.extend(kept.iter().map(|e| (e.file.id, e.file.path.clone())));
+        let sample = || {
+            kept.iter()
+                .take(5)
+                .map(|e| e.file.path.as_str())
+                .collect::<Vec<_>>()
+        };
+        if unstable {
             error!(
                 checked,
                 stale,
                 cleared,
                 unknown,
-                sample = ?confirmed.stale.iter().take(5).map(|e| e.file.path.as_str()).collect::<Vec<_>>(),
+                sample = ?sample(),
                 "object storage answered inconsistently during the parquet index check (more entries flipped back to present than stayed missing, or most HEADs failed), so no entry was removed; the next run tries again"
             );
-            (0, 0)
-        } else if over_limit {
+        } else if !kept.is_empty() {
             // Far more than drift leaves behind: more likely object storage answering NotFound
-            // for objects it holds. Pruning would hide their rows for good, so keep everything.
+            // for objects it holds. Pruning would hide their rows for good, so keep them.
             error!(
                 checked,
                 definite,
                 stale,
+                kept = kept.len(),
+                databases = ?over_limit,
                 max_prune_percent = max_percent,
-                sample = ?confirmed.stale.iter().take(5).map(|e| e.file.path.as_str()).collect::<Vec<_>>(),
-                "too much of the parquet index looks stale to prune safely, so no entry was removed; check object storage, then set --index-check-max-prune-percent (INFLUXDB3_INDEX_CHECK_MAX_PRUNE_PERCENT) to 100 to prune them"
+                sample = ?sample(),
+                "too much of the parquet index looks stale to prune safely, so these databases' entries were not removed; check object storage, then set --index-check-max-prune-percent (INFLUXDB3_INDEX_CHECK_MAX_PRUNE_PERCENT) to 100 to prune them"
             );
-            (0, 0)
-        } else {
-            // A first start after a long drift may find many stale entries: log some, count the
-            // rest. The removal snapshot lists every one of them.
-            confirmed
-                .stale
-                .iter()
-                .take(STALE_LOG_LIMIT)
-                .for_each(log_stale);
-            let not_logged = stale.saturating_sub(STALE_LOG_LIMIT);
-            let pruned = self.prune_index_entries(by_table(confirmed.stale)).await;
-            (pruned, not_logged)
-        };
+        }
+        // A first start after a long drift may find many stale entries: log some, count the
+        // rest. The removal snapshot lists every one of them.
+        prunable.iter().take(STALE_LOG_LIMIT).for_each(log_stale);
+        let not_logged = prunable.len().saturating_sub(STALE_LOG_LIMIT);
+        let pruned = self.prune_index_entries(by_table(prunable)).await;
         // Entries this run pruned or found present come off the planning skip list.
         self.left_out.lock().retain(|key| undecided.contains(key));
         info!(
@@ -1763,6 +1786,49 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             panic!("no new gen1 file was persisted");
+        }
+
+        /// The indexed files of `testtable` in database `db`.
+        fn files_in(&self, db: &str) -> Vec<ParquetFile> {
+            let Some(db) = self.catalog.db_schema(db) else {
+                return vec![];
+            };
+            let Some(table) = db.table_definition(Self::TABLE) else {
+                return vec![];
+            };
+            self.write_buffer
+                .persisted_files()
+                .get_files(db.id, table.table_id)
+        }
+
+        /// Like `write_gen1`, in database `db` (created on first write).
+        async fn write_gen1_in(&self, db: &str, lp: &str) {
+            use data_types::NamespaceName;
+
+            let before = self.files_in(db).len();
+            self.write_buffer
+                .write_lp(
+                    NamespaceName::new(db.to_string()).unwrap(),
+                    lp,
+                    iox_time::Time::from_timestamp_nanos(0),
+                    false,
+                    crate::Precision::Nanosecond,
+                    false,
+                )
+                .await
+                .unwrap();
+            if let Some((snapshot_done, _, _permit)) =
+                self.write_buffer.wal().force_flush_buffer().await
+            {
+                snapshot_done.await.expect("snapshot failed");
+            }
+            for _ in 0..100 {
+                if self.files_in(db).len() > before {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!("no new gen1 file was persisted in {db}");
         }
 
         /// Index `count` gen1 files of 10 minutes each from `start`, one per gen1 chunk, without
@@ -3110,6 +3176,56 @@ mod tests {
             indexed,
             "a run in which 3 of 5 HEADs failed pruned the 1 missing entry"
         );
+    }
+
+    /// The limit applies to each database too: a fault that hides one database's objects is a
+    /// minority of the index but all of that database. Databases over the limit are refused and
+    /// the others still prune. Here `testdb` is 2 of 2 stale and `otherdb` 1 of 4: index-wide
+    /// that's 3 of 6, which the 50% limit alone would have pruned.
+    #[tokio::test]
+    async fn test_index_check_limit_applies_per_database() {
+        let h = CompactionHarness::new().await;
+        for i in 0..2_i64 {
+            h.write_gen1(&format!(
+                "testtable value={i} {}",
+                (10 + 60 * i) * 1_000_000_000
+            ))
+            .await;
+        }
+        for i in 0..4_i64 {
+            h.write_gen1_in(
+                "otherdb",
+                &format!("testtable value={i} {}", (10 + 60 * i) * 1_000_000_000),
+            )
+            .await;
+        }
+        let hidden = h.indexed_files();
+        for file in &hidden {
+            h.delete_object(file).await;
+        }
+        let other_missing = h.files_in("otherdb").remove(0);
+        h.delete_object(&other_missing).await;
+        let limited = h.service_with_config(CompactionConfig {
+            index_check_max_prune_percent: 50,
+            ..two_minute_gen2_config()
+        });
+
+        let capture = test_helpers::tracing::TracingCapture::new();
+        limited.check_index_for_missing_files().await;
+        let logs = capture.to_string();
+
+        assert_eq!(
+            sorted_paths(&h.indexed_files()),
+            sorted_paths(&hidden),
+            "testdb, entirely stale, was pruned because it is a minority of the index"
+        );
+        assert!(
+            !h.files_in("otherdb")
+                .iter()
+                .any(|f| f.path == other_missing.path),
+            "otherdb, under the limit, was not pruned"
+        );
+        assert_eq!(logs.matches("level = ERROR").count(), 1, "{logs}");
     }
 
     /// With `index_check_enabled` off, the service starts without checking the index.

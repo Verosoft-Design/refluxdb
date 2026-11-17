@@ -309,10 +309,11 @@ pub struct Config {
     )]
     pub index_check_interval: humantime::Duration,
 
-    /// A run of the index check removes nothing, and logs an error, when more than this
-    /// percentage of the entries it could check look stale. That much usually means object
-    /// storage answering NotFound for objects it holds. Compaction jobs never remove entries.
-    /// 100 lifts the limit.
+    /// A run of the index check removes none of a database's entries, and logs an error, when
+    /// more than this percentage of that database's entries it could check look stale. That much
+    /// usually means object storage answering NotFound for objects it holds. 100 lifts the
+    /// limit. Separately, a run that sees object storage answer inconsistently removes nothing.
+    /// Compaction jobs never remove entries.
     #[clap(
         long = "index-check-max-prune-percent",
         env = "INFLUXDB3_INDEX_CHECK_MAX_PRUNE_PERCENT",

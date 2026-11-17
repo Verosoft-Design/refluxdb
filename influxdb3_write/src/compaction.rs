@@ -134,6 +134,18 @@ struct Confirmed {
 /// Index entries to prune, by table.
 type StaleEntries = BTreeMap<(DbId, TableId), Vec<ParquetFile>>;
 
+/// Where the startup index check is. A compaction job persists the prunes its drift check finds
+/// only when no check runs or the check finished without refusing: a refusal means object
+/// storage may be answering NotFound for objects it holds, and a job gets the same answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexCheckState {
+    /// No startup check runs: it is disabled, or the service was not started.
+    NotRunning,
+    Running,
+    Passed,
+    Refused,
+}
+
 fn by_table(entries: impl IntoIterator<Item = StaleEntry>) -> StaleEntries {
     let mut by_table = StaleEntries::new();
     for entry in entries {
@@ -177,6 +189,7 @@ pub struct CompactionService {
     node_identifier_prefix: String,
     time_provider: Arc<dyn TimeProvider>,
     shutdown_token: influxdb3_shutdown::ShutdownToken,
+    index_check: parking_lot::Mutex<IndexCheckState>,
 }
 
 impl CompactionService {
@@ -207,6 +220,7 @@ impl CompactionService {
             node_identifier_prefix: node_identifier_prefix.into(),
             time_provider,
             shutdown_token,
+            index_check: parking_lot::Mutex::new(IndexCheckState::NotRunning),
         }
     }
 
@@ -240,6 +254,10 @@ impl CompactionService {
 
             info!("Starting compaction service with interval: {:?}", self.config.interval);
 
+            // Set before any cycle runs, so no job prunes until the check has finished.
+            if self.config.index_check_enabled {
+                *self.index_check.lock() = IndexCheckState::Running;
+            }
             let check = async {
                 if !self.config.index_check_enabled {
                     info!("parquet index check is disabled");
@@ -451,14 +469,28 @@ impl CompactionService {
                     excluded.remove(&(entry.file.id, entry.file.path.clone()));
                 }
                 if !confirmed.stale.is_empty() {
-                    confirmed.stale.iter().for_each(log_stale);
-                    // Persisted now, not with the compaction snapshot: the job may still stop
-                    // below the minimum or fail, and the prune must survive a restart either way.
-                    let pruned = self.prune_index_entries(by_table(confirmed.stale)).await;
-                    info!(
-                        "Pruned {} stale catalog entries for db={} table={}",
-                        pruned, job.database_id, job.table_name
-                    );
+                    let check = *self.index_check.lock();
+                    if matches!(check, IndexCheckState::Running | IndexCheckState::Refused) {
+                        // Left out of the job, but kept: only a check that looked at the whole
+                        // index can tell drift from object storage answering wrongly.
+                        warn!(
+                            count = confirmed.stale.len(),
+                            sample = %confirmed.stale[0].file.path,
+                            index_check = ?check,
+                            "Leaving stale inputs out of the compaction job for db={} table={} without pruning them until the startup index check has finished without refusing",
+                            job.database_id, job.table_name
+                        );
+                    } else {
+                        confirmed.stale.iter().for_each(log_stale);
+                        // Persisted now, not with the compaction snapshot: the job may still stop
+                        // below the minimum or fail, and the prune must survive a restart either
+                        // way.
+                        let pruned = self.prune_index_entries(by_table(confirmed.stale)).await;
+                        info!(
+                            "Pruned {} stale catalog entries for db={} table={}",
+                            pruned, job.database_id, job.table_name
+                        );
+                    }
                 }
             }
             let existing: Vec<ParquetFile> = job
@@ -998,7 +1030,8 @@ impl CompactionService {
     /// Runs once as the service starts, alongside the compaction cycles, so a large index does
     /// not hold compaction back. That is safe: a job removes its inputs from the index before it
     /// deletes their objects, and only entries the index still holds after the second look are
-    /// logged, counted or pruned, so inputs a job compacts meanwhile drop out. Entries indexed
+    /// logged, counted or pruned, so inputs a job compacts meanwhile drop out. Until the check
+    /// has finished without refusing, jobs leave stale inputs out without pruning them. Entries indexed
     /// after the check starts are not checked: their objects were written before they were indexed.
     async fn check_index_for_missing_files(&self) {
         let started = std::time::Instant::now();
@@ -1045,7 +1078,8 @@ impl CompactionService {
         unknown += confirmed.unknown.len();
         let stale = confirmed.stale.len();
         let max_percent = usize::from(self.config.index_check_max_prune_percent);
-        let (pruned, not_logged) = if stale * 100 > checked * max_percent {
+        let refused = stale * 100 > checked * max_percent;
+        let (pruned, not_logged) = if refused {
             // Far more than drift leaves behind: more likely object storage answering NotFound
             // for objects it holds. Pruning would hide their rows for good, so keep everything.
             error!(
@@ -1067,6 +1101,11 @@ impl CompactionService {
             let not_logged = stale.saturating_sub(STALE_LOG_LIMIT);
             let pruned = self.prune_index_entries(by_table(confirmed.stale)).await;
             (pruned, not_logged)
+        };
+        *self.index_check.lock() = if refused {
+            IndexCheckState::Refused
+        } else {
+            IndexCheckState::Passed
         };
         info!(
             checked,
@@ -2641,7 +2680,9 @@ mod tests {
 
     /// The startup check runs alongside the compaction cycles instead of before them: on a large
     /// index it takes minutes, and compaction must not wait for it. Here the check is held on
-    /// one HEAD while the first cycle compacts a gen1 file.
+    /// one HEAD while the first cycle compacts a gen1 file. The job leaves out a stale input in
+    /// the same window but doesn't prune it while the check is running; the check prunes it
+    /// once it finishes.
     #[tokio::test]
     async fn test_startup_index_check_runs_alongside_compaction() {
         let store = Arc::new(HeadFailingObjectStore::new(Arc::new(InMemory::new())));
@@ -2650,25 +2691,41 @@ mod tests {
         h.set_now(Duration::from_secs(120));
         let gen2 = h.compact().await.remove(0);
         h.write_gen1("testtable value=2 130000000000").await;
+        h.write_gen1("testtable value=3 190000000000").await;
         let gen1 = h.indexed_file_at(130_000_000_000);
+        let stale = h.indexed_file_at(190_000_000_000);
+        h.delete_object(&stale).await;
         h.set_now(Duration::from_secs(240));
         // gen2 is the top generation, so no job touches it; only the check HEADs it.
         let release = store.hold_head(&gen2.path);
 
         let task = Arc::clone(&h.service).start();
-        let still_indexed =
-            |h: &CompactionHarness| h.indexed_files().iter().any(|f| f.path == gen1.path);
+        let indexed =
+            |h: &CompactionHarness, path: &str| h.indexed_files().iter().any(|f| f.path == path);
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while still_indexed(&h) && std::time::Instant::now() < deadline {
+        while indexed(&h, &gen1.path) && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let compacted = !still_indexed(&h);
+        let compacted = !indexed(&h, &gen1.path);
+        let kept_while_checking = indexed(&h, &stale.path);
         release.add_permits(1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while indexed(&h, &stale.path) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         task.abort();
 
         assert!(
             compacted,
             "no compaction job ran while the startup check was in progress"
+        );
+        assert!(
+            kept_while_checking,
+            "a job pruned a stale input before the startup check had finished"
+        );
+        assert!(
+            !indexed(&h, &stale.path),
+            "the startup check did not prune the stale entry once it finished"
         );
     }
 
@@ -2709,6 +2766,55 @@ mod tests {
         assert!(
             inputs.iter().all(|p| !indexed.contains(p)),
             "the running job was dropped at shutdown; still indexed: {indexed:?}"
+        );
+    }
+
+    /// A compaction job must not prune what the startup check refused to: its drift check sees
+    /// the same NotFounds, and one job can hold thousands of inputs. After a refusal, a job
+    /// leaves stale inputs out but keeps them indexed, and writes no removal.
+    #[tokio::test]
+    async fn test_job_does_not_prune_after_the_startup_check_refused() {
+        let h = CompactionHarness::new().await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 20000000000").await;
+        h.write_gen1("testtable value=3 30000000000").await;
+        let stale = [
+            h.indexed_file_at(10_000_000_000),
+            h.indexed_file_at(20_000_000_000),
+        ];
+        for file in &stale {
+            h.delete_object(file).await;
+        }
+        h.set_now(Duration::from_secs(120));
+        let limited = h.service_with_config(CompactionConfig {
+            index_check_max_prune_percent: 50,
+            ..two_minute_gen2_config()
+        });
+        limited.check_index_for_missing_files().await;
+
+        for job in limited.identify_compaction_jobs().await.unwrap() {
+            limited.execute_compaction_job(job).await.unwrap();
+        }
+
+        let indexed = sorted_paths(&h.indexed_files());
+        for file in &stale {
+            assert!(
+                indexed.contains(&file.path),
+                "a job pruned {} after the startup check refused to",
+                file.path
+            );
+        }
+        let snapshot = h.newest_snapshot().await;
+        let removed: Vec<ParquetFile> = snapshot
+            .removed_files
+            .values()
+            .flat_map(|db| db.tables.values().flatten().cloned())
+            .collect();
+        assert!(
+            !removed
+                .iter()
+                .any(|f| stale.iter().any(|s| s.path == f.path)),
+            "a snapshot records the stale inputs as removed"
         );
     }
 

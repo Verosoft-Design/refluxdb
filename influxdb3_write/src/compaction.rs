@@ -2839,6 +2839,42 @@ mod tests {
             .unwrap();
     }
 
+    /// The second look compares the object with the size captured on the first look, so it must
+    /// only prune an entry the index still holds with that size. An entry replaced meanwhile by
+    /// one with the same id and path but another size (possible with ids reused before TAG-2495)
+    /// is not the entry that was checked.
+    #[tokio::test]
+    async fn test_still_indexed_drops_an_entry_replaced_with_another_size() {
+        let h = CompactionHarness::new().await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        let checked = h.indexed_file_at(10_000_000_000);
+        let db = h.catalog.db_schema(CompactionHarness::DB).unwrap();
+        let table_id = db
+            .table_definition(CompactionHarness::TABLE)
+            .unwrap()
+            .table_id;
+        let replacement = ParquetFile {
+            size_bytes: checked.size_bytes + 10,
+            ..checked.clone()
+        };
+        h.write_buffer
+            .persisted_files()
+            .add_persisted_file(&db.id, &table_id, &replacement);
+
+        let kept = h.service.still_indexed(vec![StaleEntry {
+            key: (db.id, table_id),
+            file: checked,
+            reason: StaleReason::SizeMismatch {
+                object_size: replacement.size_bytes,
+            },
+        }]);
+
+        assert!(
+            kept.is_empty(),
+            "an entry replaced with another size counts as the entry that was checked"
+        );
+    }
+
     /// With `index_check_enabled` off, the service starts without checking the index.
     #[tokio::test]
     async fn test_disabled_index_check_does_not_run() {

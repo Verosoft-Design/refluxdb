@@ -141,8 +141,11 @@ impl PersistedFiles {
         inner.subtract(&removed);
     }
 
-    /// The entries of `files` that are in the table's index now, matched by id and path as
-    /// [`Self::remove_persisted_files`] matches them.
+    /// The entries of `files` that are in the table's index now with the same id, path and size.
+    /// The size matters to the index check: it compared the object against this size, and an
+    /// entry replaced meanwhile by one with the same id and path but another size is not the
+    /// entry it checked. This guards the decision only: removal (and a restart replaying
+    /// `removed_files`) still matches by id and path, like [`Self::remove_persisted_files`].
     pub fn indexed(
         &self,
         db_id: DbId,
@@ -153,13 +156,13 @@ impl PersistedFiles {
         let Some(table_files) = inner.files.get(&db_id).and_then(|t| t.get(&table_id)) else {
             return vec![];
         };
-        let indexed: HashSet<(ParquetFileId, &str)> = table_files
+        let indexed: HashSet<(ParquetFileId, &str, u64)> = table_files
             .iter()
-            .map(|f| (f.id, f.path.as_str()))
+            .map(|f| (f.id, f.path.as_str(), f.size_bytes))
             .collect();
         files
             .iter()
-            .filter(|f| indexed.contains(&(f.id, f.path.as_str())))
+            .filter(|f| indexed.contains(&(f.id, f.path.as_str(), f.size_bytes)))
             .cloned()
             .collect()
     }

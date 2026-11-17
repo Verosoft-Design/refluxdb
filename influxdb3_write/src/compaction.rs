@@ -1017,7 +1017,9 @@ impl CompactionService {
     /// One HEAD per entry, at most [`INDEX_CHECK_CONCURRENCY`] at a time. Only a NotFound or a
     /// size mismatch prunes, and only if a second HEAD after `stale_recheck_delay` says the same;
     /// an entry whose HEAD fails some other way is kept. Nothing is pruned if more than
-    /// `index_check_max_prune_percent` of the entries that got a definite answer are stale.
+    /// `index_check_max_prune_percent` of the entries that got a definite answer are stale, or if
+    /// the run saw object storage answer inconsistently (more entries flipped back to present
+    /// than stayed missing, or most HEADs failed).
     ///
     /// Runs as the service starts and then every `index_check_interval`, alongside the compaction
     /// cycles, so a large index does not hold compaction back and entries that go stale while
@@ -1102,7 +1104,13 @@ impl CompactionService {
                 "no parquet index entry could be checked: every HEAD failed some other way than NotFound, so nothing was pruned this run"
             );
         }
-        let refused = stale * 100 > definite * max_percent;
+        // Signs that object storage answered unreliably during this run: more entries flipped
+        // from missing to present between the two looks than stayed missing, or most HEADs
+        // failed. Prune nothing then, whatever the limit; the next run tries again.
+        let cleared = confirmed.cleared.len();
+        let unstable = stale > 0 && (cleared > stale || unknown * 2 > checked);
+        let over_limit = stale * 100 > definite * max_percent;
+        let refused = unstable || over_limit;
         if refused {
             undecided.extend(
                 confirmed
@@ -1111,7 +1119,17 @@ impl CompactionService {
                     .map(|e| (e.file.id, e.file.path.clone())),
             );
         }
-        let (pruned, not_logged) = if refused {
+        let (pruned, not_logged) = if unstable {
+            error!(
+                checked,
+                stale,
+                cleared,
+                unknown,
+                sample = ?confirmed.stale.iter().take(5).map(|e| e.file.path.as_str()).collect::<Vec<_>>(),
+                "object storage answered inconsistently during the parquet index check (more entries flipped back to present than stayed missing, or most HEADs failed), so no entry was removed; the next run tries again"
+            );
+            (0, 0)
+        } else if over_limit {
             // Far more than drift leaves behind: more likely object storage answering NotFound
             // for objects it holds. Pruning would hide their rows for good, so keep everything.
             error!(
@@ -1142,7 +1160,7 @@ impl CompactionService {
             stale,
             pruned,
             not_logged,
-            cleared = confirmed.cleared.len(),
+            cleared,
             unknown,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "checked the parquet index against object storage"
@@ -3033,6 +3051,65 @@ mod tests {
         service.check_index_for_missing_files().await;
 
         assert_eq!(service.identify_compaction_jobs().await.unwrap().len(), 1);
+    }
+
+    /// A run that sees object storage answer inconsistently prunes nothing, whatever the limit:
+    /// here more entries flip from missing to present between the two looks than stay missing.
+    #[tokio::test]
+    async fn test_index_check_refuses_a_run_where_entries_flip_back_to_present() {
+        let store = Arc::new(HeadFailingObjectStore::new(Arc::new(InMemory::new())));
+        let h = CompactionHarness::with_object_store(Arc::clone(&store) as _).await;
+        for i in 0..4_i64 {
+            h.write_gen1(&format!(
+                "testtable value={i} {}",
+                (10 + 60 * i) * 1_000_000_000
+            ))
+            .await;
+        }
+        let files = h.indexed_files();
+        h.delete_object(&files[0]).await;
+        store.not_found_once(&files[1].path);
+        store.not_found_once(&files[2].path);
+        let indexed = sorted_paths(&files);
+
+        let capture = test_helpers::tracing::TracingCapture::new();
+        h.service.check_index_for_missing_files().await;
+        let logs = capture.to_string();
+
+        assert_eq!(
+            sorted_paths(&h.indexed_files()),
+            indexed,
+            "a run in which 2 entries flipped back to present pruned the 1 that stayed missing"
+        );
+        assert!(logs.contains("answered inconsistently"), "{logs}");
+    }
+
+    /// The same when most HEADs of a run fail some other way than NotFound.
+    #[tokio::test]
+    async fn test_index_check_refuses_a_run_where_most_answers_failed() {
+        let store = Arc::new(HeadFailingObjectStore::new(Arc::new(InMemory::new())));
+        let h = CompactionHarness::with_object_store(Arc::clone(&store) as _).await;
+        for i in 0..5_i64 {
+            h.write_gen1(&format!(
+                "testtable value={i} {}",
+                (10 + 60 * i) * 1_000_000_000
+            ))
+            .await;
+        }
+        let files = h.indexed_files();
+        for file in &files[..3] {
+            store.fail_head(&file.path);
+        }
+        h.delete_object(&files[3]).await;
+        let indexed = sorted_paths(&files);
+
+        h.service.check_index_for_missing_files().await;
+
+        assert_eq!(
+            sorted_paths(&h.indexed_files()),
+            indexed,
+            "a run in which 3 of 5 HEADs failed pruned the 1 missing entry"
+        );
     }
 
     /// With `index_check_enabled` off, the service starts without checking the index.

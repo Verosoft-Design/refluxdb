@@ -1814,8 +1814,20 @@ async fn record_batch_stream_to_body(
         }
         QueryFormat::Csv => {
             struct CsvFuture {
-                first_poll: bool,
+                header_written: bool,
+                /// The first batch, while no batch has had rows. If none ever does, the output
+                /// is its header alone.
+                rowless_first: Option<RecordBatch>,
+                finished: bool,
                 stream: Pin<Box<dyn RecordBatchStream + Send>>,
+            }
+
+            fn encode(batch: &RecordBatch, header: bool) -> Result<Bytes, DataFusionError> {
+                let mut writer = arrow_csv::WriterBuilder::new()
+                    .with_header(header)
+                    .build(Vec::new());
+                writer.write(batch)?;
+                Ok(Bytes::from(writer.into_inner()))
             }
 
             impl Future for CsvFuture {
@@ -1825,34 +1837,45 @@ async fn record_batch_stream_to_body(
                     mut self: Pin<&mut Self>,
                     ctx: &mut std::task::Context<'_>,
                 ) -> Poll<Self::Output> {
+                    if self.finished {
+                        return Poll::Ready(None);
+                    }
                     match self.stream.poll_next_unpin(ctx) {
                         Poll::Ready(Some(batch)) => {
                             let batch = match batch {
                                 Ok(batch) => batch,
                                 Err(e) => return Poll::Ready(Some(Err(e))),
                             };
-                            let mut writer = if self.first_poll {
-                                self.first_poll = false;
-                                arrow_csv::Writer::new(Vec::new())
-                            } else {
-                                arrow_csv::WriterBuilder::new()
-                                    .with_header(false)
-                                    .build(Vec::new())
-                            };
-                            if let Err(err) = writer.write(&batch) {
-                                Poll::Ready(Some(Err(err.into())))
-                            } else {
-                                Poll::Ready(Some(Ok(Bytes::from(writer.into_inner()))))
+                            if !self.header_written && batch.num_rows() == 0 {
+                                // Hold the header back until the first row, or the end: once it
+                                // is sent the response has started, and a later error can no
+                                // longer get an error status.
+                                if self.rowless_first.is_none() {
+                                    self.rowless_first = Some(batch);
+                                }
+                                return Poll::Ready(Some(Ok(Bytes::new())));
+                            }
+                            let header = !self.header_written;
+                            self.header_written = true;
+                            self.rowless_first = None;
+                            Poll::Ready(Some(encode(&batch, header)))
+                        }
+                        Poll::Ready(None) => {
+                            self.finished = true;
+                            match self.rowless_first.take() {
+                                Some(batch) => Poll::Ready(Some(encode(&batch, true))),
+                                None => Poll::Ready(None),
                             }
                         }
-                        Poll::Ready(None) => Poll::Ready(None),
                         Poll::Pending => Poll::Pending,
                     }
                 }
             }
 
             let mut future = CsvFuture {
-                first_poll: true,
+                header_written: false,
+                rowless_first: None,
+                finished: false,
                 stream,
             };
             let encoded = futures::stream::poll_fn(move |ctx| future.poll_unpin(ctx));
@@ -2427,6 +2450,36 @@ mod tests {
         assert_eq!(str::from_utf8(bytes.as_ref()).unwrap(), "");
     }
 
+    /// A result whose batches have no rows is the header alone.
+    #[tokio::test]
+    async fn test_csv_output_only_empty_batches() {
+        let bytes = read_body_bytes_for_tests(
+            record_batch_stream_to_body(
+                make_record_stream_with_sizes(vec![0, 0]),
+                QueryFormat::Csv,
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(str::from_utf8(bytes.as_ref()).unwrap(), "a\n");
+    }
+
+    /// An empty first batch does not repeat the header before the rows.
+    #[tokio::test]
+    async fn test_csv_output_empty_batch_then_rows() {
+        let bytes = read_body_bytes_for_tests(
+            record_batch_stream_to_body(
+                make_record_stream_with_sizes(vec![0, 2, 0, 1]),
+                QueryFormat::Csv,
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(str::from_utf8(bytes.as_ref()).unwrap(), "a\n1\n1\n1\n");
+    }
+
     #[tokio::test]
     async fn test_csv_output_one_record() {
         // Turn RecordBatches into a Body and then collect into Bytes to assert
@@ -2537,9 +2590,8 @@ mod tests {
     /// Regression test (TAG-2507): the streaming formats sent the 200 status line before reading
     /// the first batch, so a query that failed before producing any bytes ended a 200 response
     /// early. The error must come back from `record_batch_stream_to_body`, so the handler answers
-    /// with an error status. For JSON and JSON lines a batch without rows produces no bytes, so an
-    /// error after one is still before the response starts. (A CSV response starts with the header
-    /// of the first batch, rows or not.)
+    /// with an error status. A batch without rows produces no bytes (CSV holds its header until
+    /// the first row, or the end), so an error after one is still before the response starts.
     #[tokio::test]
     async fn test_error_before_the_response_starts_is_returned() {
         let cases = [
@@ -2548,6 +2600,7 @@ mod tests {
             (QueryFormat::JsonLines, vec![]),
             (QueryFormat::JsonLines, vec![0]),
             (QueryFormat::Csv, vec![]),
+            (QueryFormat::Csv, vec![0]),
         ];
         for (format, sizes) in cases {
             let result =

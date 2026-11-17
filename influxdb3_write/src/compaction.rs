@@ -241,32 +241,38 @@ impl CompactionService {
             info!("Starting compaction service with interval: {:?}", self.config.interval);
 
             let check = async {
-                if self.config.index_check_enabled {
-                    self.check_index_for_missing_files().await;
-                } else {
+                if !self.config.index_check_enabled {
                     info!("parquet index check is disabled");
+                    return;
+                }
+                tokio::select! {
+                    _ = self.check_index_for_missing_files() => {}
+                    _ = self.shutdown_token.wait_for_shutdown() => {}
                 }
             };
             let cycles = async {
                 let mut interval = tokio::time::interval(self.config.interval);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
-                    interval.tick().await;
-                    if let Err(e) = Arc::clone(&self).run_compaction_cycle().await {
-                        error!("Compaction cycle failed: {}", e);
+                    // A cycle that has started runs to the end; shutdown is checked between them.
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            if let Err(e) = Arc::clone(&self).run_compaction_cycle().await {
+                                error!("Compaction cycle failed: {}", e);
+                            }
+                        }
+                        _ = self.shutdown_token.wait_for_shutdown() => {
+                            info!("Shutdown signal received, stopping compaction service");
+                            break;
+                        }
                     }
                 }
             };
 
-            // The check runs alongside the cycles, in this task, so shutdown (and aborting the
-            // task) stops both. See `check_index_for_missing_files` for why jobs running at the
-            // same time are safe.
-            tokio::select! {
-                _ = futures::future::join(check, cycles) => {}
-                _ = self.shutdown_token.wait_for_shutdown() => {
-                    info!("Shutdown signal received, stopping compaction service");
-                }
-            }
+            // The check runs alongside the cycles, in this task, so aborting the task stops
+            // both. See `check_index_for_missing_files` for why jobs running at the same time
+            // are safe.
+            futures::future::join(check, cycles).await;
         })
     }
 
@@ -2666,6 +2672,46 @@ mod tests {
         );
     }
 
+    /// Shutdown is checked between compaction cycles: a cycle that has started runs to the end
+    /// instead of being dropped with its jobs half done.
+    #[tokio::test]
+    async fn test_shutdown_lets_a_running_compaction_cycle_finish() {
+        let store = Arc::new(HeadFailingObjectStore::new(Arc::new(InMemory::new())));
+        let h = CompactionHarness::with_object_store(Arc::clone(&store) as _).await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 20000000000").await;
+        let inputs = sorted_paths(&h.indexed_files());
+        h.set_now(Duration::from_secs(120));
+        let release = store.hold_head(&inputs[0]);
+        let service = h.service_with_config(CompactionConfig {
+            index_check_enabled: false,
+            ..two_minute_gen2_config()
+        });
+
+        let task = Arc::clone(&service).start();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !store.head_is_held() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            store.head_is_held(),
+            "test setup: the job never reached its drift check"
+        );
+        service.shutdown_token.trigger_shutdown();
+        tokio::task::yield_now().await;
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the compaction service did not stop after shutdown")
+            .unwrap();
+
+        let indexed = sorted_paths(&h.indexed_files());
+        assert!(
+            inputs.iter().all(|p| !indexed.contains(p)),
+            "the running job was dropped at shutdown; still indexed: {indexed:?}"
+        );
+    }
+
     /// A single NotFound never prunes: object storage that briefly answers NotFound for an object
     /// it holds would otherwise remove the entry for good. The check looks again after
     /// `stale_recheck_delay` and keeps an entry whose object is there the second time.
@@ -2719,6 +2765,7 @@ mod tests {
         failing: parking_lot::Mutex<Option<ObjPath>>,
         not_found_once: parking_lot::Mutex<HashSet<ObjPath>>,
         held: parking_lot::Mutex<Option<(ObjPath, Arc<tokio::sync::Semaphore>)>>,
+        held_waiting: std::sync::atomic::AtomicBool,
     }
 
     impl HeadFailingObjectStore {
@@ -2728,7 +2775,13 @@ mod tests {
                 failing: Default::default(),
                 not_found_once: Default::default(),
                 held: Default::default(),
+                held_waiting: Default::default(),
             }
+        }
+
+        /// Whether a HEAD of the held path has started waiting.
+        fn head_is_held(&self) -> bool {
+            self.held_waiting.load(std::sync::atomic::Ordering::SeqCst)
         }
 
         /// HEAD of `path` waits until a permit is added to the returned semaphore.
@@ -2794,6 +2847,8 @@ mod tests {
                 .filter(|(path, _)| path == location)
                 .map(|(_, permits)| Arc::clone(permits));
             if let Some(permits) = held {
+                self.held_waiting
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 let _permit = permits.acquire().await;
             }
             if self.not_found_once.lock().remove(location) {

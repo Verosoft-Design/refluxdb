@@ -25,7 +25,7 @@ use futures::{Stream, StreamExt, TryStreamExt, ready, stream::Fuse};
 use hyper::http::HeaderValue;
 use hyper::{StatusCode, header::ACCEPT, header::CONTENT_TYPE};
 use influxdb_influxql_parser::select::{Dimension, GroupByClause};
-use iox_http_util::{Request, Response, ResponseBuilder, stream_results_to_response_body};
+use iox_http_util::{Request, Response, ResponseBuilder};
 use observability_deps::tracing::info;
 use regex::Regex;
 use schema::{INFLUXQL_MEASUREMENT_COLUMN_NAME, InfluxColumnType, TIME_COLUMN_NAME};
@@ -81,7 +81,8 @@ impl HttpApi {
         let (stream, group_by) = self.query_influxql_inner(database, &query, None).await?;
         let stream = QueryResponseStream::new(0, stream, chunk_size, format, epoch, group_by)
             .map_err(QueryError)?;
-        let body = stream_results_to_response_body(stream.map_err(QueryError));
+        let encoded = stream.map_ok(Bytes::from).map_err(QueryError);
+        let body = super::start_response_body(encoded).await?;
 
         Ok(ResponseBuilder::new()
             .status(StatusCode::OK)
@@ -268,7 +269,7 @@ struct QueryResponse {
     format: QueryFormat,
 }
 
-/// Convert `QueryResponse` to [`Bytes`] for the [`stream_results_to_response_body`] method
+/// Convert `QueryResponse` to [`Bytes`] for [`super::start_response_body`]
 impl From<QueryResponse> for Bytes {
     fn from(s: QueryResponse) -> Self {
         /// Convert a [`QueryResponse`] to a JSON byte vector.

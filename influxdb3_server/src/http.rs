@@ -14,7 +14,7 @@ use datafusion::execution::RecordBatchStream;
 use datafusion::execution::memory_pool::UnboundedMemoryPool;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::FutureExt;
-use futures::{StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use http::header::ACCESS_CONTROL_ALLOW_ORIGIN;
 use hyper::HeaderMap;
 use hyper::header::AUTHORIZATION;
@@ -1751,6 +1751,36 @@ pub enum ValidateDbNameError {
     Empty,
 }
 
+/// Start a streamed response body from the encoded `stream`.
+///
+/// The status line goes out with the first bytes of the body, so the stream is read up to its
+/// first non-empty chunk first: a query that fails before then (for example on a parquet object
+/// that is missing) returns its error here, and the handler answers with an error status. After
+/// that the status can't change. A later error is logged at error level and ends the body, so
+/// hyper closes the connection without the final chunk and the client sees an incomplete
+/// response, not a complete one.
+async fn start_response_body<S, E>(stream: S) -> Result<ResponseBody, E>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let mut stream = Box::pin(stream.fuse());
+    let mut first = None;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if !chunk.is_empty() {
+            first = Some(chunk);
+            break;
+        }
+    }
+    let rest = stream.inspect_err(|error| {
+        error!(%error, "query failed after its response started; ending the response early");
+    });
+    Ok(stream_results_to_response_body(
+        futures::stream::iter(first.map(Ok)).chain(rest),
+    ))
+}
+
 async fn record_batch_stream_to_body(
     mut stream: Pin<Box<dyn RecordBatchStream + Send>>,
     format: QueryFormat,
@@ -1784,8 +1814,20 @@ async fn record_batch_stream_to_body(
         }
         QueryFormat::Csv => {
             struct CsvFuture {
-                first_poll: bool,
+                header_written: bool,
+                /// The first batch, while no batch has had rows. If none ever does, the output
+                /// is its header alone.
+                rowless_first: Option<RecordBatch>,
+                finished: bool,
                 stream: Pin<Box<dyn RecordBatchStream + Send>>,
+            }
+
+            fn encode(batch: &RecordBatch, header: bool) -> Result<Bytes, DataFusionError> {
+                let mut writer = arrow_csv::WriterBuilder::new()
+                    .with_header(header)
+                    .build(Vec::new());
+                writer.write(batch)?;
+                Ok(Bytes::from(writer.into_inner()))
             }
 
             impl Future for CsvFuture {
@@ -1795,39 +1837,49 @@ async fn record_batch_stream_to_body(
                     mut self: Pin<&mut Self>,
                     ctx: &mut std::task::Context<'_>,
                 ) -> Poll<Self::Output> {
+                    if self.finished {
+                        return Poll::Ready(None);
+                    }
                     match self.stream.poll_next_unpin(ctx) {
                         Poll::Ready(Some(batch)) => {
                             let batch = match batch {
                                 Ok(batch) => batch,
                                 Err(e) => return Poll::Ready(Some(Err(e))),
                             };
-                            let mut writer = if self.first_poll {
-                                self.first_poll = false;
-                                arrow_csv::Writer::new(Vec::new())
-                            } else {
-                                arrow_csv::WriterBuilder::new()
-                                    .with_header(false)
-                                    .build(Vec::new())
-                            };
-                            if let Err(err) = writer.write(&batch) {
-                                Poll::Ready(Some(Err(err.into())))
-                            } else {
-                                Poll::Ready(Some(Ok(Bytes::from(writer.into_inner()))))
+                            if !self.header_written && batch.num_rows() == 0 {
+                                // Hold the header back until the first row, or the end: once it
+                                // is sent the response has started, and a later error can no
+                                // longer get an error status.
+                                if self.rowless_first.is_none() {
+                                    self.rowless_first = Some(batch);
+                                }
+                                return Poll::Ready(Some(Ok(Bytes::new())));
+                            }
+                            let header = !self.header_written;
+                            self.header_written = true;
+                            self.rowless_first = None;
+                            Poll::Ready(Some(encode(&batch, header)))
+                        }
+                        Poll::Ready(None) => {
+                            self.finished = true;
+                            match self.rowless_first.take() {
+                                Some(batch) => Poll::Ready(Some(encode(&batch, true))),
+                                None => Poll::Ready(None),
                             }
                         }
-                        Poll::Ready(None) => Poll::Ready(None),
                         Poll::Pending => Poll::Pending,
                     }
                 }
             }
 
             let mut future = CsvFuture {
-                first_poll: true,
+                header_written: false,
+                rowless_first: None,
+                finished: false,
                 stream,
             };
-            Ok(stream_results_to_response_body(futures::stream::poll_fn(
-                move |ctx| future.poll_unpin(ctx),
-            )))
+            let encoded = futures::stream::poll_fn(move |ctx| future.poll_unpin(ctx));
+            Ok(start_response_body(encoded).await?)
         }
         QueryFormat::Json => {
             struct JsonFuture {
@@ -1863,6 +1915,10 @@ async fn record_batch_stream_to_body(
                     mut self: Pin<&mut Self>,
                     ctx: &mut std::task::Context<'_>,
                 ) -> Poll<Self::Output> {
+                    // The closing bytes are out and the stream has ended; don't poll it again.
+                    if matches!(self.state, State::Done) {
+                        return Poll::Ready(None);
+                    }
                     match self.stream.poll_next_unpin(ctx) {
                         Poll::Ready(Some(batch)) => {
                             let batch = match batch {
@@ -1922,9 +1978,8 @@ async fn record_batch_stream_to_body(
                 state: State::FirstPoll,
                 stream,
             };
-            Ok(stream_results_to_response_body(futures::stream::poll_fn(
-                move |ctx| future.poll_unpin(ctx),
-            )))
+            let encoded = futures::stream::poll_fn(move |ctx| future.poll_unpin(ctx));
+            Ok(start_response_body(encoded).await?)
         }
         QueryFormat::JsonLines => {
             let stream = futures::stream::poll_fn(move |ctx| match stream.poll_next_unpin(ctx) {
@@ -1946,7 +2001,7 @@ async fn record_batch_stream_to_body(
                 Poll::Ready(None) => Poll::Ready(None),
                 Poll::Pending => Poll::Pending,
             });
-            Ok(stream_results_to_response_body(stream))
+            Ok(start_response_body(stream).await?)
         }
     }
 }
@@ -2399,6 +2454,36 @@ mod tests {
         assert_eq!(str::from_utf8(bytes.as_ref()).unwrap(), "");
     }
 
+    /// A result whose batches have no rows is the header alone.
+    #[tokio::test]
+    async fn test_csv_output_only_empty_batches() {
+        let bytes = read_body_bytes_for_tests(
+            record_batch_stream_to_body(
+                make_record_stream_with_sizes(vec![0, 0]),
+                QueryFormat::Csv,
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(str::from_utf8(bytes.as_ref()).unwrap(), "a\n");
+    }
+
+    /// An empty first batch does not repeat the header before the rows.
+    #[tokio::test]
+    async fn test_csv_output_empty_batch_then_rows() {
+        let bytes = read_body_bytes_for_tests(
+            record_batch_stream_to_body(
+                make_record_stream_with_sizes(vec![0, 2, 0, 1]),
+                QueryFormat::Csv,
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(str::from_utf8(bytes.as_ref()).unwrap(), "a\n1\n1\n1\n");
+    }
+
     #[tokio::test]
     async fn test_csv_output_one_record() {
         // Turn RecordBatches into a Body and then collect into Bytes to assert
@@ -2473,6 +2558,188 @@ mod tests {
             invalid_token,
             Err(AuthenticationError::MalformedRequest)
         ));
+    }
+
+    const MISSING_OBJECT: &str = "Object at location test/missing.parquet not found";
+
+    /// Batches with `batch_sizes` rows each, then the error a scan of a missing parquet object
+    /// fails with. Like a real scan, the error is not ready at once, so a server flushes what it
+    /// has before it arrives.
+    fn make_stream_failing_after(batch_sizes: Vec<usize>) -> SendableRecordBatchStream {
+        use futures::StreamExt;
+
+        let schema = record_batch!(("a", Int32, [1])).unwrap().schema();
+        let batches: Vec<datafusion::error::Result<RecordBatch>> = batch_sizes
+            .into_iter()
+            .map(|size| {
+                Ok(RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int32Array::from_iter_values(vec![1; size]))],
+                )
+                .unwrap())
+            })
+            .collect();
+        let error = futures::stream::once(async {
+            tokio::task::yield_now().await;
+            Err(datafusion::error::DataFusionError::Execution(
+                MISSING_OBJECT.to_string(),
+            ))
+        });
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(batches).chain(error),
+        ))
+    }
+
+    /// Regression test (TAG-2507): the streaming formats sent the 200 status line before reading
+    /// the first batch, so a query that failed before producing any bytes ended a 200 response
+    /// early. The error must come back from `record_batch_stream_to_body`, so the handler answers
+    /// with an error status. A batch without rows produces no bytes (CSV holds its header until
+    /// the first row, or the end), so an error after one is still before the response starts.
+    #[tokio::test]
+    async fn test_error_before_the_response_starts_is_returned() {
+        let cases = [
+            (QueryFormat::Json, vec![]),
+            (QueryFormat::Json, vec![0]),
+            (QueryFormat::JsonLines, vec![]),
+            (QueryFormat::JsonLines, vec![0]),
+            (QueryFormat::Csv, vec![]),
+            (QueryFormat::Csv, vec![0]),
+        ];
+        for (format, sizes) in cases {
+            let result =
+                record_batch_stream_to_body(make_stream_failing_after(sizes.clone()), format).await;
+            let err = result.err().unwrap_or_else(|| {
+                panic!("{format:?} after batches {sizes:?}: the error was left to the body")
+            });
+            assert!(err.to_string().contains(MISSING_OBJECT), "{err}");
+        }
+    }
+
+    use futures::Stream;
+    use std::pin::Pin;
+    use std::task::Poll;
+
+    /// A record batch stream that panics if polled again after it ended. Streams in general
+    /// don't promise that a poll after `None` is safe.
+    struct PanicsWhenPolledAfterEnd {
+        batches: std::vec::IntoIter<datafusion::error::Result<RecordBatch>>,
+        ended: bool,
+    }
+
+    impl Stream for PanicsWhenPolledAfterEnd {
+        type Item = datafusion::error::Result<RecordBatch>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _ctx: &mut std::task::Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            assert!(!self.ended, "the stream was polled after it ended");
+            let next = self.batches.next();
+            self.ended = next.is_none();
+            Poll::Ready(next)
+        }
+    }
+
+    /// No encoder polls the record batch stream again once it has ended.
+    #[tokio::test]
+    async fn test_encoders_stop_polling_a_finished_stream() {
+        let schema = record_batch!(("a", Int32, [1])).unwrap().schema();
+        for format in [
+            QueryFormat::Json,
+            QueryFormat::JsonLines,
+            QueryFormat::Csv,
+            QueryFormat::Pretty,
+            QueryFormat::Parquet,
+        ] {
+            for sizes in [vec![], vec![0], vec![1, 2]] {
+                let batches: Vec<_> = sizes
+                    .iter()
+                    .map(|&n| {
+                        Ok(RecordBatch::try_new(
+                            Arc::clone(&schema),
+                            vec![Arc::new(Int32Array::from_iter_values(vec![1; n]))],
+                        )
+                        .unwrap())
+                    })
+                    .collect();
+                let stream = Box::pin(RecordBatchStreamAdapter::new(
+                    Arc::clone(&schema),
+                    PanicsWhenPolledAfterEnd {
+                        batches: batches.into_iter(),
+                        ended: false,
+                    },
+                ));
+                let body = record_batch_stream_to_body(stream, format).await.unwrap();
+                read_body_bytes_for_tests(body).await;
+            }
+        }
+    }
+
+    /// Once bytes are sent the status can't change, so an error after that ends the response
+    /// early. Over HTTP/1.1 that is a chunked body without its last chunk, which a client reports
+    /// as an error, not as a complete (empty) response. This already held before TAG-2507; the
+    /// test keeps it that way.
+    #[tokio::test]
+    async fn test_error_after_the_response_starts_leaves_it_incomplete() {
+        for format in [QueryFormat::Json, QueryFormat::JsonLines, QueryFormat::Csv] {
+            let body = record_batch_stream_to_body(make_stream_failing_after(vec![1]), format)
+                .await
+                .unwrap();
+            let (status, body) = serve_once_over_tcp(body).await;
+            assert_eq!(status, http::StatusCode::OK);
+            assert!(
+                body.is_err(),
+                "{format:?}: the client read a complete response: {body:?}"
+            );
+        }
+    }
+
+    /// Regression test (TAG-2507): an error after the response started was only passed to hyper,
+    /// which logs it at debug level, so the server logged nothing.
+    #[tokio::test]
+    async fn test_error_after_the_response_starts_is_logged_at_error_level() {
+        for format in [QueryFormat::Json, QueryFormat::JsonLines, QueryFormat::Csv] {
+            let capture = test_helpers::tracing::TracingCapture::new();
+            let body = record_batch_stream_to_body(make_stream_failing_after(vec![1]), format)
+                .await
+                .unwrap();
+            assert!(hyper::body::to_bytes(body).await.is_err());
+            let logs = capture.to_string();
+            assert!(
+                logs.lines()
+                    .any(|l| l.contains("level = ERROR") && l.contains(MISSING_OBJECT)),
+                "{format:?}: no error-level log of the error: {logs}"
+            );
+        }
+    }
+
+    /// Serve `body` as the response to one request on a loopback socket and read it with a real
+    /// client. Returns the status and the body, or the client's error reading it.
+    async fn serve_once_over_tcp(
+        body: iox_http_util::ResponseBody,
+    ) -> (http::StatusCode, Result<bytes::Bytes, hyper::Error>) {
+        let body = Arc::new(std::sync::Mutex::new(Some(body)));
+        let make_service = hyper::service::make_service_fn(move |_| {
+            let body = Arc::clone(&body);
+            async move {
+                Ok::<_, std::convert::Infallible>(hyper::service::service_fn(move |_| {
+                    let body = body.lock().unwrap().take().expect("one request");
+                    async move { Ok::<_, std::convert::Infallible>(hyper::Response::new(body)) }
+                }))
+            }
+        });
+        let server = hyper::Server::bind(&([127, 0, 0, 1], 0).into()).serve(make_service);
+        let url = format!("http://{}/", server.local_addr());
+        let server = tokio::spawn(server);
+        let res = hyper::Client::new()
+            .get(url.parse().unwrap())
+            .await
+            .expect("request failed");
+        let status = res.status();
+        let body = hyper::body::to_bytes(res.into_body()).await;
+        server.abort();
+        (status, body)
     }
 
     fn make_record_stream(records: Option<usize>) -> SendableRecordBatchStream {

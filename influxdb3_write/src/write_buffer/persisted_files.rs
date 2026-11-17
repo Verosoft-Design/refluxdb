@@ -105,16 +105,21 @@ impl PersistedFiles {
 
     /// Remove specific files from a table (for compaction and drift pruning).
     ///
-    /// Entries are matched by [`ParquetFileId`], not by path, so removing a stale entry never
-    /// drops a different entry that happens to share its path. Metrics are adjusted by the
-    /// entries actually removed; files that are not in the index are ignored.
+    /// Entries are matched by [`ParquetFileId`] and path, as the snapshot loader matches the
+    /// `removed_files` it replays: removing a stale entry never drops a different entry that
+    /// shares its path, or one that reuses its id (builds before TAG-2495 could reuse ids after a
+    /// restart). Metrics are adjusted by the entries actually removed; files that are not in the
+    /// index are ignored.
     pub fn remove_persisted_files(
         &self,
         db_id: &DbId,
         table_id: &TableId,
         files_to_remove: &[ParquetFile],
     ) {
-        let ids_to_remove: HashSet<ParquetFileId> = files_to_remove.iter().map(|f| f.id).collect();
+        let to_remove: HashSet<(ParquetFileId, &str)> = files_to_remove
+            .iter()
+            .map(|f| (f.id, f.path.as_str()))
+            .collect();
         let mut inner = self.inner.write();
         let Some(files) = inner
             .files
@@ -126,7 +131,7 @@ impl PersistedFiles {
 
         let mut removed = Removed::default();
         files.retain(|file| {
-            if ids_to_remove.contains(&file.id) {
+            if to_remove.contains(&(file.id, file.path.as_str())) {
                 removed.add(file);
                 false
             } else {
@@ -134,6 +139,32 @@ impl PersistedFiles {
             }
         });
         inner.subtract(&removed);
+    }
+
+    /// The entries of `files` that are in the table's index now with the same id, path and size.
+    /// The size matters to the index check: it compared the object against this size, and an
+    /// entry replaced meanwhile by one with the same id and path but another size is not the
+    /// entry it checked. This guards the decision only: removal (and a restart replaying
+    /// `removed_files`) still matches by id and path, like [`Self::remove_persisted_files`].
+    pub fn indexed(
+        &self,
+        db_id: DbId,
+        table_id: TableId,
+        files: &[ParquetFile],
+    ) -> Vec<ParquetFile> {
+        let inner = self.inner.read();
+        let Some(table_files) = inner.files.get(&db_id).and_then(|t| t.get(&table_id)) else {
+            return vec![];
+        };
+        let indexed: HashSet<(ParquetFileId, &str, u64)> = table_files
+            .iter()
+            .map(|f| (f.id, f.path.as_str(), f.size_bytes))
+            .collect();
+        files
+            .iter()
+            .filter(|f| indexed.contains(&(f.id, f.path.as_str(), f.size_bytes)))
+            .cloned()
+            .collect()
     }
 
     /// Get the list of files for a given database and table, always return in descending order of min_time
@@ -1019,6 +1050,44 @@ mod tests {
         persisted_files.remove_persisted_files(&db_id, &table_id, &[stale]);
         assert_eq!(persisted_files.get_files(db_id, table_id).len(), 2);
         assert_metrics(&persisted_files, 2, 6_750 + 1_000, 17);
+    }
+
+    /// Builds before TAG-2495 could reuse file ids after a restart, so two entries can share an
+    /// id. The snapshot loader removes an entry only when both id and path match; removing from
+    /// the running index must do the same, or the index drops an entry that a restart brings back.
+    #[test]
+    fn remove_persisted_files_keeps_an_entry_that_only_shares_the_id() {
+        let db_id = DbId::from(0);
+        let table_id = TableId::from(0);
+        let stale = parquet_file(7, "gen1/2026-07-10/23-10/0000021161.parquet", 1_000, 10);
+        let reused_id = parquet_file(7, "gen1/2026-07-11/00-00/0000021200.parquet", 2_000, 20);
+
+        let persisted_files = PersistedFiles::new();
+        persisted_files.add_persisted_file(&db_id, &table_id, &stale);
+        persisted_files.add_persisted_file(&db_id, &table_id, &reused_id);
+
+        persisted_files.remove_persisted_files(&db_id, &table_id, std::slice::from_ref(&stale));
+
+        assert_eq!(
+            persisted_files.get_files(db_id, table_id),
+            vec![reused_id.clone()]
+        );
+        assert_metrics(&persisted_files, 1, 2_000, 20);
+
+        // The same removal recorded in a snapshot and reloaded gives the same index.
+        let snapshot_1 = build_snapshot(vec![stale.clone(), reused_id], 1, 1, 1);
+        let mut snapshot_2 = build_snapshot(vec![], 2, 1, 2);
+        snapshot_2
+            .removed_files
+            .entry(db_id)
+            .or_default()
+            .tables
+            .insert(table_id, vec![stale]);
+        let reloaded = PersistedFiles::new_from_persisted_snapshots(vec![snapshot_2, snapshot_1]);
+        assert_eq!(
+            reloaded.get_files(db_id, table_id),
+            persisted_files.get_files(db_id, table_id)
+        );
     }
 
     #[test]

@@ -285,6 +285,44 @@ pub struct Config {
     )]
     pub min_files_for_compaction: usize,
 
+    /// Check every parquet index entry against object storage when compaction starts, and again
+    /// every `--index-check-interval`, alongside compaction, and remove the entries whose objects
+    /// are missing or have another size. An entry must look stale twice, 30 seconds apart.
+    /// Compaction jobs never remove entries, so turning this off stops all pruning. Runs only
+    /// when compaction is enabled.
+    #[clap(
+        long = "enable-index-check",
+        env = "INFLUXDB3_ENABLE_INDEX_CHECK",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    pub enable_index_check: bool,
+
+    /// How long after one run of the index check ends the next one starts, e.g. `30m` or `2h`.
+    /// 0 runs it only at startup.
+    #[clap(
+        long = "index-check-interval",
+        env = "INFLUXDB3_INDEX_CHECK_INTERVAL",
+        default_value = "1h",
+        value_parser = parse_index_check_interval,
+        action
+    )]
+    pub index_check_interval: humantime::Duration,
+
+    /// A run of the index check removes none of a database's entries, and logs an error, when
+    /// more than this percentage of that database's entries it could check look stale. That much
+    /// usually means object storage answering NotFound for objects it holds. 100 lifts the
+    /// limit. Separately, a run that sees object storage answer inconsistently removes nothing.
+    /// Compaction jobs never remove entries.
+    #[clap(
+        long = "index-check-max-prune-percent",
+        env = "INFLUXDB3_INDEX_CHECK_MAX_PRUNE_PERCENT",
+        default_value = "50",
+        value_parser = clap::value_parser!(u8).range(0..=100),
+        action
+    )]
+    pub index_check_max_prune_percent: u8,
+
     /// The amount of time that the server looks back on startup when populating the in-memory
     /// index of gen1 files.
     ///
@@ -749,6 +787,10 @@ pub async fn command(config: Config) -> Result<()> {
         config.object_store_config.bucket.as_ref(),
     ));
 
+    // The store without the parquet memory cache: the compaction service HEADs through it, since
+    // the cache answers HEAD from cached metadata and would hide objects deleted underneath it.
+    let uncached_object_store = Arc::clone(&object_store);
+
     // setup cached object store:
     let (object_store, parquet_cache) = if !config.disable_parquet_mem_cache {
         let (object_store, parquet_cache) = create_cached_obj_store_and_oracle(
@@ -1006,22 +1048,29 @@ pub async fn command(config: Config) -> Result<()> {
             max_files_per_run: config.max_compaction_files,
             min_files_for_compaction: config.min_files_for_compaction,
             generation_durations,
+            index_check_enabled: config.enable_index_check,
+            index_check_interval: config.index_check_interval.into(),
+            index_check_max_prune_percent: config.index_check_max_prune_percent,
+            ..Default::default()
         };
 
-        let compaction_service = Arc::new(influxdb3_write::compaction::CompactionService::new(
-            compaction_config,
-            Arc::clone(&catalog),
-            Arc::clone(&write_buffer_impl) as Arc<dyn WriteBuffer>,
-            Arc::clone(&persisted_files),
-            Arc::clone(&persister),
-            Arc::clone(&write_path_executor),
-            config.iox_query_datafusion_config.clone().build(),
-            Arc::clone(&object_store),
-            persister.object_store_url().clone(),
-            config.node_identifier_prefix.clone(),
-            Arc::clone(&time_provider),
-            shutdown_manager.register(),
-        ));
+        let compaction_service = Arc::new(
+            influxdb3_write::compaction::CompactionService::new(
+                compaction_config,
+                Arc::clone(&catalog),
+                Arc::clone(&write_buffer_impl) as Arc<dyn WriteBuffer>,
+                Arc::clone(&persisted_files),
+                Arc::clone(&persister),
+                Arc::clone(&write_path_executor),
+                config.iox_query_datafusion_config.clone().build(),
+                Arc::clone(&object_store),
+                persister.object_store_url().clone(),
+                config.node_identifier_prefix.clone(),
+                Arc::clone(&time_provider),
+                shutdown_manager.register(),
+            )
+            .with_head_store(uncached_object_store),
+        );
 
         compaction_service.start();
         info!("compaction service started");
@@ -1392,4 +1441,71 @@ pub fn setup_metric_registry() -> Arc<metric::Registry> {
     );
 
     registry
+}
+
+/// A humantime duration, or a bare `0` for "startup only": humantime alone needs a unit.
+fn parse_index_check_interval(
+    value: &str,
+) -> Result<humantime::Duration, humantime::DurationError> {
+    if value.trim() == "0" {
+        return Ok(std::time::Duration::ZERO.into());
+    }
+    value.parse()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+    use clap::{CommandFactory, FromArgMatches};
+    use std::time::Duration;
+
+    /// Parses `serve` arguments, ignoring the environment for the flags under test, so an
+    /// exported `INFLUXDB3_*` variable can't change the defaults these tests assert.
+    fn parse(extra: &[&str]) -> Result<Config, clap::Error> {
+        let args = ["serve", "--node-id", "test", "--object-store", "memory"];
+        let command = [
+            "enable_index_check",
+            "index_check_interval",
+            "index_check_max_prune_percent",
+        ]
+        .into_iter()
+        .fold(Config::command(), |command, id| {
+            command.mut_arg(id, |arg| arg.env(None::<&'static str>))
+        });
+        let matches = command.try_get_matches_from(args.iter().chain(extra))?;
+        Config::from_arg_matches(&matches)
+    }
+
+    /// The index check is on by default and can be turned off; it reruns hourly by default (0
+    /// means startup only); the prune limit defaults to 50% and accepts 0 to 100.
+    #[test]
+    fn index_check_flags() {
+        let config = parse(&[]).unwrap();
+        assert!(config.enable_index_check);
+        assert_eq!(config.index_check_max_prune_percent, 50);
+        assert_eq!(
+            Duration::from(config.index_check_interval),
+            Duration::from_secs(3600)
+        );
+
+        let config = parse(&[
+            "--enable-index-check",
+            "false",
+            "--index-check-max-prune-percent",
+            "100",
+            "--index-check-interval",
+            "0s",
+        ])
+        .unwrap();
+        assert!(!config.enable_index_check);
+        assert_eq!(config.index_check_max_prune_percent, 100);
+        assert_eq!(Duration::from(config.index_check_interval), Duration::ZERO);
+
+        assert!(parse(&["--index-check-max-prune-percent", "101"]).is_err());
+
+        // The help says 0 means startup only, so a bare 0 must parse (humantime alone needs a
+        // unit, and a pod with INFLUXDB3_INDEX_CHECK_INTERVAL=0 would not start).
+        let config = parse(&["--index-check-interval", "0"]).unwrap();
+        assert_eq!(Duration::from(config.index_check_interval), Duration::ZERO);
+    }
 }

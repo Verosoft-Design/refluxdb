@@ -1385,7 +1385,120 @@ mod tests {
         shutdown.cancel();
     }
 
+    /// Regression test (TAG-2507): a query that read an index entry whose parquet object was
+    /// missing returned HTTP 200 and a body that ended early (0 bytes), and logged nothing above
+    /// debug. The status line went out before the first batch was read, so the error could only
+    /// end the body. It must be an error status with the error in the body, on every endpoint and
+    /// format.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn query_over_a_missing_parquet_object_returns_an_error() {
+        let (server, shutdown, write_buffer, object_store) =
+            setup_server_with_object_store(0).await;
+        write_lp(
+            &server,
+            "foo",
+            "cpu,host=a val=1i 123",
+            None,
+            false,
+            "nanosecond",
+        )
+        .await;
+
+        // Persist the row to a parquet file, then delete the file's object.
+        if let Some((snapshot_done, _, _permit)) = write_buffer.wal().force_flush_buffer().await {
+            snapshot_done.await.expect("snapshot failed");
+        }
+        let db = write_buffer.catalog().db_schema("foo").unwrap();
+        let table_id = db.table_definition("cpu").unwrap().table_id;
+        let mut files = vec![];
+        for _ in 0..100 {
+            files = write_buffer.parquet_files(db.id, table_id);
+            if !files.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            files.len(),
+            1,
+            "test setup: the row must be in one parquet file"
+        );
+        let path = files[0].path.clone();
+        object_store
+            .delete(&object_store::path::Path::from(path.as_str()))
+            .await
+            .unwrap();
+
+        let q = urlencoding::encode("SELECT * FROM cpu");
+        let v3 = |endpoint: &str, format: &str| {
+            (
+                format!("{server}/api/v3/{endpoint}?db=foo&q={q}&format={format}"),
+                None,
+            )
+        };
+        let v1 = |params: &str, accept: &'static str| {
+            (format!("{server}/query?db=foo&q={q}{params}"), Some(accept))
+        };
+        let cases = [
+            // Buffers the whole result before responding: checks that the deletion took effect.
+            ("query_sql pretty", v3("query_sql", "pretty")),
+            ("query_sql parquet", v3("query_sql", "parquet")),
+            ("query_sql json", v3("query_sql", "json")),
+            ("query_sql jsonl", v3("query_sql", "jsonl")),
+            ("query_sql csv", v3("query_sql", "csv")),
+            ("query_influxql json", v3("query_influxql", "json")),
+            ("query_influxql jsonl", v3("query_influxql", "jsonl")),
+            ("query_influxql csv", v3("query_influxql", "csv")),
+            ("v1 json", v1("", "application/json")),
+            ("v1 json pretty", v1("&pretty=true", "application/json")),
+            ("v1 csv", v1("", "application/csv")),
+            ("v1 json chunked", v1("&chunked=true", "application/json")),
+            ("v1 csv chunked", v1("&chunked=true", "application/csv")),
+        ];
+        let client = Client::new();
+        for (case, (url, accept)) in cases {
+            let mut builder = RequestBuilder::new().uri(url).method("GET");
+            if let Some(accept) = accept {
+                builder = builder.header(hyper::header::ACCEPT, accept);
+            }
+            let res = client
+                .request(builder.body(empty_request_body()).unwrap())
+                .await
+                .expect("http error sending query");
+            let status = res.status();
+            let body = hyper::body::to_bytes(res.into_body())
+                .await
+                .map(|b| String::from_utf8_lossy(&b).into_owned());
+            assert_eq!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{case}: a query over a missing object must fail with an error status; body: {body:?}"
+            );
+            let body = body.unwrap_or_else(|e| panic!("{case}: error body cut off: {e}"));
+            assert!(
+                body.contains(&path) && body.contains("not found"),
+                "{case}: the error body should name the missing object: {body}"
+            );
+        }
+
+        shutdown.cancel();
+    }
+
     async fn setup_server(start_time: i64) -> (String, CancellationToken, Arc<dyn WriteBuffer>) {
+        let (server, shutdown, write_buffer, _) = setup_server_with_object_store(start_time).await;
+        (server, shutdown, write_buffer)
+    }
+
+    /// Like [`setup_server`], also returning the server's object store. It is wrapped in the
+    /// parquet cache, so deleting through it also evicts the cached copy.
+    async fn setup_server_with_object_store(
+        start_time: i64,
+    ) -> (
+        String,
+        CancellationToken,
+        Arc<dyn WriteBuffer>,
+        Arc<DynObjectStore>,
+    ) {
         let server_start_time = tokio::time::Instant::now();
         let trace_header_parser = trace_http::ctx::TraceHeaderParser::new();
         let metrics = Arc::new(metric::Registry::new());
@@ -1410,7 +1523,19 @@ mod tests {
                 per_query_mem_pool_config: PerQueryMemoryPoolConfig::Disabled,
                 heap_memory_limit: None,
             },
-            DedicatedExecutor::new_testing(),
+            // Not `DedicatedExecutor::new_testing()`: that one is shared by the whole process and
+            // does its IO on the runtime of whichever test created it first, so reading a parquet
+            // file after that test ended panics with "IO runtime was shut down". A per-test
+            // executor does its IO on this test's runtime.
+            DedicatedExecutor::new(
+                "server-test",
+                {
+                    let mut runtime_builder = tokio::runtime::Builder::new_current_thread();
+                    runtime_builder.enable_time();
+                    runtime_builder
+                },
+                Arc::clone(&metrics),
+            ),
         ));
         let node_identifier_prefix = "test_host";
         let persister = Arc::new(Persister::new(
@@ -1560,7 +1685,12 @@ mod tests {
             .await
         });
 
-        (format!("http://{addr}"), shutdown, write_buffer)
+        (
+            format!("http://{addr}"),
+            shutdown,
+            write_buffer,
+            object_store,
+        )
     }
 
     pub(crate) async fn write_lp(

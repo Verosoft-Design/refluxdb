@@ -5,8 +5,10 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion_util::stream_from_batches;
+use futures::StreamExt;
 use influxdb3_catalog::catalog::Catalog;
 use influxdb3_id::{DbId, TableId};
+use influxdb3_wal::SnapshotSequenceNumber;
 use iox_query::exec::Executor;
 use iox_query::frontend::reorg::ReorgPlanner;
 use iox_time::TimeProvider;
@@ -15,7 +17,7 @@ use object_store::path::Path as ObjPath;
 use observability_deps::tracing::{debug, error, info, warn};
 use schema::Schema;
 use schema::sort::SortKey;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinSet;
@@ -34,6 +36,18 @@ pub struct CompactionConfig {
     pub min_files_for_compaction: usize,
     /// Generation durations for each level
     pub generation_durations: HashMap<u8, Duration>,
+    /// How long to wait before looking a second time at an index entry whose object looked
+    /// missing or the wrong size. Only an entry that looks stale both times is pruned.
+    pub stale_recheck_delay: Duration,
+    /// Check every index entry against object storage when the service starts and every
+    /// `index_check_interval` after that. Off, nothing prunes stale entries: jobs never do.
+    pub index_check_enabled: bool,
+    /// Run the index check again this long after each run ends. Zero runs it only at startup.
+    pub index_check_interval: Duration,
+    /// A run of the index check prunes none of a database's entries, and logs an error, when
+    /// more than this percentage of that database's entries it could check are stale. 100 lifts
+    /// the limit.
+    pub index_check_max_prune_percent: u8,
 }
 
 impl Default for CompactionConfig {
@@ -44,6 +58,10 @@ impl Default for CompactionConfig {
             max_files_per_run: 100,
             min_files_for_compaction: 10,
             generation_durations: HashMap::new(),
+            stale_recheck_delay: Duration::from_secs(30),
+            index_check_enabled: true,
+            index_check_interval: Duration::from_secs(3600),
+            index_check_max_prune_percent: 50,
         }
     }
 }
@@ -71,6 +89,82 @@ pub struct CompactionResult {
     pub total_rows_compacted: u64,
 }
 
+/// HEAD requests in flight at once while [`CompactionService::check_index_for_missing_files`]
+/// runs.
+const INDEX_CHECK_CONCURRENCY: usize = 16;
+
+/// Stale entries the startup check logs one by one; it counts the rest in its summary.
+const STALE_LOG_LIMIT: usize = 20;
+
+/// What object storage says about an index entry.
+#[derive(Debug)]
+enum ObjectCheck {
+    /// The object exists with the indexed size.
+    Present,
+    /// The entry does not describe what object storage holds.
+    Stale(StaleReason),
+    /// The request failed some other way, e.g. a timeout. Says nothing about the entry.
+    Unknown(object_store::Error),
+}
+
+/// Why an index entry is stale.
+#[derive(Debug, Clone, Copy)]
+enum StaleReason {
+    /// HEAD answered NotFound.
+    Missing,
+    /// The object's size differs from the indexed size: it was overwritten after the entry was
+    /// recorded, and reading it with the indexed size fails with "Corrupt footer".
+    SizeMismatch { object_size: u64 },
+}
+
+/// An index entry that looked stale.
+#[derive(Debug)]
+struct StaleEntry {
+    key: (DbId, TableId),
+    file: ParquetFile,
+    reason: StaleReason,
+}
+
+/// The second look at entries that looked stale (see [`CompactionService::confirm_stale`]).
+#[derive(Debug, Default)]
+struct Confirmed {
+    /// Still stale, and still indexed.
+    stale: Vec<StaleEntry>,
+    /// Present with the indexed size this time.
+    cleared: Vec<StaleEntry>,
+    /// The second HEAD failed some other way.
+    unknown: Vec<(StaleEntry, object_store::Error)>,
+}
+
+/// Index entries to prune, by table.
+type StaleEntries = BTreeMap<(DbId, TableId), Vec<ParquetFile>>;
+
+fn by_table(entries: impl IntoIterator<Item = StaleEntry>) -> StaleEntries {
+    let mut by_table = StaleEntries::new();
+    for entry in entries {
+        by_table.entry(entry.key).or_default().push(entry.file);
+    }
+    by_table
+}
+
+/// Log a stale entry before it is pruned. Pruning drops the entry, so the object's rows stop
+/// being queryable; the object itself is left in place, and the path logged here is enough to
+/// re-index or inspect it manually.
+fn log_stale(entry: &StaleEntry) {
+    match entry.reason {
+        StaleReason::Missing => {
+            warn!(
+                "Skipping missing parquet file in catalog: {}",
+                entry.file.path
+            )
+        }
+        StaleReason::SizeMismatch { object_size } => warn!(
+            "Skipping parquet file whose size does not match the catalog: {} (catalog {} bytes, object store {} bytes)",
+            entry.file.path, entry.file.size_bytes, object_size
+        ),
+    }
+}
+
 #[cfg(test)]
 mod drift_tests;
 
@@ -84,10 +178,17 @@ pub struct CompactionService {
     executor: Arc<Executor>,
     datafusion_config: HashMap<String, String>,
     object_store: Arc<dyn ObjectStore>,
+    /// The store HEADs go to (the drift check and the index check). The server passes the store
+    /// without the parquet memory cache, whose HEAD answers from cached metadata; reads still go
+    /// through `object_store`.
+    head_store: Arc<dyn ObjectStore>,
     object_store_url: ObjectStoreUrl,
     node_identifier_prefix: String,
     time_provider: Arc<dyn TimeProvider>,
     shutdown_token: influxdb3_shutdown::ShutdownToken,
+    /// Index entries a job left out as stale, by id and path. Planning skips them until an index
+    /// check run decides: pruned, or present after all. In memory only; a restart forgets them.
+    left_out: parking_lot::Mutex<HashSet<(ParquetFileId, String)>>,
 }
 
 impl CompactionService {
@@ -113,12 +214,22 @@ impl CompactionService {
             persister,
             executor,
             datafusion_config,
+            head_store: Arc::clone(&object_store),
             object_store,
             object_store_url,
             node_identifier_prefix: node_identifier_prefix.into(),
             time_provider,
             shutdown_token,
+            left_out: Default::default(),
         }
+    }
+
+    /// Send HEADs to `store` instead of the store reads use: the server passes the one without
+    /// the parquet memory cache, so a check sees an object deleted outside refluxdb even while
+    /// its metadata is cached.
+    pub fn with_head_store(mut self, store: Arc<dyn ObjectStore>) -> Self {
+        self.head_store = store;
+        self
     }
 
     fn persisted_files(&self) -> Arc<PersistedFiles> {
@@ -130,14 +241,22 @@ impl CompactionService {
         &self,
         _db_id: DbId,
         _table_id: TableId,
-        files: Vec<ParquetFile>,
+        mut files: Vec<ParquetFile>,
     ) -> Result<Vec<ParquetFile>> {
+        // Skip entries a job already left out as stale, until an index check run decides on
+        // them; otherwise their window is planned again every cycle and takes job slots.
+        {
+            let left_out = self.left_out.lock();
+            if !left_out.is_empty() {
+                files.retain(|f| !left_out.contains(&(f.id, f.path.clone())));
+            }
+        }
         // Checking every catalog entry against object store (object_store.head per file) is
         // O(n) HTTP requests and prohibitively slow for large catalogs (e.g. 477k files → minutes
         // of sequential HEAD calls before a single job can be identified). Trust the catalog
         // during planning. Missing objects and size mismatches (stale entries for overwritten
-        // objects) are detected and pruned per job in execute_compaction_job, which only HEADs
-        // the files of that job.
+        // objects) are detected per job in execute_compaction_job, which only HEADs the files of
+        // that job and leaves stale ones out; only the index check prunes them.
         Ok(files)
     }
 
@@ -150,23 +269,53 @@ impl CompactionService {
             }
 
             info!("Starting compaction service with interval: {:?}", self.config.interval);
-            
-            let mut interval = tokio::time::interval(self.config.interval);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        if let Err(e) = Arc::clone(&self).run_compaction_cycle().await {
-                            error!("Compaction cycle failed: {}", e);
-                        }
+            // The index check runs at startup and then every `index_check_interval` after the
+            // previous run ends (never two at once). Shutdown ends a run or the wait.
+            let check = async {
+                if !self.config.index_check_enabled {
+                    info!("parquet index check is disabled");
+                    return;
+                }
+                loop {
+                    tokio::select! {
+                        _ = self.check_index_for_missing_files() => {}
+                        _ = self.shutdown_token.wait_for_shutdown() => return,
                     }
-                    _ = self.shutdown_token.wait_for_shutdown() => {
-                        info!("Shutdown signal received, stopping compaction service");
-                        break;
+                    if self.config.index_check_interval.is_zero() {
+                        return;
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(self.config.index_check_interval) => {}
+                        _ = self.shutdown_token.wait_for_shutdown() => return,
                     }
                 }
-            }
+            };
+            let cycles = async {
+                let mut interval = tokio::time::interval(self.config.interval);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    // A cycle that has started runs to the end; shutdown is checked between them,
+                    // and wins over a tick that came due while the last cycle ran.
+                    tokio::select! {
+                        biased;
+                        _ = self.shutdown_token.wait_for_shutdown() => {
+                            info!("Shutdown signal received, stopping compaction service");
+                            break;
+                        }
+                        _ = interval.tick() => {
+                            if let Err(e) = Arc::clone(&self).run_compaction_cycle().await {
+                                error!("Compaction cycle failed: {}", e);
+                            }
+                        }
+                    }
+                }
+            };
+
+            // The check runs alongside the cycles, in this task, so aborting the task stops
+            // both. See `check_index_for_missing_files` for why jobs running at the same time
+            // are safe.
+            futures::future::join(check, cycles).await;
         })
     }
 
@@ -307,45 +456,47 @@ impl CompactionService {
 
         let start_time = std::time::Instant::now();
 
-        // Filter out catalog entries that do not describe what is in object storage (catalog
-        // drift): the object is missing, or its size differs from the indexed size (the object was
+        // Leave out inputs that do not describe what is in object storage (catalog drift): the
+        // object is missing, or its size differs from the indexed size (the object was
         // overwritten after the entry was recorded; reading it with the stale size fails with
-        // "Invalid Parquet file. Corrupt footer"). Done per-job (typically 100s of files) rather
-        // than pre-planning (potentially 100k+ files) so this remains fast even with large catalogs.
+        // "Invalid Parquet file. Corrupt footer"). Done per job (typically 100s of files) rather
+        // than at planning (potentially 100k+ files) so this stays fast on large catalogs.
+        //
+        // A job never prunes: it leaves stale inputs out and keeps them indexed, so the running
+        // index and a restarted one agree. The index check prunes them, after a second look and
+        // within its limit (`check_index_for_missing_files`).
         let files = {
-            let mut existing = Vec::with_capacity(job.files.len());
-            let mut stale = Vec::new();
+            let mut excluded: HashSet<(ParquetFileId, &str)> = HashSet::new();
             for file in &job.files {
-                let path = ObjPath::from(file.path.as_str());
-                match self.object_store.head(&path).await {
-                    Ok(meta) if meta.size as u64 == file.size_bytes => existing.push(file.clone()),
-                    Ok(meta) => {
-                        // Pruning drops the entry, so the object's rows stop being queryable.
-                        // The object itself is left in place; the path logged here is enough
-                        // to re-index or inspect it manually.
-                        warn!(
-                            "Skipping parquet file whose size does not match the catalog: {} (catalog {} bytes, object store {} bytes)",
-                            file.path, file.size_bytes, meta.size
-                        );
-                        stale.push(file.clone());
+                match self.check_object(file).await {
+                    ObjectCheck::Present => {}
+                    ObjectCheck::Stale(_) => {
+                        excluded.insert((file.id, file.path.as_str()));
+                        self.left_out.lock().insert((file.id, file.path.clone()));
                     }
-                    Err(object_store::Error::NotFound { .. }) => {
-                        warn!("Skipping missing parquet file in catalog: {}", file.path);
-                        stale.push(file.clone());
-                    }
-                    Err(e) => return Err(e.into()),
+                    ObjectCheck::Unknown(e) => return Err(e.into()),
                 }
             }
-            if !stale.is_empty() {
-                // Removal is by file id, so pruning a stale entry never drops a valid entry that
-                // shares its path.
-                self.persisted_files()
-                    .remove_persisted_files(&job.database_id, &job.table_id, &stale);
+            if let Some(sample) = job
+                .files
+                .iter()
+                .find(|f| excluded.contains(&(f.id, f.path.as_str())))
+            {
+                // Info, not warn: the same window is planned every cycle until the index check
+                // prunes these entries, and prod plans up to 50 jobs every 2 minutes.
                 info!(
-                    "Pruned {} stale catalog entries for db={} table={}",
-                    stale.len(), job.database_id, job.table_name
+                    count = excluded.len(),
+                    sample = %sample.path,
+                    "Leaving stale inputs out of the compaction job for db={} table={}; the index check prunes them",
+                    job.database_id, job.table_name
                 );
             }
+            let existing: Vec<ParquetFile> = job
+                .files
+                .iter()
+                .filter(|f| !excluded.contains(&(f.id, f.path.as_str())))
+                .cloned()
+                .collect();
             if existing.len() < self.config.min_files_for_compaction {
                 info!(
                     "Skipping compaction for db={} table={}: only {} files remain after drift check (min {})",
@@ -701,13 +852,13 @@ impl CompactionService {
         )
     }
 
-    /// Update catalog for compaction: persist snapshot, then update catalog and remove old files.
-    async fn update_catalog_for_compaction(
+    /// Write a snapshot that records index changes made outside a data snapshot (a compaction's
+    /// outputs and inputs, or pruned entries), filled in by `record`. Callers change the
+    /// in-memory index only after this returns, so a restart sees every change the index made.
+    async fn persist_index_snapshot(
         &self,
-        job: &CompactionJob,
-        new_files: &[ParquetFile],
-        old_files: &[ParquetFile],
-    ) -> Result<()> {
+        record: impl FnOnce(&mut PersistedSnapshot),
+    ) -> SnapshotSequenceNumber {
         let wal = self.write_buffer.wal();
         let snapshot_sequence_number = wal.reserve_next_snapshot_sequence_number().await;
         // A data snapshot with a lower sequence number may still be writing its files; it holds
@@ -728,34 +879,352 @@ impl CompactionService {
             wal_file_sequence_number,
             self.catalog.sequence_number(),
         );
-        for file in new_files {
-            snapshot.add_parquet_file(job.database_id, job.table_id, file.clone());
-        }
-        snapshot
-            .removed_files
-            .entry(job.database_id)
-            .or_default()
-            .tables
-            .entry(job.table_id)
-            .or_default()
-            .extend(old_files.iter().cloned());
+        record(&mut snapshot);
         // Release the permit before the upload, which retries until it succeeds: a flush that
         // starts a data snapshot waits for it while holding the WAL lock, and so does every write.
         // A data snapshot that starts now gets a higher number than this one, so it is newer
         // whichever of the two is written first.
         drop(snapshot_permit);
 
-        // Persist snapshot before mutating catalog or deleting old parquet objects.
         let persisted_snapshot = PersistedSnapshotVersion::V1(snapshot);
         loop {
             match self.persister.persist_snapshot(&persisted_snapshot).await {
                 Ok(_) => break,
                 Err(e) => {
-                    error!(%e, "Error persisting compaction snapshot, sleeping and retrying...");
+                    error!(
+                        %e,
+                        snapshot_sequence_number = snapshot_sequence_number.as_u64(),
+                        "Error persisting index snapshot (compaction or prune), sleeping and retrying..."
+                    );
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }
         }
+        snapshot_sequence_number
+    }
+
+    /// HEAD the object of an index entry.
+    async fn check_object(&self, file: &ParquetFile) -> ObjectCheck {
+        match self
+            .head_store
+            .head(&ObjPath::from(file.path.as_str()))
+            .await
+        {
+            Ok(meta) if meta.size as u64 == file.size_bytes => ObjectCheck::Present,
+            Ok(meta) => ObjectCheck::Stale(StaleReason::SizeMismatch {
+                object_size: meta.size as u64,
+            }),
+            Err(object_store::Error::NotFound { .. }) => ObjectCheck::Stale(StaleReason::Missing),
+            Err(e) => ObjectCheck::Unknown(e),
+        }
+    }
+
+    /// Keep the entries the index still holds. Compaction and retention remove entries while a
+    /// check runs, and delete their objects afterwards; those entries look missing but are gone.
+    fn still_indexed(&self, entries: Vec<StaleEntry>) -> Vec<StaleEntry> {
+        let persisted_files = self.persisted_files();
+        let mut kept = Vec::with_capacity(entries.len());
+        let mut grouped: BTreeMap<(DbId, TableId), Vec<StaleEntry>> = BTreeMap::new();
+        for entry in entries {
+            grouped.entry(entry.key).or_default().push(entry);
+        }
+        for ((db_id, table_id), entries) in grouped {
+            let files: Vec<ParquetFile> = entries.iter().map(|e| e.file.clone()).collect();
+            let indexed: HashSet<(ParquetFileId, String)> = persisted_files
+                .indexed(db_id, table_id, &files)
+                .into_iter()
+                .map(|f| (f.id, f.path))
+                .collect();
+            kept.extend(
+                entries
+                    .into_iter()
+                    .filter(|e| indexed.contains(&(e.file.id, e.file.path.clone()))),
+            );
+        }
+        kept
+    }
+
+    /// Look again, after `stale_recheck_delay`, at entries that looked stale. A single NotFound
+    /// or size mismatch never prunes: object storage that briefly answers wrongly for objects it
+    /// holds would otherwise remove their entries for good, and their rows with them. Entries
+    /// the index no longer holds are dropped before and after the wait. Returns `None` if
+    /// shutdown starts during the wait; nothing has been changed by then.
+    async fn confirm_stale(&self, candidates: Vec<StaleEntry>) -> Option<Confirmed> {
+        let candidates = self.still_indexed(candidates);
+        if candidates.is_empty() {
+            return Some(Confirmed::default());
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(self.config.stale_recheck_delay) => {}
+            _ = self.shutdown_token.wait_for_shutdown() => return None,
+        }
+
+        let mut confirmed = Confirmed::default();
+        let mut stale = Vec::new();
+        let mut results = futures::stream::iter(candidates)
+            .map(|entry| async move {
+                let check = self.check_object(&entry.file).await;
+                (entry, check)
+            })
+            .buffer_unordered(INDEX_CHECK_CONCURRENCY);
+        while let Some((entry, check)) = results.next().await {
+            match check {
+                ObjectCheck::Present => confirmed.cleared.push(entry),
+                ObjectCheck::Stale(reason) => stale.push(StaleEntry { reason, ..entry }),
+                ObjectCheck::Unknown(e) => confirmed.unknown.push((entry, e)),
+            }
+        }
+        confirmed.stale = self.still_indexed(stale);
+        Some(confirmed)
+    }
+
+    /// Remove stale index entries durably: a snapshot lists them in `removed_files` before they
+    /// leave the in-memory index, so a restart does not load them again from the snapshot that
+    /// added them. Entries that are no longer indexed (compaction or retention removed them
+    /// meanwhile) are left out; if none is left, no snapshot is written. Returns how many entries
+    /// were removed.
+    async fn prune_index_entries(&self, stale: StaleEntries) -> usize {
+        let persisted_files = self.persisted_files();
+        let indexed: StaleEntries = stale
+            .into_iter()
+            .map(|((db_id, table_id), files)| {
+                let files = persisted_files.indexed(db_id, table_id, &files);
+                ((db_id, table_id), files)
+            })
+            .filter(|(_, files)| !files.is_empty())
+            .collect();
+        let count = indexed.values().map(Vec::len).sum();
+        if count == 0 {
+            return 0;
+        }
+
+        let snapshot_sequence_number = self
+            .persist_index_snapshot(|snapshot| {
+                for ((db_id, table_id), files) in &indexed {
+                    snapshot
+                        .removed_files
+                        .entry(*db_id)
+                        .or_default()
+                        .tables
+                        .entry(*table_id)
+                        .or_default()
+                        .extend(files.iter().cloned());
+                }
+            })
+            .await;
+        for ((db_id, table_id), files) in &indexed {
+            persisted_files.remove_persisted_files(db_id, table_id, files);
+        }
+        info!(
+            count,
+            snapshot_sequence_number = snapshot_sequence_number.as_u64(),
+            "removed stale parquet index entries and recorded the removal in a snapshot"
+        );
+        count
+    }
+
+    /// Check every index entry against object storage and prune the ones whose object is
+    /// missing or has another size. Compaction jobs only leave such inputs out; this is the only
+    /// place that prunes. It also covers windows that never get a job (fewer files than
+    /// `min_files_for_compaction`: leftover gen1 files, most gen2 files, every top-generation
+    /// file).
+    ///
+    /// One HEAD per entry, at most [`INDEX_CHECK_CONCURRENCY`] at a time. Only a NotFound or a
+    /// size mismatch prunes, and only if a second HEAD after `stale_recheck_delay` agrees and the
+    /// index still holds the entry with the size that was checked. An entry whose HEAD fails some
+    /// other way is kept. A database's entries are not pruned if more than
+    /// `index_check_max_prune_percent` of its entries that got a definite answer are stale, and
+    /// nothing is pruned if the run saw object storage answer inconsistently (more entries
+    /// flipped back to present than stayed missing, or most HEADs failed).
+    ///
+    /// Runs as the service starts and then every `index_check_interval`, alongside the
+    /// compaction cycles, so a large index does not hold compaction back and entries that go
+    /// stale while the server runs are pruned without a restart. A refused run is followed by
+    /// another after the interval. Running alongside jobs is safe: a job removes its inputs from
+    /// the index before it deletes their objects, and only entries the index still holds after
+    /// the second look are logged, counted or pruned, so inputs a job compacts meanwhile drop
+    /// out. Entries indexed after a run starts are not checked in that run: their objects were
+    /// written before they were indexed.
+    async fn check_index_for_missing_files(&self) {
+        let started = std::time::Instant::now();
+        let mut entries = Vec::new();
+        for db_schema in self.catalog.list_db_schema() {
+            if db_schema.deleted {
+                continue;
+            }
+            for table_def in db_schema.tables() {
+                if table_def.deleted {
+                    continue;
+                }
+                let key = (db_schema.id, table_def.table_id);
+                for file in self.write_buffer.parquet_files(key.0, key.1) {
+                    entries.push((key, file));
+                }
+            }
+        }
+        let checked = entries.len();
+
+        let mut candidates = Vec::new();
+        let mut unknown = 0_usize;
+        // Entries this run can't decide on; any a job left out stay skipped by planning.
+        let mut undecided: HashSet<(ParquetFileId, String)> = HashSet::new();
+        // Entries checked and HEADs that failed, per database, for the per-database limit.
+        let mut per_db: HashMap<DbId, (usize, usize)> = HashMap::new();
+        let mut results = futures::stream::iter(entries)
+            .map(|(key, file)| async move {
+                let check = self.check_object(&file).await;
+                (key, file, check)
+            })
+            .buffer_unordered(INDEX_CHECK_CONCURRENCY);
+        while let Some((key, file, check)) = results.next().await {
+            per_db.entry(key.0).or_default().0 += 1;
+            match check {
+                ObjectCheck::Present => {}
+                ObjectCheck::Stale(reason) => candidates.push(StaleEntry { key, file, reason }),
+                ObjectCheck::Unknown(e) => {
+                    per_db.entry(key.0).or_default().1 += 1;
+                    if unknown == 0 {
+                        warn!(path = %file.path, error = %e, "could not check a parquet index entry; keeping it");
+                    }
+                    unknown += 1;
+                    undecided.insert((file.id, file.path.clone()));
+                }
+            }
+        }
+        drop(results);
+
+        let Some(confirmed) = self.confirm_stale(candidates).await else {
+            info!("shutdown during the parquet index check; nothing was pruned");
+            return;
+        };
+        if let Some((entry, error)) = confirmed.unknown.first() {
+            warn!(
+                path = %entry.file.path,
+                %error,
+                failed = confirmed.unknown.len(),
+                "could not check a parquet index entry on the second look; keeping it"
+            );
+        }
+        unknown += confirmed.unknown.len();
+        for (entry, _) in &confirmed.unknown {
+            per_db.entry(entry.key.0).or_default().1 += 1;
+        }
+        undecided.extend(
+            confirmed
+                .unknown
+                .iter()
+                .map(|(e, _)| (e.file.id, e.file.path.clone())),
+        );
+        let stale = confirmed.stale.len();
+        let max_percent = usize::from(self.config.index_check_max_prune_percent);
+        // Only entries with a definite answer (present, missing, other size) say anything about
+        // the index; a store that times out on most requests must not make the rest look small.
+        let definite = checked - unknown;
+        if checked > 0 && definite == 0 {
+            warn!(
+                checked,
+                unknown,
+                "no parquet index entry could be checked: every HEAD failed some other way than NotFound, so nothing was pruned this run"
+            );
+        }
+        // Signs that object storage answered unreliably during this run: more entries flipped
+        // from missing to present between the two looks than stayed missing, or most HEADs
+        // failed. Prune nothing then, whatever the limit; the next run tries again.
+        let cleared = confirmed.cleared.len();
+        let unstable = stale > 0 && (cleared > stale || unknown * 2 > checked);
+        // The limit applies per database, which also bounds the whole index: a fault that hides
+        // one database's objects is a minority of the index but all of that database.
+        let mut stale_by_db: HashMap<DbId, usize> = HashMap::new();
+        for entry in &confirmed.stale {
+            *stale_by_db.entry(entry.key.0).or_default() += 1;
+        }
+        let over_limit: BTreeSet<DbId> = stale_by_db
+            .iter()
+            .filter(|(db, stale_db)| {
+                let (checked_db, unknown_db) = per_db.get(*db).copied().unwrap_or_default();
+                **stale_db * 100 > (checked_db - unknown_db) * max_percent
+            })
+            .map(|(db, _)| *db)
+            .collect();
+        let (prunable, kept): (Vec<StaleEntry>, Vec<StaleEntry>) = if unstable {
+            (Vec::new(), confirmed.stale)
+        } else {
+            confirmed
+                .stale
+                .into_iter()
+                .partition(|e| !over_limit.contains(&e.key.0))
+        };
+        undecided.extend(kept.iter().map(|e| (e.file.id, e.file.path.clone())));
+        let sample = || {
+            kept.iter()
+                .take(5)
+                .map(|e| e.file.path.as_str())
+                .collect::<Vec<_>>()
+        };
+        if unstable {
+            error!(
+                checked,
+                stale,
+                cleared,
+                unknown,
+                sample = ?sample(),
+                "object storage answered inconsistently during the parquet index check (more entries flipped back to present than stayed missing, or most HEADs failed), so no entry was removed; the next run tries again"
+            );
+        } else if !kept.is_empty() {
+            // Far more than drift leaves behind: more likely object storage answering NotFound
+            // for objects it holds. Pruning would hide their rows for good, so keep them.
+            error!(
+                checked,
+                definite,
+                stale,
+                kept = kept.len(),
+                databases = ?over_limit,
+                max_prune_percent = max_percent,
+                sample = ?sample(),
+                "too much of the parquet index looks stale to prune safely, so these databases' entries were not removed; check object storage, then set --index-check-max-prune-percent (INFLUXDB3_INDEX_CHECK_MAX_PRUNE_PERCENT) to 100 to prune them"
+            );
+        }
+        // A first start after a long drift may find many stale entries: log some, count the
+        // rest. The removal snapshot lists every one of them.
+        prunable.iter().take(STALE_LOG_LIMIT).for_each(log_stale);
+        let not_logged = prunable.len().saturating_sub(STALE_LOG_LIMIT);
+        let pruned = self.prune_index_entries(by_table(prunable)).await;
+        // Entries this run pruned or found present come off the planning skip list.
+        self.left_out.lock().retain(|key| undecided.contains(key));
+        info!(
+            checked,
+            stale,
+            pruned,
+            not_logged,
+            cleared,
+            unknown,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "checked the parquet index against object storage"
+        );
+    }
+
+    /// Update catalog for compaction: persist snapshot, then update catalog and remove old files.
+    async fn update_catalog_for_compaction(
+        &self,
+        job: &CompactionJob,
+        new_files: &[ParquetFile],
+        old_files: &[ParquetFile],
+    ) -> Result<()> {
+        // Persist snapshot before mutating catalog or deleting old parquet objects.
+        self.persist_index_snapshot(|snapshot| {
+            for file in new_files {
+                snapshot.add_parquet_file(job.database_id, job.table_id, file.clone());
+            }
+            snapshot
+                .removed_files
+                .entry(job.database_id)
+                .or_default()
+                .tables
+                .entry(job.table_id)
+                .or_default()
+                .extend(old_files.iter().cloned());
+        })
+        .await;
 
         let persisted_files = self.persisted_files();
         for file in new_files {
@@ -763,9 +1232,9 @@ impl CompactionService {
         }
         persisted_files.remove_persisted_files(&job.database_id, &job.table_id, old_files);
 
-        // Objects are deleted by path while the index removed entries by id. This assumes no
-        // other index entry shares an input's path, which holds because gen1 paths carry the WAL
-        // sequence number and compacted paths carry a UUID.
+        // The index removed exactly these entries (by id and path), but objects are deleted by
+        // path alone. This assumes no other index entry shares an input's path, which holds
+        // because gen1 paths carry the WAL sequence number and compacted paths carry a UUID.
         for file in old_files {
             let path = ObjPath::from(file.path.clone());
             if let Err(e) = self.object_store.delete(&path).await {
@@ -1018,7 +1487,55 @@ mod tests {
         time: Arc<MockProvider>,
         executor: Arc<Executor>,
         write_buffer: Arc<WriteBufferImpl>,
-        service: CompactionService,
+        service: Arc<CompactionService>,
+    }
+
+    /// gen1 -> gen2 into 2 minute windows once a window has ended and holds a gen1 file.
+    fn two_minute_gen2_config() -> CompactionConfig {
+        CompactionConfig {
+            enabled: true,
+            interval: Duration::from_secs(1),
+            max_files_per_run: 10,
+            min_files_for_compaction: 1,
+            generation_durations: HashMap::from([
+                (1, Duration::from_secs(60)),
+                (2, Duration::from_secs(120)),
+            ]),
+            stale_recheck_delay: Duration::ZERO,
+            index_check_enabled: true,
+            index_check_interval: Duration::ZERO,
+            index_check_max_prune_percent: 100,
+        }
+    }
+
+    fn new_test_service(
+        config: CompactionConfig,
+        catalog: &Arc<Catalog>,
+        write_buffer: &Arc<WriteBufferImpl>,
+        persister: &Arc<Persister>,
+        executor: &Arc<Executor>,
+        object_store: &Arc<dyn ObjectStore>,
+        time_provider: Arc<dyn TimeProvider>,
+    ) -> CompactionService {
+        CompactionService::new(
+            config,
+            Arc::clone(catalog),
+            Arc::clone(write_buffer) as Arc<dyn WriteBuffer>,
+            write_buffer.persisted_files(),
+            Arc::clone(persister),
+            Arc::clone(executor),
+            // As the server sets it (influxdb3_clap_blocks datafusion config): without this,
+            // iox_query encodes a size hint that plain object stores reject.
+            HashMap::from([(
+                "iox.hint_known_object_size_to_object_store".to_string(),
+                false.to_string(),
+            )]),
+            Arc::clone(object_store),
+            ObjectStoreUrl::parse(DEFAULT_OBJECT_STORE_URL).unwrap(),
+            "test-host",
+            time_provider,
+            ShutdownManager::new_testing().register(),
+        )
     }
 
     impl CompactionHarness {
@@ -1034,17 +1551,7 @@ mod tests {
 
         /// Like [`Self::new`], on the given object store.
         async fn with_object_store(object_store: Arc<dyn ObjectStore>) -> Self {
-            let config = CompactionConfig {
-                enabled: true,
-                interval: Duration::from_secs(1),
-                max_files_per_run: 10,
-                min_files_for_compaction: 1,
-                generation_durations: HashMap::from([
-                    (1, Duration::from_secs(60)),
-                    (2, Duration::from_secs(120)),
-                ]),
-            };
-            Self::build(object_store, config).await
+            Self::build(object_store, two_minute_gen2_config()).await
         }
 
         /// Like [`Self::new`], with the given compaction config.
@@ -1088,27 +1595,17 @@ mod tests {
                 Arc::clone(&time_provider),
             ));
             let write_buffer =
-                Self::start_write_buffer(&persister, &catalog, &time_provider, &executor).await;
+                Self::start_write_buffer(&persister, &catalog, &time_provider, &executor, 1).await;
 
-            let service = CompactionService::new(
+            let service = Arc::new(new_test_service(
                 config,
-                Arc::clone(&catalog),
-                Arc::clone(&write_buffer) as Arc<dyn WriteBuffer>,
-                write_buffer.persisted_files(),
-                Arc::clone(&persister),
-                Arc::clone(&executor),
-                // As the server sets it (influxdb3_clap_blocks datafusion config): without this,
-                // iox_query encodes a size hint that plain object stores reject.
-                HashMap::from([(
-                    "iox.hint_known_object_size_to_object_store".to_string(),
-                    false.to_string(),
-                )]),
-                Arc::clone(&object_store),
-                ObjectStoreUrl::parse(DEFAULT_OBJECT_STORE_URL).unwrap(),
-                "test-host",
+                &catalog,
+                &write_buffer,
+                &persister,
+                &executor,
+                &object_store,
                 time_provider,
-                ShutdownManager::new_testing().register(),
-            );
+            ));
 
             Self {
                 object_store,
@@ -1121,13 +1618,29 @@ mod tests {
             }
         }
 
-        /// Build a write buffer the way the server does on startup: load the newest snapshot,
-        /// then replay the WAL files after its `wal_file_sequence_number`.
+        /// A compaction service on this harness's catalog, write buffer, index and object store,
+        /// with the given config.
+        fn service_with_config(&self, config: CompactionConfig) -> Arc<CompactionService> {
+            Arc::new(new_test_service(
+                config,
+                &self.catalog,
+                &self.write_buffer,
+                &self.persister,
+                &self.executor,
+                &self.object_store,
+                Arc::clone(&self.time) as _,
+            ))
+        }
+
+        /// Build a write buffer the way the server does on startup: load the newest
+        /// `n_snapshots` snapshots, then replay the WAL files after the newest one's
+        /// `wal_file_sequence_number`.
         async fn start_write_buffer(
             persister: &Arc<Persister>,
             catalog: &Arc<Catalog>,
             time_provider: &Arc<dyn TimeProvider>,
             executor: &Arc<Executor>,
+            n_snapshots: usize,
         ) -> Arc<WriteBufferImpl> {
             let last_cache = LastCacheProvider::new_from_catalog(Arc::clone(catalog))
                 .await
@@ -1150,7 +1663,7 @@ mod tests {
                 metric_registry: Arc::new(Registry::default()),
                 snapshotted_wal_files_to_keep: 10,
                 query_file_limit: None,
-                n_snapshots_to_load_on_start: 1,
+                n_snapshots_to_load_on_start: n_snapshots,
                 shutdown: ShutdownManager::new_testing().register(),
                 wal_replay_concurrency_limit: None,
             })
@@ -1165,6 +1678,19 @@ mod tests {
         /// would try to create the same WAL file. Starting a write buffer also resets the
         /// process-wide parquet file id counter to the newest snapshot's `next_file_id`.
         async fn restart(&self) -> (Arc<Catalog>, Arc<WriteBufferImpl>) {
+            self.restart_loading(1).await
+        }
+
+        /// Like [`Self::restart`], loading every snapshot: an index entry that any snapshot
+        /// still lists comes back, as it does on a server whose lookback covers that snapshot.
+        async fn restart_loading_all(&self) -> (Arc<Catalog>, Arc<WriteBufferImpl>) {
+            self.restart_loading(10_000).await
+        }
+
+        async fn restart_loading(
+            &self,
+            n_snapshots: usize,
+        ) -> (Arc<Catalog>, Arc<WriteBufferImpl>) {
             let time_provider: Arc<dyn TimeProvider> = Arc::clone(&self.time) as _;
             let catalog = Arc::new(
                 Catalog::new(
@@ -1176,10 +1702,41 @@ mod tests {
                 .await
                 .unwrap(),
             );
-            let write_buffer =
-                Self::start_write_buffer(&self.persister, &catalog, &time_provider, &self.executor)
-                    .await;
+            let write_buffer = Self::start_write_buffer(
+                &self.persister,
+                &catalog,
+                &time_provider,
+                &self.executor,
+                n_snapshots,
+            )
+            .await;
             (catalog, write_buffer)
+        }
+
+        /// Paths in the test table's index of a write buffer started by [`Self::restart`].
+        fn paths_after_restart(catalog: &Catalog, write_buffer: &WriteBufferImpl) -> Vec<String> {
+            let db = catalog.db_schema(Self::DB).unwrap();
+            let table_id = db.table_definition(Self::TABLE).unwrap().table_id;
+            sorted_paths(&write_buffer.persisted_files().get_files(db.id, table_id))
+        }
+
+        /// The test table's indexed file whose `min_time` is `min_time`.
+        fn indexed_file_at(&self, min_time: i64) -> ParquetFile {
+            self.indexed_files()
+                .into_iter()
+                .find(|f| f.min_time == min_time)
+                .unwrap_or_else(|| panic!("no indexed file at {min_time}"))
+        }
+
+        async fn delete_object(&self, file: &ParquetFile) {
+            self.object_store
+                .delete(&ObjPath::from(file.path.as_str()))
+                .await
+                .unwrap();
+        }
+
+        async fn snapshot_count(&self) -> usize {
+            self.persister.load_snapshots(10_000).await.unwrap().len()
         }
 
         fn set_now(&self, since_epoch: Duration) {
@@ -1242,6 +1799,49 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             panic!("no new gen1 file was persisted");
+        }
+
+        /// The indexed files of `testtable` in database `db`.
+        fn files_in(&self, db: &str) -> Vec<ParquetFile> {
+            let Some(db) = self.catalog.db_schema(db) else {
+                return vec![];
+            };
+            let Some(table) = db.table_definition(Self::TABLE) else {
+                return vec![];
+            };
+            self.write_buffer
+                .persisted_files()
+                .get_files(db.id, table.table_id)
+        }
+
+        /// Like `write_gen1`, in database `db` (created on first write).
+        async fn write_gen1_in(&self, db: &str, lp: &str) {
+            use data_types::NamespaceName;
+
+            let before = self.files_in(db).len();
+            self.write_buffer
+                .write_lp(
+                    NamespaceName::new(db.to_string()).unwrap(),
+                    lp,
+                    iox_time::Time::from_timestamp_nanos(0),
+                    false,
+                    crate::Precision::Nanosecond,
+                    false,
+                )
+                .await
+                .unwrap();
+            if let Some((snapshot_done, _, _permit)) =
+                self.write_buffer.wal().force_flush_buffer().await
+            {
+                snapshot_done.await.expect("snapshot failed");
+            }
+            for _ in 0..100 {
+                if self.files_in(db).len() > before {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!("no new gen1 file was persisted in {db}");
         }
 
         /// Index `count` gen1 files of 10 minutes each from `start`, one per gen1 chunk, without
@@ -1525,6 +2125,10 @@ mod tests {
                 (1, Duration::from_secs(600)),
                 (2, Duration::from_secs(86_400)),
             ]),
+            stale_recheck_delay: Duration::ZERO,
+            index_check_enabled: true,
+            index_check_interval: Duration::ZERO,
+            index_check_max_prune_percent: 100,
         }
     }
 
@@ -1879,6 +2483,1207 @@ mod tests {
         drop(permit);
     }
 
+    fn sorted_paths(files: &[ParquetFile]) -> Vec<String> {
+        let mut paths: Vec<_> = files.iter().map(|f| f.path.clone()).collect();
+        paths.sort();
+        paths
+    }
+
+    /// Regression test (TAG-2507): a job pruned an input whose object is missing from the index,
+    /// but only in memory, so a restart loaded the entry again from the snapshot that added it and
+    /// the running and restarted indexes disagreed. A job now leaves such an input out without
+    /// pruning it, so both indexes keep it; the index check prunes it durably.
+    #[tokio::test]
+    async fn test_job_leaves_a_missing_input_out_and_the_index_check_prunes_it() {
+        let h = CompactionHarness::new().await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 20000000000").await;
+        let missing = h.indexed_file_at(10_000_000_000);
+        h.delete_object(&missing).await;
+        let snapshots = h.snapshot_count().await;
+
+        h.set_now(Duration::from_secs(120));
+        let compacted = h.compact().await;
+        assert_eq!(compacted.iter().map(|f| f.row_count).sum::<u64>(), 1);
+        let mut expected = sorted_paths(&compacted);
+        expected.push(missing.path.clone());
+        expected.sort();
+        assert_eq!(
+            sorted_paths(&h.indexed_files()),
+            expected,
+            "the job pruned the missing input"
+        );
+        assert_eq!(
+            h.snapshot_count().await,
+            snapshots + 1,
+            "the job wrote more than its compaction snapshot"
+        );
+        let (catalog, restarted) = h.restart_loading_all().await;
+        assert_eq!(
+            CompactionHarness::paths_after_restart(&catalog, &restarted),
+            expected,
+            "the running and restarted indexes disagree"
+        );
+
+        h.service.check_index_for_missing_files().await;
+        let (catalog, restarted) = h.restart_loading_all().await;
+        assert_eq!(
+            CompactionHarness::paths_after_restart(&catalog, &restarted),
+            sorted_paths(&compacted),
+            "the index check's prune did not survive a restart"
+        );
+    }
+
+    /// Regression test (TAG-2507): the same when the job stops after its drift check because too
+    /// few inputs are left. On main it pruned in memory and wrote no snapshot at all. Now it writes
+    /// nothing and keeps the entry, so the running and restarted indexes agree.
+    #[tokio::test]
+    async fn test_skipped_job_writes_nothing_and_keeps_the_missing_input() {
+        let h = CompactionHarness::with_config(CompactionConfig {
+            min_files_for_compaction: 2,
+            ..two_minute_gen2_config()
+        })
+        .await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 20000000000").await;
+        let missing = h.indexed_file_at(10_000_000_000);
+        h.delete_object(&missing).await;
+        let indexed = sorted_paths(&h.indexed_files());
+        let snapshots = h.snapshot_count().await;
+
+        h.set_now(Duration::from_secs(120));
+        let jobs = h.service.identify_compaction_jobs().await.unwrap();
+        assert_eq!(jobs.len(), 1, "test setup: one job for the two files");
+        let result = h
+            .service
+            .execute_compaction_job(jobs.into_iter().next().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            result.compacted_files.is_empty(),
+            "test setup: the job stops below the minimum"
+        );
+
+        assert_eq!(sorted_paths(&h.indexed_files()), indexed);
+        assert_eq!(
+            h.snapshot_count().await,
+            snapshots,
+            "the skipped job wrote a snapshot"
+        );
+        let (catalog, restarted) = h.restart_loading_all().await;
+        assert_eq!(
+            CompactionHarness::paths_after_restart(&catalog, &restarted),
+            indexed
+        );
+    }
+
+    /// Regression test (TAG-2507): pruning ran only inside a compaction job, and a window with
+    /// fewer files than `min_files_for_compaction` never gets one. That covers leftover gen1
+    /// files and most gen2 files (a 7 day gen3 window holds about 7), as on tagmobi-dev where a
+    /// day window with 2 gen1 entries and two gen2 entries kept pointing at missing objects. The
+    /// compaction service checks every index entry once when it starts, prunes the ones whose
+    /// object is missing, and records that in a snapshot without moving the WAL replay start.
+    #[tokio::test]
+    async fn test_startup_index_check_prunes_missing_files_below_the_compaction_minimum() {
+        let h = CompactionHarness::new().await;
+        // A gen2 file, listed by the compaction snapshot that wrote it.
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.set_now(Duration::from_secs(120));
+        let gen2 = h.compact().await.remove(0);
+        // gen1 files in two later windows.
+        h.write_gen1("testtable value=2 130000000000").await;
+        h.write_gen1("testtable value=3 250000000000").await;
+        let gen1_missing = h.indexed_file_at(130_000_000_000);
+        let gen1_kept = h.indexed_file_at(250_000_000_000);
+        h.delete_object(&gen2).await;
+        h.delete_object(&gen1_missing).await;
+        // A row only the WAL holds: the check's snapshot must not move the replay start past it.
+        h.write_wal_only("testtable value=4 260000000000").await;
+        let persisted_wal = h
+            .write_buffer
+            .persisted_files()
+            .last_persisted_wal_sequence_number()
+            .unwrap();
+        assert!(
+            h.write_buffer.wal().last_wal_sequence_number().await > persisted_wal,
+            "test setup: the WAL must hold a file no snapshot persisted"
+        );
+
+        // With a minimum of 10 files no window gets a job, so only the startup check can prune.
+        let service = h.service_with_config(CompactionConfig {
+            min_files_for_compaction: 10,
+            ..two_minute_gen2_config()
+        });
+        let task = Arc::clone(&service).start();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while h.indexed_files().len() > 1 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        task.abort();
+        assert_eq!(
+            sorted_paths(&h.indexed_files()),
+            vec![gen1_kept.path.clone()],
+            "the startup check did not prune the entries whose objects are missing"
+        );
+
+        let snapshot = h.newest_snapshot().await;
+        assert!(
+            snapshot.databases.is_empty(),
+            "the check's snapshot only removes entries"
+        );
+        let removed: Vec<ParquetFile> = snapshot
+            .removed_files
+            .values()
+            .flat_map(|db| db.tables.values().flatten().cloned())
+            .collect();
+        assert_eq!(sorted_paths(&removed), sorted_paths(&[gen2, gen1_missing]));
+        assert_eq!(
+            snapshot.wal_file_sequence_number, persisted_wal,
+            "the check's snapshot moved the WAL replay start past an unpersisted WAL file"
+        );
+
+        let (catalog, restarted) = h.restart_loading_all().await;
+        assert_eq!(
+            CompactionHarness::paths_after_restart(&catalog, &restarted),
+            vec![gen1_kept.path],
+            "the pruned entries came back after a restart"
+        );
+    }
+
+    /// The tagmobi-dev case, start to finish: stale entries that persisted snapshots still list
+    /// are loaded at startup, the WAL is replayed, the check prunes them, and the next start no
+    /// longer loads them.
+    #[tokio::test]
+    async fn test_startup_index_check_after_a_restart_heals_entries_loaded_from_snapshots() {
+        let h = CompactionHarness::new().await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 130000000000").await;
+        let missing = h.indexed_file_at(10_000_000_000);
+        let kept = h.indexed_file_at(130_000_000_000);
+        h.delete_object(&missing).await;
+        h.write_wal_only("testtable value=3 140000000000").await;
+
+        let (catalog, restarted) = h.restart_loading_all().await;
+        assert_eq!(
+            CompactionHarness::paths_after_restart(&catalog, &restarted),
+            sorted_paths(&[missing.clone(), kept.clone()]),
+            "test setup: the stale entry is loaded from its snapshot"
+        );
+        let service = new_test_service(
+            CompactionConfig {
+                min_files_for_compaction: 10,
+                ..two_minute_gen2_config()
+            },
+            &catalog,
+            &restarted,
+            &h.persister,
+            &h.executor,
+            &h.object_store,
+            Arc::clone(&h.time) as _,
+        );
+        service.check_index_for_missing_files().await;
+
+        let snapshot = h.newest_snapshot().await;
+        assert!(snapshot.databases.is_empty() && !snapshot.removed_files.is_empty());
+        assert_eq!(
+            Some(snapshot.wal_file_sequence_number),
+            restarted
+                .persisted_files()
+                .last_persisted_wal_sequence_number()
+        );
+        let (catalog, restarted_again) = h.restart_loading_all().await;
+        assert_eq!(
+            CompactionHarness::paths_after_restart(&catalog, &restarted_again),
+            vec![kept.path],
+            "the pruned entry came back after the next restart"
+        );
+    }
+
+    /// The startup check prunes only on a NotFound or a size mismatch. An entry whose HEAD fails
+    /// any other way (a timeout, an unreachable store) is kept, and a check that finds nothing
+    /// stale writes no snapshot.
+    #[tokio::test]
+    async fn test_startup_index_check_keeps_entries_it_cannot_check() {
+        let store = Arc::new(HeadFailingObjectStore::new(Arc::new(InMemory::new())));
+        let h = CompactionHarness::with_object_store(Arc::clone(&store) as _).await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 20000000000").await;
+        store.fail_head(&h.indexed_file_at(10_000_000_000).path);
+        let indexed = sorted_paths(&h.indexed_files());
+        let snapshots = h.snapshot_count().await;
+
+        h.service.check_index_for_missing_files().await;
+
+        assert_eq!(
+            sorted_paths(&h.indexed_files()),
+            indexed,
+            "an entry whose HEAD failed with an error other than NotFound was pruned"
+        );
+        assert_eq!(
+            h.snapshot_count().await,
+            snapshots,
+            "a check that found nothing stale wrote a snapshot"
+        );
+    }
+
+    /// A first start of the new image may prune many entries at once (tagmobi-prod logged 134765
+    /// stale entries in July). The startup check logs the first [`STALE_LOG_LIMIT`] paths and
+    /// counts the rest in its summary; the removal snapshot lists all of them.
+    #[tokio::test]
+    async fn test_startup_index_check_logs_the_first_stale_paths_and_counts_the_rest() {
+        let h = CompactionHarness::new().await;
+        let stale = STALE_LOG_LIMIT + 2;
+        for i in 0..stale {
+            let ts = (10 + 60 * i as u64) * 1_000_000_000;
+            h.write_gen1(&format!("testtable value={i} {ts}")).await;
+            h.delete_object(&h.indexed_file_at(ts as i64)).await;
+        }
+
+        let capture = test_helpers::tracing::TracingCapture::new();
+        h.service.check_index_for_missing_files().await;
+        let logs = capture.to_string();
+
+        assert!(h.indexed_files().is_empty(), "every stale entry is pruned");
+        assert_eq!(
+            logs.matches("Skipping missing parquet file in catalog")
+                .count(),
+            STALE_LOG_LIMIT,
+            "{logs}"
+        );
+        assert!(logs.contains("not_logged = 2"), "{logs}");
+    }
+
+    /// The startup check prunes nothing when a larger share of the index looks stale than
+    /// `index_check_max_prune_percent` allows. Object storage that answers NotFound for objects it
+    /// holds (a wrong bucket or prefix, MinIO drives not yet healed) must not empty the index.
+    /// One error line says so, and a limit of 100 lets the same check prune.
+    #[tokio::test]
+    async fn test_startup_index_check_refuses_to_prune_most_of_the_index() {
+        let h = CompactionHarness::new().await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 70000000000").await;
+        h.write_gen1("testtable value=3 130000000000").await;
+        for ts in [10_000_000_000, 70_000_000_000] {
+            h.delete_object(&h.indexed_file_at(ts)).await;
+        }
+        let indexed = sorted_paths(&h.indexed_files());
+        let snapshots = h.snapshot_count().await;
+
+        let limited = h.service_with_config(CompactionConfig {
+            index_check_max_prune_percent: 50,
+            ..two_minute_gen2_config()
+        });
+        let capture = test_helpers::tracing::TracingCapture::new();
+        limited.check_index_for_missing_files().await;
+        let logs = capture.to_string();
+
+        assert_eq!(
+            sorted_paths(&h.indexed_files()),
+            indexed,
+            "two of three entries looked stale and the check pruned them with a 50% limit"
+        );
+        assert_eq!(h.snapshot_count().await, snapshots);
+        assert_eq!(logs.matches("level = ERROR").count(), 1, "{logs}");
+
+        let unlimited = h.service_with_config(CompactionConfig {
+            index_check_max_prune_percent: 100,
+            ..two_minute_gen2_config()
+        });
+        unlimited.check_index_for_missing_files().await;
+        assert_eq!(
+            sorted_paths(&h.indexed_files()),
+            vec![h.indexed_file_at(130_000_000_000).path],
+        );
+    }
+
+    /// The limit counts only entries that got a definite answer. Entries whose HEAD failed some
+    /// other way say nothing about the index, so a store that times out on most requests and
+    /// answers NotFound for the rest must trip the limit, not pass it.
+    #[tokio::test]
+    async fn test_startup_index_check_limit_ignores_entries_it_could_not_check() {
+        let store = Arc::new(HeadFailingObjectStore::new(Arc::new(InMemory::new())));
+        let h = CompactionHarness::with_object_store(Arc::clone(&store) as _).await;
+        for i in 0..5_u64 {
+            h.write_gen1(&format!(
+                "testtable value={i} {}",
+                (10 + 60 * i) * 1_000_000_000
+            ))
+            .await;
+        }
+        let files = h.indexed_files();
+        for file in &files[..3] {
+            store.fail_head(&file.path);
+        }
+        for file in &files[3..] {
+            h.delete_object(file).await;
+        }
+        let indexed = sorted_paths(&files);
+        let snapshots = h.snapshot_count().await;
+        let limited = h.service_with_config(CompactionConfig {
+            index_check_max_prune_percent: 50,
+            ..two_minute_gen2_config()
+        });
+
+        limited.check_index_for_missing_files().await;
+
+        assert_eq!(
+            sorted_paths(&h.indexed_files()),
+            indexed,
+            "2 of 2 definite answers were stale, and the check pruned them because 3 more could not be checked"
+        );
+        assert_eq!(h.snapshot_count().await, snapshots);
+    }
+
+    /// Waits until `logs()` holds `n` index check summaries, or 10 s pass.
+    async fn wait_for_index_check_runs(logs: impl Fn() -> String, n: usize) -> usize {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let runs = logs()
+                .matches("checked the parquet index against object storage")
+                .count();
+            if runs >= n || std::time::Instant::now() >= deadline {
+                return runs;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The index check runs again after `index_check_interval`, so an entry that goes stale while
+    /// the server runs is pruned without a restart.
+    #[tokio::test]
+    async fn test_index_check_runs_again_after_its_interval() {
+        let h = CompactionHarness::new().await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 70000000000").await;
+        h.write_gen1("testtable value=3 130000000000").await;
+        let service = h.service_with_config(CompactionConfig {
+            min_files_for_compaction: 10,
+            index_check_interval: Duration::from_millis(200),
+            ..two_minute_gen2_config()
+        });
+        let capture = test_helpers::tracing::TracingCapture::new();
+        let task = Arc::clone(&service).start();
+        assert_eq!(
+            wait_for_index_check_runs(|| capture.to_string(), 1).await,
+            1
+        );
+
+        let stale = h.indexed_file_at(10_000_000_000);
+        h.delete_object(&stale).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while h.indexed_files().iter().any(|f| f.path == stale.path)
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        task.abort();
+
+        assert!(
+            !h.indexed_files().iter().any(|f| f.path == stale.path),
+            "no later run pruned the entry that went stale after the first"
+        );
+    }
+
+    /// A refusal lasts until the next run, not until a restart: once the stale share drops below
+    /// the limit, the next run prunes.
+    #[tokio::test]
+    async fn test_a_refused_index_check_run_is_followed_by_one_that_prunes() {
+        let h = CompactionHarness::new().await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 70000000000").await;
+        let stale = h.indexed_files();
+        for file in &stale {
+            h.delete_object(file).await;
+        }
+        let service = h.service_with_config(CompactionConfig {
+            min_files_for_compaction: 10,
+            index_check_interval: Duration::from_millis(200),
+            index_check_max_prune_percent: 50,
+            ..two_minute_gen2_config()
+        });
+        let capture = test_helpers::tracing::TracingCapture::new();
+        let task = Arc::clone(&service).start();
+        assert_eq!(
+            wait_for_index_check_runs(|| capture.to_string(), 1).await,
+            1
+        );
+        assert_eq!(
+            h.indexed_files().len(),
+            2,
+            "test setup: the first run refuses"
+        );
+
+        // Three valid entries make the share 2 of 5, under the 50% limit.
+        for ts in [130, 190, 250] {
+            h.write_gen1(&format!("testtable value={ts} {}", ts * 1_000_000_000_i64))
+                .await;
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while h.indexed_files().len() > 3 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        task.abort();
+
+        let indexed = sorted_paths(&h.indexed_files());
+        assert!(
+            stale.iter().all(|f| !indexed.contains(&f.path)),
+            "the refusal outlived the run that made it"
+        );
+    }
+
+    /// An interval of zero runs the check once, at startup, and never loops.
+    #[tokio::test]
+    async fn test_index_check_with_a_zero_interval_runs_only_at_startup() {
+        let h = CompactionHarness::new().await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 70000000000").await;
+        let service = h.service_with_config(CompactionConfig {
+            min_files_for_compaction: 10,
+            index_check_interval: Duration::ZERO,
+            ..two_minute_gen2_config()
+        });
+        let capture = test_helpers::tracing::TracingCapture::new();
+        let task = Arc::clone(&service).start();
+        assert_eq!(
+            wait_for_index_check_runs(|| capture.to_string(), 1).await,
+            1
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        task.abort();
+
+        assert_eq!(
+            capture
+                .to_string()
+                .matches("checked the parquet index against object storage")
+                .count(),
+            1
+        );
+    }
+
+    /// Shutdown ends the wait between index check runs, so the service stops promptly.
+    #[tokio::test]
+    async fn test_shutdown_ends_the_wait_between_index_check_runs() {
+        let h = CompactionHarness::new().await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        let service = h.service_with_config(CompactionConfig {
+            min_files_for_compaction: 10,
+            index_check_interval: Duration::from_secs(3600),
+            ..two_minute_gen2_config()
+        });
+        let capture = test_helpers::tracing::TracingCapture::new();
+        let task = Arc::clone(&service).start();
+        assert_eq!(
+            wait_for_index_check_runs(|| capture.to_string(), 1).await,
+            1
+        );
+
+        service.shutdown_token.trigger_shutdown();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the compaction service did not stop while waiting for the next index check")
+            .unwrap();
+    }
+
+    /// The second look compares the object with the size captured on the first look, so it must
+    /// only prune an entry the index still holds with that size. An entry replaced meanwhile by
+    /// one with the same id and path but another size (possible with ids reused before TAG-2495)
+    /// is not the entry that was checked.
+    #[tokio::test]
+    async fn test_still_indexed_drops_an_entry_replaced_with_another_size() {
+        let h = CompactionHarness::new().await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        let checked = h.indexed_file_at(10_000_000_000);
+        let db = h.catalog.db_schema(CompactionHarness::DB).unwrap();
+        let table_id = db
+            .table_definition(CompactionHarness::TABLE)
+            .unwrap()
+            .table_id;
+        let replacement = ParquetFile {
+            size_bytes: checked.size_bytes + 10,
+            ..checked.clone()
+        };
+        h.write_buffer
+            .persisted_files()
+            .add_persisted_file(&db.id, &table_id, &replacement);
+
+        let kept = h.service.still_indexed(vec![StaleEntry {
+            key: (db.id, table_id),
+            file: checked,
+            reason: StaleReason::SizeMismatch {
+                object_size: replacement.size_bytes,
+            },
+        }]);
+
+        assert!(
+            kept.is_empty(),
+            "an entry replaced with another size counts as the entry that was checked"
+        );
+    }
+
+    /// A run in which no entry got a definite answer (every HEAD failed some other way) checked
+    /// nothing. It says so at warn, instead of only an info summary that reads like a clean run.
+    #[tokio::test]
+    async fn test_index_check_warns_when_no_entry_could_be_checked() {
+        let store = Arc::new(HeadFailingObjectStore::new(Arc::new(InMemory::new())));
+        let h = CompactionHarness::with_object_store(Arc::clone(&store) as _).await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 70000000000").await;
+        for file in h.indexed_files() {
+            store.fail_head(&file.path);
+        }
+
+        let capture = test_helpers::tracing::TracingCapture::new();
+        h.service.check_index_for_missing_files().await;
+        let logs = capture.to_string();
+
+        assert!(
+            logs.contains("level = WARN; message = no parquet index entry could be checked"),
+            "{logs}"
+        );
+    }
+
+    /// An entry that looked missing but whose second HEAD fails some other way is kept, and the
+    /// failure is logged with its path, as the first look's failures are.
+    #[tokio::test]
+    async fn test_index_check_logs_a_second_look_failure() {
+        let store = Arc::new(HeadFailingObjectStore::new(Arc::new(InMemory::new())));
+        let h = CompactionHarness::with_object_store(Arc::clone(&store) as _).await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 70000000000").await;
+        let flaky = h.indexed_file_at(10_000_000_000);
+        store.not_found_once(&flaky.path);
+        store.fail_head(&flaky.path);
+
+        let capture = test_helpers::tracing::TracingCapture::new();
+        h.service.check_index_for_missing_files().await;
+        let logs = capture.to_string();
+
+        assert!(h.indexed_files().iter().any(|f| f.path == flaky.path));
+        let line = logs
+            .lines()
+            .find(|l| l.contains("on the second look"))
+            .unwrap_or_else(|| panic!("no second-look warning: {logs}"));
+        assert!(
+            line.contains("level = WARN") && line.contains(&flaky.path),
+            "{line}"
+        );
+    }
+
+    /// Planning skips inputs a job left out as stale, so a window whose inputs are all stale is not
+    /// planned again every cycle (taking job slots from real compaction) while it waits for the
+    /// index check. The check's prune then takes them off the list.
+    #[tokio::test]
+    async fn test_planning_skips_inputs_a_job_left_out_until_the_index_check_decides() {
+        let h = CompactionHarness::with_config(CompactionConfig {
+            min_files_for_compaction: 2,
+            ..two_minute_gen2_config()
+        })
+        .await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 20000000000").await;
+        for file in h.indexed_files() {
+            h.delete_object(&file).await;
+        }
+        h.set_now(Duration::from_secs(120));
+        let job = h
+            .service
+            .identify_compaction_jobs()
+            .await
+            .unwrap()
+            .remove(0);
+        h.service.execute_compaction_job(job).await.unwrap();
+
+        assert!(
+            h.service
+                .identify_compaction_jobs()
+                .await
+                .unwrap()
+                .is_empty(),
+            "the window of the left-out inputs was planned again"
+        );
+        h.service.check_index_for_missing_files().await;
+        assert!(h.indexed_files().is_empty());
+        assert!(h.service.left_out.lock().is_empty());
+    }
+
+    /// An input left out after a wrong NotFound is planned again once an index check run finds its
+    /// object present.
+    #[tokio::test]
+    async fn test_planning_includes_a_left_out_input_again_once_the_index_check_finds_it_present() {
+        let store = Arc::new(HeadFailingObjectStore::new(Arc::new(InMemory::new())));
+        let h = CompactionHarness::with_object_store(Arc::clone(&store) as _).await;
+        let service = h.service_with_config(CompactionConfig {
+            min_files_for_compaction: 2,
+            ..two_minute_gen2_config()
+        });
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 20000000000").await;
+        store.not_found_once(&h.indexed_file_at(10_000_000_000).path);
+        h.set_now(Duration::from_secs(120));
+        let job = service.identify_compaction_jobs().await.unwrap().remove(0);
+        service.execute_compaction_job(job).await.unwrap();
+        assert!(
+            service.identify_compaction_jobs().await.unwrap().is_empty(),
+            "test setup: the left-out input is skipped, leaving the window below the minimum"
+        );
+
+        service.check_index_for_missing_files().await;
+
+        assert_eq!(service.identify_compaction_jobs().await.unwrap().len(), 1);
+    }
+
+    /// A run that sees object storage answer inconsistently prunes nothing, whatever the limit:
+    /// here more entries flip from missing to present between the two looks than stay missing.
+    #[tokio::test]
+    async fn test_index_check_refuses_a_run_where_entries_flip_back_to_present() {
+        let store = Arc::new(HeadFailingObjectStore::new(Arc::new(InMemory::new())));
+        let h = CompactionHarness::with_object_store(Arc::clone(&store) as _).await;
+        for i in 0..4_i64 {
+            h.write_gen1(&format!(
+                "testtable value={i} {}",
+                (10 + 60 * i) * 1_000_000_000
+            ))
+            .await;
+        }
+        let files = h.indexed_files();
+        h.delete_object(&files[0]).await;
+        store.not_found_once(&files[1].path);
+        store.not_found_once(&files[2].path);
+        let indexed = sorted_paths(&files);
+
+        let capture = test_helpers::tracing::TracingCapture::new();
+        h.service.check_index_for_missing_files().await;
+        let logs = capture.to_string();
+
+        assert_eq!(
+            sorted_paths(&h.indexed_files()),
+            indexed,
+            "a run in which 2 entries flipped back to present pruned the 1 that stayed missing"
+        );
+        assert!(logs.contains("answered inconsistently"), "{logs}");
+    }
+
+    /// The same when most HEADs of a run fail some other way than NotFound.
+    #[tokio::test]
+    async fn test_index_check_refuses_a_run_where_most_answers_failed() {
+        let store = Arc::new(HeadFailingObjectStore::new(Arc::new(InMemory::new())));
+        let h = CompactionHarness::with_object_store(Arc::clone(&store) as _).await;
+        for i in 0..5_i64 {
+            h.write_gen1(&format!(
+                "testtable value={i} {}",
+                (10 + 60 * i) * 1_000_000_000
+            ))
+            .await;
+        }
+        let files = h.indexed_files();
+        for file in &files[..3] {
+            store.fail_head(&file.path);
+        }
+        h.delete_object(&files[3]).await;
+        let indexed = sorted_paths(&files);
+
+        h.service.check_index_for_missing_files().await;
+
+        assert_eq!(
+            sorted_paths(&h.indexed_files()),
+            indexed,
+            "a run in which 3 of 5 HEADs failed pruned the 1 missing entry"
+        );
+    }
+
+    /// The limit applies to each database too: a fault that hides one database's objects is a
+    /// minority of the index but all of that database. Databases over the limit are refused and
+    /// the others still prune. Here `testdb` is 2 of 2 stale and `otherdb` 1 of 4: index-wide
+    /// that's 3 of 6, which the 50% limit alone would have pruned.
+    #[tokio::test]
+    async fn test_index_check_limit_applies_per_database() {
+        let h = CompactionHarness::new().await;
+        for i in 0..2_i64 {
+            h.write_gen1(&format!(
+                "testtable value={i} {}",
+                (10 + 60 * i) * 1_000_000_000
+            ))
+            .await;
+        }
+        for i in 0..4_i64 {
+            h.write_gen1_in(
+                "otherdb",
+                &format!("testtable value={i} {}", (10 + 60 * i) * 1_000_000_000),
+            )
+            .await;
+        }
+        let hidden = h.indexed_files();
+        for file in &hidden {
+            h.delete_object(file).await;
+        }
+        let other_missing = h.files_in("otherdb").remove(0);
+        h.delete_object(&other_missing).await;
+        let limited = h.service_with_config(CompactionConfig {
+            index_check_max_prune_percent: 50,
+            ..two_minute_gen2_config()
+        });
+
+        let capture = test_helpers::tracing::TracingCapture::new();
+        limited.check_index_for_missing_files().await;
+        let logs = capture.to_string();
+
+        assert_eq!(
+            sorted_paths(&h.indexed_files()),
+            sorted_paths(&hidden),
+            "testdb, entirely stale, was pruned because it is a minority of the index"
+        );
+        assert!(
+            !h.files_in("otherdb")
+                .iter()
+                .any(|f| f.path == other_missing.path),
+            "otherdb, under the limit, was not pruned"
+        );
+        assert_eq!(logs.matches("level = ERROR").count(), 1, "{logs}");
+    }
+
+    /// With `index_check_enabled` off, the service starts without checking the index.
+    #[tokio::test]
+    async fn test_disabled_index_check_does_not_run() {
+        let h = CompactionHarness::new().await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 70000000000").await;
+        h.delete_object(&h.indexed_file_at(10_000_000_000)).await;
+        let indexed = sorted_paths(&h.indexed_files());
+
+        let service = h.service_with_config(CompactionConfig {
+            index_check_enabled: false,
+            min_files_for_compaction: 10,
+            ..two_minute_gen2_config()
+        });
+        let capture = test_helpers::tracing::TracingCapture::new();
+        let task = Arc::clone(&service).start();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !capture
+            .to_string()
+            .contains("parquet index check is disabled")
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        task.abort();
+
+        assert!(
+            capture
+                .to_string()
+                .contains("parquet index check is disabled"),
+            "{capture}"
+        );
+        assert_eq!(sorted_paths(&h.indexed_files()), indexed);
+    }
+
+    /// The startup check runs alongside the compaction cycles instead of before them: on a large
+    /// index it takes minutes, and compaction must not wait for it. Here the check is held on
+    /// one HEAD while the first cycle compacts a gen1 file. The job leaves out a stale input in
+    /// the same window without pruning it; the check prunes it once it finishes.
+    #[tokio::test]
+    async fn test_startup_index_check_runs_alongside_compaction() {
+        let store = Arc::new(HeadFailingObjectStore::new(Arc::new(InMemory::new())));
+        let h = CompactionHarness::with_object_store(Arc::clone(&store) as _).await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.set_now(Duration::from_secs(120));
+        let gen2 = h.compact().await.remove(0);
+        h.write_gen1("testtable value=2 130000000000").await;
+        h.write_gen1("testtable value=3 190000000000").await;
+        let gen1 = h.indexed_file_at(130_000_000_000);
+        let stale = h.indexed_file_at(190_000_000_000);
+        h.delete_object(&stale).await;
+        h.set_now(Duration::from_secs(240));
+        // gen2 is the top generation, so no job touches it; only the check HEADs it.
+        let release = store.hold_head(&gen2.path);
+
+        let task = Arc::clone(&h.service).start();
+        let indexed =
+            |h: &CompactionHarness, path: &str| h.indexed_files().iter().any(|f| f.path == path);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while indexed(&h, &gen1.path) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let compacted = !indexed(&h, &gen1.path);
+        let kept_while_checking = indexed(&h, &stale.path);
+        release.add_permits(1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while indexed(&h, &stale.path) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        task.abort();
+
+        assert!(
+            compacted,
+            "no compaction job ran while the startup check was in progress"
+        );
+        assert!(kept_while_checking, "a job pruned a stale input");
+        assert!(
+            !indexed(&h, &stale.path),
+            "the startup check did not prune the stale entry once it finished"
+        );
+    }
+
+    /// Shutdown is checked between compaction cycles: a cycle that has started runs to the end
+    /// instead of being dropped with its jobs half done.
+    #[tokio::test]
+    async fn test_shutdown_lets_a_running_compaction_cycle_finish() {
+        let store = Arc::new(HeadFailingObjectStore::new(Arc::new(InMemory::new())));
+        let h = CompactionHarness::with_object_store(Arc::clone(&store) as _).await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 20000000000").await;
+        let inputs = sorted_paths(&h.indexed_files());
+        h.set_now(Duration::from_secs(120));
+        let release = store.hold_head(&inputs[0]);
+        let service = h.service_with_config(CompactionConfig {
+            index_check_enabled: false,
+            ..two_minute_gen2_config()
+        });
+
+        let task = Arc::clone(&service).start();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !store.head_is_held() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            store.head_is_held(),
+            "test setup: the job never reached its drift check"
+        );
+        service.shutdown_token.trigger_shutdown();
+        tokio::task::yield_now().await;
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the compaction service did not stop after shutdown")
+            .unwrap();
+
+        let indexed = sorted_paths(&h.indexed_files());
+        assert!(
+            inputs.iter().all(|p| !indexed.contains(p)),
+            "the running job was dropped at shutdown; still indexed: {indexed:?}"
+        );
+    }
+
+    /// The index check's second look waits `stale_recheck_delay`. Shutdown ends the wait, and the
+    /// check stops without pruning: nothing is saved before the second look.
+    #[tokio::test]
+    async fn test_shutdown_ends_the_index_checks_second_look_wait() {
+        let h = CompactionHarness::new().await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 70000000000").await;
+        let stale = h.indexed_file_at(10_000_000_000);
+        h.delete_object(&stale).await;
+        let snapshots = h.snapshot_count().await;
+        let service = h.service_with_config(CompactionConfig {
+            stale_recheck_delay: Duration::from_secs(600),
+            ..two_minute_gen2_config()
+        });
+
+        let running = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.check_index_for_missing_files().await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        service.shutdown_token.trigger_shutdown();
+        tokio::time::timeout(Duration::from_secs(10), running)
+            .await
+            .expect("the index check kept waiting after shutdown")
+            .unwrap();
+
+        assert!(
+            h.indexed_files().iter().any(|f| f.path == stale.path),
+            "the index check pruned an entry after shutdown"
+        );
+        assert_eq!(h.snapshot_count().await, snapshots);
+    }
+
+    /// A single NotFound never prunes: object storage that briefly answers NotFound for an object
+    /// it holds would otherwise remove the entry for good. The check looks again after
+    /// `stale_recheck_delay` and keeps an entry whose object is there the second time.
+    #[tokio::test]
+    async fn test_startup_index_check_keeps_an_entry_present_on_a_second_look() {
+        let store = Arc::new(HeadFailingObjectStore::new(Arc::new(InMemory::new())));
+        let h = CompactionHarness::with_object_store(Arc::clone(&store) as _).await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 20000000000").await;
+        store.not_found_once(&h.indexed_file_at(10_000_000_000).path);
+        let indexed = sorted_paths(&h.indexed_files());
+        let snapshots = h.snapshot_count().await;
+
+        h.service.check_index_for_missing_files().await;
+
+        assert_eq!(
+            sorted_paths(&h.indexed_files()),
+            indexed,
+            "an entry was pruned after a single NotFound"
+        );
+        assert_eq!(h.snapshot_count().await, snapshots);
+    }
+
+    /// Forwards to `inner`, but answers HEAD from what it saw before, as the parquet memory cache
+    /// does for cached objects.
+    #[derive(Debug)]
+    struct CachingHeadObjectStore {
+        inner: Arc<dyn ObjectStore>,
+        seen: parking_lot::Mutex<HashMap<ObjPath, object_store::ObjectMeta>>,
+    }
+
+    impl std::fmt::Display for CachingHeadObjectStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CachingHeadObjectStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for CachingHeadObjectStore {
+        async fn put_opts(
+            &self,
+            location: &ObjPath,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            opts: object_store::PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn head(&self, location: &ObjPath) -> object_store::Result<object_store::ObjectMeta> {
+            if let Some(meta) = self.seen.lock().get(location) {
+                return Ok(meta.clone());
+            }
+            let meta = self.inner.head(location).await?;
+            self.seen.lock().insert(location.clone(), meta.clone());
+            Ok(meta)
+        }
+
+        async fn delete(&self, location: &ObjPath) -> object_store::Result<()> {
+            self.seen.lock().remove(location);
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &ObjPath, to: &ObjPath) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &ObjPath,
+            to: &ObjPath,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    /// With the parquet memory cache in front of the store, HEAD of a cached object answers from
+    /// cached metadata, so a periodic check would keep seeing an object deleted outside refluxdb
+    /// as present (found in a local run). The check HEADs the store without the cache instead.
+    #[tokio::test]
+    async fn test_index_check_heads_past_a_caching_store() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let caching: Arc<dyn ObjectStore> = Arc::new(CachingHeadObjectStore {
+            inner: Arc::clone(&inner),
+            seen: Default::default(),
+        });
+        let h = CompactionHarness::with_object_store(Arc::clone(&caching)).await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 70000000000").await;
+        h.write_gen1("testtable value=3 130000000000").await;
+        let service = new_test_service(
+            two_minute_gen2_config(),
+            &h.catalog,
+            &h.write_buffer,
+            &h.persister,
+            &h.executor,
+            &caching,
+            Arc::clone(&h.time) as _,
+        )
+        .with_head_store(Arc::clone(&inner));
+        // A read through the caching store remembers every object's metadata.
+        for file in h.indexed_files() {
+            caching
+                .head(&ObjPath::from(file.path.as_str()))
+                .await
+                .unwrap();
+        }
+        let deleted = h.indexed_file_at(10_000_000_000);
+        inner
+            .delete(&ObjPath::from(deleted.path.as_str()))
+            .await
+            .unwrap();
+
+        service.check_index_for_missing_files().await;
+
+        assert!(
+            !h.indexed_files().iter().any(|f| f.path == deleted.path),
+            "the check asked the caching store and saw the deleted object as present"
+        );
+    }
+
+    /// Forwards to `inner`, except for HEAD of the paths set with [`Self::not_found_once`] (the
+    /// next HEAD says NotFound), [`Self::fail_head`] (fails with an error other than NotFound,
+    /// after any NotFound-once) and [`Self::hold_head`] (HEAD waits for a permit).
+    #[derive(Debug)]
+    struct HeadFailingObjectStore {
+        inner: Arc<dyn ObjectStore>,
+        failing: parking_lot::Mutex<HashSet<ObjPath>>,
+        not_found_once: parking_lot::Mutex<HashSet<ObjPath>>,
+        held: parking_lot::Mutex<Option<(ObjPath, Arc<tokio::sync::Semaphore>)>>,
+        held_waiting: std::sync::atomic::AtomicBool,
+    }
+
+    impl HeadFailingObjectStore {
+        fn new(inner: Arc<dyn ObjectStore>) -> Self {
+            Self {
+                inner,
+                failing: Default::default(),
+                not_found_once: Default::default(),
+                held: Default::default(),
+                held_waiting: Default::default(),
+            }
+        }
+
+        /// Whether a HEAD of the held path has started waiting.
+        fn head_is_held(&self) -> bool {
+            self.held_waiting.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// HEAD of `path` waits until a permit is added to the returned semaphore.
+        fn hold_head(&self, path: &str) -> Arc<tokio::sync::Semaphore> {
+            let permits = Arc::new(tokio::sync::Semaphore::new(0));
+            *self.held.lock() = Some((ObjPath::from(path), Arc::clone(&permits)));
+            permits
+        }
+
+        fn fail_head(&self, path: &str) {
+            self.failing.lock().insert(ObjPath::from(path));
+        }
+
+        fn not_found_once(&self, path: &str) {
+            self.not_found_once.lock().insert(ObjPath::from(path));
+        }
+    }
+
+    impl std::fmt::Display for HeadFailingObjectStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "HeadFailingObjectStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for HeadFailingObjectStore {
+        async fn put_opts(
+            &self,
+            location: &ObjPath,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            opts: object_store::PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn head(&self, location: &ObjPath) -> object_store::Result<object_store::ObjectMeta> {
+            if self.not_found_once.lock().remove(location) {
+                return Err(object_store::Error::NotFound {
+                    path: location.to_string(),
+                    source: "briefly missing".into(),
+                });
+            }
+            if self.failing.lock().contains(location) {
+                return Err(object_store::Error::Generic {
+                    store: "test",
+                    source: "connection reset".into(),
+                });
+            }
+            let held = self
+                .held
+                .lock()
+                .as_ref()
+                .filter(|(path, _)| path == location)
+                .map(|(_, permits)| Arc::clone(permits));
+            if let Some(permits) = held {
+                self.held_waiting
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                let _permit = permits.acquire().await;
+            }
+            self.inner.head(location).await
+        }
+
+        async fn delete(&self, location: &ObjPath) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &ObjPath, to: &ObjPath) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &ObjPath,
+            to: &ObjPath,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
     /// If writing a later output fails, outputs already uploaded by this attempt are deleted.
     #[tokio::test]
     async fn test_failed_compaction_write_deletes_uploaded_outputs() {
@@ -2197,6 +4002,10 @@ mod tests {
             max_files_per_run: 10,
             min_files_for_compaction: 1,
             generation_durations,
+            stale_recheck_delay: Duration::ZERO,
+            index_check_enabled: true,
+            index_check_interval: Duration::ZERO,
+            index_check_max_prune_percent: 100,
         };
 
         // Use .clone() so we can use write_buffer later

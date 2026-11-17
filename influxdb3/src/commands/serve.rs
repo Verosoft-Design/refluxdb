@@ -297,11 +297,10 @@ pub struct Config {
     )]
     pub enable_index_check: bool,
 
-    /// The startup index check removes nothing, and logs an error, when more than this
+    /// A run of the index check removes nothing, and logs an error, when more than this
     /// percentage of the entries it could check look stale. That much usually means object
-    /// storage answering NotFound for objects it holds. The limit also covers compaction jobs:
-    /// between restarts, the check and the jobs together never remove more than this share of
-    /// the index. 100 lifts the limit.
+    /// storage answering NotFound for objects it holds. Compaction jobs never remove entries.
+    /// 100 lifts the limit.
     #[clap(
         long = "index-check-max-prune-percent",
         env = "INFLUXDB3_INDEX_CHECK_MAX_PRUNE_PERCENT",

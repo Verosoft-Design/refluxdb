@@ -14,11 +14,11 @@ use iox_time::MockProvider;
 use metric::Registry;
 use object_store::memory::InMemory;
 
-/// Entries whose object is missing or whose size does not match the object are pruned from the
-/// index (by id and path, so a valid entry sharing the stale entry's path survives) and excluded
-/// from the job.
+/// A job leaves out entries whose object is missing or whose size does not match the object, and
+/// keeps them indexed. The index check then prunes them (by id and path, so a valid entry sharing
+/// a stale entry's path survives). The objects are left alone.
 #[tokio::test]
-async fn drift_check_prunes_missing_and_size_mismatched_entries() {
+async fn drift_check_leaves_stale_entries_out_and_the_index_check_prunes_them() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let time_provider: Arc<dyn TimeProvider> =
         Arc::new(MockProvider::new(iox_time::Time::from_timestamp_nanos(0)));
@@ -191,12 +191,20 @@ async fn drift_check_prunes_missing_and_size_mismatched_entries() {
     assert!(result.compacted_files.is_empty());
     assert!(result.deleted_files.is_empty());
 
+    let mut indexed_after_job = expected_remaining.clone();
+    indexed_after_job.extend([overwritten.clone(), missing.clone()]);
+    indexed_after_job.sort_by_key(|f| f.id);
+    let mut remaining = persisted_files.get_files(db_id, table_id);
+    remaining.sort_by_key(|f| f.id);
+    assert_eq!(remaining, indexed_after_job, "the job pruned stale entries");
+
+    service.check_index_for_missing_files().await;
     let mut remaining = persisted_files.get_files(db_id, table_id);
     remaining.sort_by_key(|f| f.id);
     assert_eq!(
         remaining, expected_remaining,
-        "the overwritten and missing entries are pruned; the valid entry sharing a path with a \
-         stale entry is kept"
+        "the index check prunes the overwritten and missing entries; the valid entry sharing a \
+         path with a stale entry is kept"
     );
 
     // Stale entries are only dropped from the index; the objects are left alone.

@@ -15,8 +15,8 @@ use metric::Registry;
 use object_store::memory::InMemory;
 
 /// Entries whose object is missing or whose size does not match the object are pruned from the
-/// index (by id, so a valid entry sharing the stale entry's path survives) and excluded from the
-/// job.
+/// index (by id and path, so a valid entry sharing the stale entry's path survives) and excluded
+/// from the job.
 #[tokio::test]
 async fn drift_check_prunes_missing_and_size_mismatched_entries() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());

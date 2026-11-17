@@ -928,9 +928,9 @@ impl CompactionService {
         }
         persisted_files.remove_persisted_files(&job.database_id, &job.table_id, old_files);
 
-        // Objects are deleted by path while the index removed entries by id. This assumes no
-        // other index entry shares an input's path, which holds because gen1 paths carry the WAL
-        // sequence number and compacted paths carry a UUID.
+        // The index removed exactly these entries (by id and path), but objects are deleted by
+        // path alone. This assumes no other index entry shares an input's path, which holds
+        // because gen1 paths carry the WAL sequence number and compacted paths carry a UUID.
         for file in old_files {
             let path = ObjPath::from(file.path.clone());
             if let Err(e) = self.object_store.delete(&path).await {

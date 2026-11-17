@@ -2270,6 +2270,55 @@ mod tests {
         );
     }
 
+    /// The tagmobi-dev case, start to finish: stale entries that persisted snapshots still list
+    /// are loaded at startup, the WAL is replayed, the check prunes them, and the next start no
+    /// longer loads them.
+    #[tokio::test]
+    async fn test_startup_index_check_after_a_restart_heals_entries_loaded_from_snapshots() {
+        let h = CompactionHarness::new().await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 130000000000").await;
+        let missing = h.indexed_file_at(10_000_000_000);
+        let kept = h.indexed_file_at(130_000_000_000);
+        h.delete_object(&missing).await;
+        h.write_wal_only("testtable value=3 140000000000").await;
+
+        let (catalog, restarted) = h.restart_loading_all().await;
+        assert_eq!(
+            CompactionHarness::paths_after_restart(&catalog, &restarted),
+            sorted_paths(&[missing.clone(), kept.clone()]),
+            "test setup: the stale entry is loaded from its snapshot"
+        );
+        let service = new_test_service(
+            CompactionConfig {
+                min_files_for_compaction: 10,
+                ..two_minute_gen2_config()
+            },
+            &catalog,
+            &restarted,
+            &h.persister,
+            &h.executor,
+            &h.object_store,
+            Arc::clone(&h.time) as _,
+        );
+        service.check_index_for_missing_files().await;
+
+        let snapshot = h.newest_snapshot().await;
+        assert!(snapshot.databases.is_empty() && !snapshot.removed_files.is_empty());
+        assert_eq!(
+            Some(snapshot.wal_file_sequence_number),
+            restarted
+                .persisted_files()
+                .last_persisted_wal_sequence_number()
+        );
+        let (catalog, restarted_again) = h.restart_loading_all().await;
+        assert_eq!(
+            CompactionHarness::paths_after_restart(&catalog, &restarted_again),
+            vec![kept.path],
+            "the pruned entry came back after the next restart"
+        );
+    }
+
     /// The startup check prunes only on a NotFound or a size mismatch. An entry whose HEAD fails
     /// any other way (a timeout, an unreachable store) is kept, and a check that finds nothing
     /// stale writes no snapshot.

@@ -178,6 +178,10 @@ pub struct CompactionService {
     executor: Arc<Executor>,
     datafusion_config: HashMap<String, String>,
     object_store: Arc<dyn ObjectStore>,
+    /// The store HEADs go to (the drift check and the index check). The server passes the store
+    /// without the parquet memory cache, whose HEAD answers from cached metadata; reads still go
+    /// through `object_store`.
+    head_store: Arc<dyn ObjectStore>,
     object_store_url: ObjectStoreUrl,
     node_identifier_prefix: String,
     time_provider: Arc<dyn TimeProvider>,
@@ -210,6 +214,7 @@ impl CompactionService {
             persister,
             executor,
             datafusion_config,
+            head_store: Arc::clone(&object_store),
             object_store,
             object_store_url,
             node_identifier_prefix: node_identifier_prefix.into(),
@@ -217,6 +222,14 @@ impl CompactionService {
             shutdown_token,
             left_out: Default::default(),
         }
+    }
+
+    /// Send HEADs to `store` instead of the store reads use: the server passes the one without
+    /// the parquet memory cache, so a check sees an object deleted outside refluxdb even while
+    /// its metadata is cached.
+    pub fn with_head_store(mut self, store: Arc<dyn ObjectStore>) -> Self {
+        self.head_store = store;
+        self
     }
 
     fn persisted_files(&self) -> Arc<PersistedFiles> {
@@ -893,7 +906,7 @@ impl CompactionService {
     /// HEAD the object of an index entry.
     async fn check_object(&self, file: &ParquetFile) -> ObjectCheck {
         match self
-            .object_store
+            .head_store
             .head(&ObjPath::from(file.path.as_str()))
             .await
         {
@@ -3405,6 +3418,134 @@ mod tests {
             "an entry was pruned after a single NotFound"
         );
         assert_eq!(h.snapshot_count().await, snapshots);
+    }
+
+    /// Forwards to `inner`, but answers HEAD from what it saw before, as the parquet memory cache
+    /// does for cached objects.
+    #[derive(Debug)]
+    struct CachingHeadObjectStore {
+        inner: Arc<dyn ObjectStore>,
+        seen: parking_lot::Mutex<HashMap<ObjPath, object_store::ObjectMeta>>,
+    }
+
+    impl std::fmt::Display for CachingHeadObjectStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CachingHeadObjectStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for CachingHeadObjectStore {
+        async fn put_opts(
+            &self,
+            location: &ObjPath,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            opts: object_store::PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn head(&self, location: &ObjPath) -> object_store::Result<object_store::ObjectMeta> {
+            if let Some(meta) = self.seen.lock().get(location) {
+                return Ok(meta.clone());
+            }
+            let meta = self.inner.head(location).await?;
+            self.seen.lock().insert(location.clone(), meta.clone());
+            Ok(meta)
+        }
+
+        async fn delete(&self, location: &ObjPath) -> object_store::Result<()> {
+            self.seen.lock().remove(location);
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &ObjPath, to: &ObjPath) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &ObjPath,
+            to: &ObjPath,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    /// With the parquet memory cache in front of the store, HEAD of a cached object answers from
+    /// cached metadata, so a periodic check would keep seeing an object deleted outside refluxdb
+    /// as present (found in a local run). The check HEADs the store without the cache instead.
+    #[tokio::test]
+    async fn test_index_check_heads_past_a_caching_store() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let caching: Arc<dyn ObjectStore> = Arc::new(CachingHeadObjectStore {
+            inner: Arc::clone(&inner),
+            seen: Default::default(),
+        });
+        let h = CompactionHarness::with_object_store(Arc::clone(&caching)).await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 70000000000").await;
+        h.write_gen1("testtable value=3 130000000000").await;
+        let service = new_test_service(
+            two_minute_gen2_config(),
+            &h.catalog,
+            &h.write_buffer,
+            &h.persister,
+            &h.executor,
+            &caching,
+            Arc::clone(&h.time) as _,
+        )
+        .with_head_store(Arc::clone(&inner));
+        // A read through the caching store remembers every object's metadata.
+        for file in h.indexed_files() {
+            caching
+                .head(&ObjPath::from(file.path.as_str()))
+                .await
+                .unwrap();
+        }
+        let deleted = h.indexed_file_at(10_000_000_000);
+        inner
+            .delete(&ObjPath::from(deleted.path.as_str()))
+            .await
+            .unwrap();
+
+        service.check_index_for_missing_files().await;
+
+        assert!(
+            !h.indexed_files().iter().any(|f| f.path == deleted.path),
+            "the check asked the caching store and saw the deleted object as present"
+        );
     }
 
     /// Forwards to `inner`, except for HEAD of the paths set with [`Self::not_found_once`] (the

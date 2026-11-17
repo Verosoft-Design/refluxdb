@@ -787,6 +787,10 @@ pub async fn command(config: Config) -> Result<()> {
         config.object_store_config.bucket.as_ref(),
     ));
 
+    // The store without the parquet memory cache: the compaction service HEADs through it, since
+    // the cache answers HEAD from cached metadata and would hide objects deleted underneath it.
+    let uncached_object_store = Arc::clone(&object_store);
+
     // setup cached object store:
     let (object_store, parquet_cache) = if !config.disable_parquet_mem_cache {
         let (object_store, parquet_cache) = create_cached_obj_store_and_oracle(
@@ -1050,20 +1054,23 @@ pub async fn command(config: Config) -> Result<()> {
             ..Default::default()
         };
 
-        let compaction_service = Arc::new(influxdb3_write::compaction::CompactionService::new(
-            compaction_config,
-            Arc::clone(&catalog),
-            Arc::clone(&write_buffer_impl) as Arc<dyn WriteBuffer>,
-            Arc::clone(&persisted_files),
-            Arc::clone(&persister),
-            Arc::clone(&write_path_executor),
-            config.iox_query_datafusion_config.clone().build(),
-            Arc::clone(&object_store),
-            persister.object_store_url().clone(),
-            config.node_identifier_prefix.clone(),
-            Arc::clone(&time_provider),
-            shutdown_manager.register(),
-        ));
+        let compaction_service = Arc::new(
+            influxdb3_write::compaction::CompactionService::new(
+                compaction_config,
+                Arc::clone(&catalog),
+                Arc::clone(&write_buffer_impl) as Arc<dyn WriteBuffer>,
+                Arc::clone(&persisted_files),
+                Arc::clone(&persister),
+                Arc::clone(&write_path_executor),
+                config.iox_query_datafusion_config.clone().build(),
+                Arc::clone(&object_store),
+                persister.object_store_url().clone(),
+                config.node_identifier_prefix.clone(),
+                Arc::clone(&time_provider),
+                shutdown_manager.register(),
+            )
+            .with_head_store(uncached_object_store),
+        );
 
         compaction_service.start();
         info!("compaction service started");

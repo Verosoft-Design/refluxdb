@@ -42,7 +42,8 @@ pub struct CompactionConfig {
     /// Check every index entry against object storage when the service starts.
     pub index_check_enabled: bool,
     /// The startup check prunes nothing, and logs an error, when more than this percentage of
-    /// the entries it checked are stale. 100 lifts the limit.
+    /// the entries it could check are stale. Afterwards, the check and compaction jobs together
+    /// prune at most this share of those entries until a restart. 100 lifts the limit.
     pub index_check_max_prune_percent: u8,
 }
 
@@ -135,14 +136,20 @@ struct Confirmed {
 type StaleEntries = BTreeMap<(DbId, TableId), Vec<ParquetFile>>;
 
 /// Where the startup index check is. A compaction job persists the prunes its drift check finds
-/// only when no check runs or the check finished without refusing: a refusal means object
-/// storage may be answering NotFound for objects it holds, and a job gets the same answers.
+/// only when no check runs, or the check finished without refusing and the prune fits in what is
+/// left of the limit: a refusal means object storage may be answering NotFound for objects it
+/// holds, and a job gets the same answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IndexCheckState {
     /// No startup check runs: it is disabled, or the service was not started.
     NotRunning,
     Running,
-    Passed,
+    /// The check finished without refusing. `remaining` is how many more entries may be pruned
+    /// before the limit is used up: everything pruned since the start, by the check and by
+    /// jobs, stays within `index_check_max_prune_percent` of the entries the check could check.
+    Passed {
+        remaining: usize,
+    },
     Refused,
 }
 
@@ -477,18 +484,29 @@ impl CompactionService {
                     excluded.remove(&(entry.file.id, entry.file.path.clone()));
                 }
                 if !confirmed.stale.is_empty() {
-                    let check = *self.index_check.lock();
-                    if matches!(check, IndexCheckState::Running | IndexCheckState::Refused) {
-                        // Left out of the job, but kept: only a check that looked at the whole
-                        // index can tell drift from object storage answering wrongly.
-                        warn!(
-                            count = confirmed.stale.len(),
-                            sample = %confirmed.stale[0].file.path,
-                            index_check = ?check,
-                            "Leaving stale inputs out of the compaction job for db={} table={} without pruning them until the startup index check has finished without refusing",
-                            job.database_id, job.table_name
-                        );
-                    } else {
+                    let count = confirmed.stale.len();
+                    // Take the prune out of what is left of the limit before making it, under
+                    // the lock, so concurrent jobs can't overspend it together.
+                    let (check, prune) = {
+                        let mut state = self.index_check.lock();
+                        let check = *state;
+                        let prune = match check {
+                            IndexCheckState::NotRunning => true,
+                            IndexCheckState::Passed { remaining } if count <= remaining => {
+                                *state = IndexCheckState::Passed {
+                                    remaining: remaining - count,
+                                };
+                                true
+                            }
+                            IndexCheckState::Passed { .. } => {
+                                *state = IndexCheckState::Refused;
+                                false
+                            }
+                            IndexCheckState::Running | IndexCheckState::Refused => false,
+                        };
+                        (check, prune)
+                    };
+                    if prune {
                         confirmed.stale.iter().for_each(log_stale);
                         // Persisted now, not with the compaction snapshot: the job may still stop
                         // below the minimum or fail, and the prune must survive a restart either
@@ -497,6 +515,25 @@ impl CompactionService {
                         info!(
                             "Pruned {} stale catalog entries for db={} table={}",
                             pruned, job.database_id, job.table_name
+                        );
+                    } else if let IndexCheckState::Passed { remaining } = check {
+                        error!(
+                            count,
+                            remaining,
+                            max_prune_percent = self.config.index_check_max_prune_percent,
+                            sample = %confirmed.stale[0].file.path,
+                            "a compaction job found more stale inputs than the prune limit has left, so nothing more will be pruned until a restart; check object storage, then raise --index-check-max-prune-percent (INFLUXDB3_INDEX_CHECK_MAX_PRUNE_PERCENT) if the drift is real. db={} table={}",
+                            job.database_id, job.table_name
+                        );
+                    } else {
+                        // Left out of the job, but kept: only a check that looked at the whole
+                        // index can tell drift from object storage answering wrongly.
+                        warn!(
+                            count,
+                            sample = %confirmed.stale[0].file.path,
+                            index_check = ?check,
+                            "Leaving stale inputs out of the compaction job for db={} table={} without pruning them until the startup index check has finished without refusing",
+                            job.database_id, job.table_name
                         );
                     }
                 }
@@ -1047,7 +1084,8 @@ impl CompactionService {
     /// not hold compaction back. That is safe: a job removes its inputs from the index before it
     /// deletes their objects, and only entries the index still holds after the second look are
     /// logged, counted or pruned, so inputs a job compacts meanwhile drop out. Until the check
-    /// has finished without refusing, jobs leave stale inputs out without pruning them. Entries indexed
+    /// has finished without refusing, jobs leave stale inputs out without pruning them; after
+    /// it, they prune only what fits in what is left of the limit (see [`IndexCheckState`]). Entries indexed
     /// after the check starts are not checked: their objects were written before they were indexed.
     async fn check_index_for_missing_files(&self) {
         let started = std::time::Instant::now();
@@ -1127,8 +1165,14 @@ impl CompactionService {
         };
         *self.index_check.lock() = if refused {
             IndexCheckState::Refused
+        } else if max_percent >= 100 {
+            IndexCheckState::Passed {
+                remaining: usize::MAX,
+            }
         } else {
-            IndexCheckState::Passed
+            IndexCheckState::Passed {
+                remaining: (definite * max_percent / 100).saturating_sub(pruned),
+            }
         };
         info!(
             checked,
@@ -2861,6 +2905,82 @@ mod tests {
             h.indexed_files().iter().any(|f| f.path == stale.path),
             "the job pruned an entry after shutdown"
         );
+    }
+
+    /// The limit covers jobs too: everything pruned since the start stays within
+    /// `index_check_max_prune_percent` of the entries the check could check. A job's prune that
+    /// fits is made and counted.
+    #[tokio::test]
+    async fn test_jobs_prune_within_what_is_left_of_the_limit() {
+        let h = CompactionHarness::new().await;
+        for s in [10_i64, 20, 30, 40] {
+            h.write_gen1(&format!("testtable value={s} {}", s * 1_000_000_000))
+                .await;
+        }
+        let limited = h.service_with_config(CompactionConfig {
+            index_check_max_prune_percent: 50,
+            ..two_minute_gen2_config()
+        });
+        limited.check_index_for_missing_files().await;
+        assert_eq!(
+            *limited.index_check.lock(),
+            IndexCheckState::Passed { remaining: 2 }
+        );
+        let stale = h.indexed_file_at(10_000_000_000);
+        h.delete_object(&stale).await;
+        h.set_now(Duration::from_secs(120));
+
+        for job in limited.identify_compaction_jobs().await.unwrap() {
+            limited.execute_compaction_job(job).await.unwrap();
+        }
+
+        assert!(!h.indexed_files().iter().any(|f| f.path == stale.path));
+        assert_eq!(
+            *limited.index_check.lock(),
+            IndexCheckState::Passed { remaining: 1 }
+        );
+    }
+
+    /// A job whose prune doesn't fit in what is left of the limit prunes nothing, and no job
+    /// prunes again until a restart: past the limit, the job's NotFounds are as suspect as a
+    /// refused startup check's. One error line says so.
+    #[tokio::test]
+    async fn test_jobs_stop_pruning_once_the_limit_is_used_up() {
+        let h = CompactionHarness::new().await;
+        for s in [10_i64, 20, 30, 40] {
+            h.write_gen1(&format!("testtable value={s} {}", s * 1_000_000_000))
+                .await;
+        }
+        let limited = h.service_with_config(CompactionConfig {
+            index_check_max_prune_percent: 50,
+            ..two_minute_gen2_config()
+        });
+        limited.check_index_for_missing_files().await;
+        let stale: Vec<ParquetFile> = [10_i64, 20, 30]
+            .iter()
+            .map(|s| h.indexed_file_at(s * 1_000_000_000))
+            .collect();
+        for file in &stale {
+            h.delete_object(file).await;
+        }
+        h.set_now(Duration::from_secs(120));
+
+        let capture = test_helpers::tracing::TracingCapture::new();
+        for job in limited.identify_compaction_jobs().await.unwrap() {
+            limited.execute_compaction_job(job).await.unwrap();
+        }
+        let logs = capture.to_string();
+
+        let indexed = sorted_paths(&h.indexed_files());
+        for file in &stale {
+            assert!(
+                indexed.contains(&file.path),
+                "a job pruned {} past the limit",
+                file.path
+            );
+        }
+        assert_eq!(*limited.index_check.lock(), IndexCheckState::Refused);
+        assert_eq!(logs.matches("level = ERROR").count(), 1, "{logs}");
     }
 
     /// A compaction job must not prune what the startup check refused to: its drift check sees

@@ -1437,12 +1437,24 @@ pub fn setup_metric_registry() -> Arc<metric::Registry> {
 #[cfg(test)]
 mod tests {
     use super::Config;
-    use clap::Parser;
+    use clap::{CommandFactory, FromArgMatches};
     use std::time::Duration;
 
+    /// Parses `serve` arguments, ignoring the environment for the flags under test, so an
+    /// exported `INFLUXDB3_*` variable can't change the defaults these tests assert.
     fn parse(extra: &[&str]) -> Result<Config, clap::Error> {
         let args = ["serve", "--node-id", "test", "--object-store", "memory"];
-        Config::try_parse_from(args.iter().chain(extra))
+        let command = [
+            "enable_index_check",
+            "index_check_interval",
+            "index_check_max_prune_percent",
+        ]
+        .into_iter()
+        .fold(Config::command(), |command, id| {
+            command.mut_arg(id, |arg| arg.env(None::<&'static str>))
+        });
+        let matches = command.try_get_matches_from(args.iter().chain(extra))?;
+        Config::from_arg_matches(&matches)
     }
 
     /// The index check is on by default and can be turned off; it reruns hourly by default (0

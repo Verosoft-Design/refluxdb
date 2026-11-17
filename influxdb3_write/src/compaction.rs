@@ -39,7 +39,8 @@ pub struct CompactionConfig {
     /// How long to wait before looking a second time at an index entry whose object looked
     /// missing or the wrong size. Only an entry that looks stale both times is pruned.
     pub stale_recheck_delay: Duration,
-    /// Check every index entry against object storage when the service starts.
+    /// Check every index entry against object storage when the service starts and every
+    /// `index_check_interval` after that. Off, nothing prunes stale entries: jobs never do.
     pub index_check_enabled: bool,
     /// Run the index check again this long after each run ends. Zero runs it only at startup.
     pub index_check_interval: Duration,
@@ -228,8 +229,8 @@ impl CompactionService {
         // O(n) HTTP requests and prohibitively slow for large catalogs (e.g. 477k files → minutes
         // of sequential HEAD calls before a single job can be identified). Trust the catalog
         // during planning. Missing objects and size mismatches (stale entries for overwritten
-        // objects) are detected and pruned per job in execute_compaction_job, which only HEADs
-        // the files of that job.
+        // objects) are detected per job in execute_compaction_job, which only HEADs the files of
+        // that job and leaves stale ones out; only the index check prunes them.
         Ok(files)
     }
 

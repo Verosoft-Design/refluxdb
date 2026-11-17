@@ -240,33 +240,31 @@ impl CompactionService {
 
             info!("Starting compaction service with interval: {:?}", self.config.interval);
 
-            // Before the first cycle, in this task: no job runs while the check does.
-            if self.config.index_check_enabled {
-                tokio::select! {
-                    _ = self.check_index_for_missing_files() => {}
-                    _ = self.shutdown_token.wait_for_shutdown() => {
-                        info!("Shutdown signal received, stopping compaction service");
-                        return;
+            let check = async {
+                if self.config.index_check_enabled {
+                    self.check_index_for_missing_files().await;
+                } else {
+                    info!("parquet index check is disabled");
+                }
+            };
+            let cycles = async {
+                let mut interval = tokio::time::interval(self.config.interval);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    if let Err(e) = Arc::clone(&self).run_compaction_cycle().await {
+                        error!("Compaction cycle failed: {}", e);
                     }
                 }
-            } else {
-                info!("parquet index check is disabled");
-            }
+            };
 
-            let mut interval = tokio::time::interval(self.config.interval);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        if let Err(e) = Arc::clone(&self).run_compaction_cycle().await {
-                            error!("Compaction cycle failed: {}", e);
-                        }
-                    }
-                    _ = self.shutdown_token.wait_for_shutdown() => {
-                        info!("Shutdown signal received, stopping compaction service");
-                        break;
-                    }
+            // The check runs alongside the cycles, in this task, so shutdown (and aborting the
+            // task) stops both. See `check_index_for_missing_files` for why jobs running at the
+            // same time are safe.
+            tokio::select! {
+                _ = futures::future::join(check, cycles) => {}
+                _ = self.shutdown_token.wait_for_shutdown() => {
+                    info!("Shutdown signal received, stopping compaction service");
                 }
             }
         })
@@ -988,8 +986,13 @@ impl CompactionService {
     ///
     /// One HEAD per entry, at most [`INDEX_CHECK_CONCURRENCY`] at a time. Only a NotFound or a
     /// size mismatch prunes, and only if a second HEAD after `stale_recheck_delay` says the same;
-    /// an entry whose HEAD fails some other way is kept. Run once as the
-    /// service starts, before the first cycle, so no job runs at the same time. Entries indexed
+    /// an entry whose HEAD fails some other way is kept. Nothing is pruned if more than
+    /// `index_check_max_prune_percent` of the entries checked are stale.
+    ///
+    /// Runs once as the service starts, alongside the compaction cycles, so a large index does
+    /// not hold compaction back. That is safe: a job removes its inputs from the index before it
+    /// deletes their objects, and only entries the index still holds after the second look are
+    /// logged, counted or pruned, so inputs a job compacts meanwhile drop out. Entries indexed
     /// after the check starts are not checked: their objects were written before they were indexed.
     async fn check_index_for_missing_files(&self) {
         let started = std::time::Instant::now();
@@ -2630,6 +2633,39 @@ mod tests {
         assert_eq!(sorted_paths(&h.indexed_files()), indexed);
     }
 
+    /// The startup check runs alongside the compaction cycles instead of before them: on a large
+    /// index it takes minutes, and compaction must not wait for it. Here the check is held on
+    /// one HEAD while the first cycle compacts a gen1 file.
+    #[tokio::test]
+    async fn test_startup_index_check_runs_alongside_compaction() {
+        let store = Arc::new(HeadFailingObjectStore::new(Arc::new(InMemory::new())));
+        let h = CompactionHarness::with_object_store(Arc::clone(&store) as _).await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.set_now(Duration::from_secs(120));
+        let gen2 = h.compact().await.remove(0);
+        h.write_gen1("testtable value=2 130000000000").await;
+        let gen1 = h.indexed_file_at(130_000_000_000);
+        h.set_now(Duration::from_secs(240));
+        // gen2 is the top generation, so no job touches it; only the check HEADs it.
+        let release = store.hold_head(&gen2.path);
+
+        let task = Arc::clone(&h.service).start();
+        let still_indexed =
+            |h: &CompactionHarness| h.indexed_files().iter().any(|f| f.path == gen1.path);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while still_indexed(&h) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let compacted = !still_indexed(&h);
+        release.add_permits(1);
+        task.abort();
+
+        assert!(
+            compacted,
+            "no compaction job ran while the startup check was in progress"
+        );
+    }
+
     /// A single NotFound never prunes: object storage that briefly answers NotFound for an object
     /// it holds would otherwise remove the entry for good. The check looks again after
     /// `stale_recheck_delay` and keeps an entry whose object is there the second time.
@@ -2675,12 +2711,14 @@ mod tests {
     }
 
     /// Forwards to `inner`, except for HEAD of the paths set with [`Self::fail_head`] (fails with
-    /// an error other than NotFound) and [`Self::not_found_once`] (the next HEAD says NotFound).
+    /// an error other than NotFound), [`Self::not_found_once`] (the next HEAD says NotFound) and
+    /// [`Self::hold_head`] (HEAD waits for a permit).
     #[derive(Debug)]
     struct HeadFailingObjectStore {
         inner: Arc<dyn ObjectStore>,
         failing: parking_lot::Mutex<Option<ObjPath>>,
         not_found_once: parking_lot::Mutex<HashSet<ObjPath>>,
+        held: parking_lot::Mutex<Option<(ObjPath, Arc<tokio::sync::Semaphore>)>>,
     }
 
     impl HeadFailingObjectStore {
@@ -2689,7 +2727,15 @@ mod tests {
                 inner,
                 failing: Default::default(),
                 not_found_once: Default::default(),
+                held: Default::default(),
             }
+        }
+
+        /// HEAD of `path` waits until a permit is added to the returned semaphore.
+        fn hold_head(&self, path: &str) -> Arc<tokio::sync::Semaphore> {
+            let permits = Arc::new(tokio::sync::Semaphore::new(0));
+            *self.held.lock() = Some((ObjPath::from(path), Arc::clone(&permits)));
+            permits
         }
 
         fn fail_head(&self, path: &str) {
@@ -2740,6 +2786,15 @@ mod tests {
                     store: "test",
                     source: "connection reset".into(),
                 });
+            }
+            let held = self
+                .held
+                .lock()
+                .as_ref()
+                .filter(|(path, _)| path == location)
+                .map(|(_, permits)| Arc::clone(permits));
+            if let Some(permits) = held {
+                let _permit = permits.acquire().await;
             }
             if self.not_found_once.lock().remove(location) {
                 return Err(object_store::Error::NotFound {

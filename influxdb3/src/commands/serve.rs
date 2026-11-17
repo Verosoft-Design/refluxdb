@@ -285,10 +285,11 @@ pub struct Config {
     )]
     pub min_files_for_compaction: usize,
 
-    /// Check every parquet index entry against object storage when compaction starts, alongside
-    /// the first compaction cycle, and remove the entries whose objects are missing or have
-    /// another size. An entry must look stale twice, 30 seconds apart. Runs only when compaction
-    /// is enabled.
+    /// Check every parquet index entry against object storage when compaction starts, and again
+    /// every `--index-check-interval`, alongside compaction, and remove the entries whose objects
+    /// are missing or have another size. An entry must look stale twice, 30 seconds apart.
+    /// Compaction jobs never remove entries, so turning this off stops all pruning. Runs only
+    /// when compaction is enabled.
     #[clap(
         long = "enable-index-check",
         env = "INFLUXDB3_ENABLE_INDEX_CHECK",
@@ -296,6 +297,16 @@ pub struct Config {
         action = clap::ArgAction::Set
     )]
     pub enable_index_check: bool,
+
+    /// How long after one run of the index check ends the next one starts. 0 runs it only at
+    /// startup.
+    #[clap(
+        long = "index-check-interval",
+        env = "INFLUXDB3_INDEX_CHECK_INTERVAL",
+        default_value = "1h",
+        action
+    )]
+    pub index_check_interval: humantime::Duration,
 
     /// A run of the index check removes nothing, and logs an error, when more than this
     /// percentage of the entries it could check look stale. That much usually means object
@@ -1032,6 +1043,7 @@ pub async fn command(config: Config) -> Result<()> {
             min_files_for_compaction: config.min_files_for_compaction,
             generation_durations,
             index_check_enabled: config.enable_index_check,
+            index_check_interval: config.index_check_interval.into(),
             index_check_max_prune_percent: config.index_check_max_prune_percent,
             ..Default::default()
         };
@@ -1426,29 +1438,37 @@ pub fn setup_metric_registry() -> Arc<metric::Registry> {
 mod tests {
     use super::Config;
     use clap::Parser;
+    use std::time::Duration;
 
     fn parse(extra: &[&str]) -> Result<Config, clap::Error> {
         let args = ["serve", "--node-id", "test", "--object-store", "memory"];
         Config::try_parse_from(args.iter().chain(extra))
     }
 
-    /// The index check is on by default and can be turned off; the prune limit defaults to 50%
-    /// and accepts 0 to 100.
+    /// The index check is on by default and can be turned off; it reruns hourly by default (0
+    /// means startup only); the prune limit defaults to 50% and accepts 0 to 100.
     #[test]
     fn index_check_flags() {
         let config = parse(&[]).unwrap();
         assert!(config.enable_index_check);
         assert_eq!(config.index_check_max_prune_percent, 50);
+        assert_eq!(
+            Duration::from(config.index_check_interval),
+            Duration::from_secs(3600)
+        );
 
         let config = parse(&[
             "--enable-index-check",
             "false",
             "--index-check-max-prune-percent",
             "100",
+            "--index-check-interval",
+            "0s",
         ])
         .unwrap();
         assert!(!config.enable_index_check);
         assert_eq!(config.index_check_max_prune_percent, 100);
+        assert_eq!(Duration::from(config.index_check_interval), Duration::ZERO);
 
         assert!(parse(&["--index-check-max-prune-percent", "101"]).is_err());
     }

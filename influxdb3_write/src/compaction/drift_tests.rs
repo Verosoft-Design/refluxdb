@@ -172,6 +172,7 @@ async fn drift_check_leaves_stale_entries_out_and_the_index_check_prunes_them() 
             generation_durations: HashMap::from([(2, Duration::from_secs(120))]),
             stale_recheck_delay: Duration::ZERO,
             index_check_enabled: true,
+            index_check_interval: Duration::ZERO,
             index_check_max_prune_percent: 100,
         },
         Arc::clone(&catalog),

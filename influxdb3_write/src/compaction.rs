@@ -41,6 +41,8 @@ pub struct CompactionConfig {
     pub stale_recheck_delay: Duration,
     /// Check every index entry against object storage when the service starts.
     pub index_check_enabled: bool,
+    /// Run the index check again this long after each run ends. Zero runs it only at startup.
+    pub index_check_interval: Duration,
     /// A run of the index check prunes nothing, and logs an error, when more than this
     /// percentage of the entries it could check are stale. 100 lifts the limit.
     pub index_check_max_prune_percent: u8,
@@ -56,6 +58,7 @@ impl Default for CompactionConfig {
             generation_durations: HashMap::new(),
             stale_recheck_delay: Duration::from_secs(30),
             index_check_enabled: true,
+            index_check_interval: Duration::from_secs(3600),
             index_check_max_prune_percent: 50,
         }
     }
@@ -240,14 +243,25 @@ impl CompactionService {
 
             info!("Starting compaction service with interval: {:?}", self.config.interval);
 
+            // The index check runs at startup and then every `index_check_interval` after the
+            // previous run ends (never two at once). Shutdown ends a run or the wait.
             let check = async {
                 if !self.config.index_check_enabled {
                     info!("parquet index check is disabled");
                     return;
                 }
-                tokio::select! {
-                    _ = self.check_index_for_missing_files() => {}
-                    _ = self.shutdown_token.wait_for_shutdown() => {}
+                loop {
+                    tokio::select! {
+                        _ = self.check_index_for_missing_files() => {}
+                        _ = self.shutdown_token.wait_for_shutdown() => return,
+                    }
+                    if self.config.index_check_interval.is_zero() {
+                        return;
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(self.config.index_check_interval) => {}
+                        _ = self.shutdown_token.wait_for_shutdown() => return,
+                    }
                 }
             };
             let cycles = async {
@@ -981,7 +995,7 @@ impl CompactionService {
         count
     }
 
-    /// Check every index entry against object storage once and prune the ones whose object is
+    /// Check every index entry against object storage and prune the ones whose object is
     /// missing or has another size. Compaction checks only the inputs of its jobs, and a window
     /// with fewer files than `min_files_for_compaction` never gets a job: leftover gen1 files,
     /// most gen2 files and every file of the top generation would keep stale entries forever.
@@ -991,8 +1005,10 @@ impl CompactionService {
     /// an entry whose HEAD fails some other way is kept. Nothing is pruned if more than
     /// `index_check_max_prune_percent` of the entries that got a definite answer are stale.
     ///
-    /// Runs once as the service starts, alongside the compaction cycles, so a large index does
-    /// not hold compaction back. That is safe: a job removes its inputs from the index before it
+    /// Runs as the service starts and then every `index_check_interval`, alongside the compaction
+    /// cycles, so a large index does not hold compaction back and entries that go stale while
+    /// the server runs are pruned without a restart. Each run applies the limit to its own
+    /// count; a refused run is followed by another after the interval. That is safe: a job removes its inputs from the index before it
     /// deletes their objects, and only entries the index still holds after the second look are
     /// logged, counted or pruned, so inputs a job compacts meanwhile drop out. Jobs never prune;
     /// they leave stale inputs out for this check to prune. Entries indexed
@@ -1385,6 +1401,7 @@ mod tests {
             ]),
             stale_recheck_delay: Duration::ZERO,
             index_check_enabled: true,
+            index_check_interval: Duration::ZERO,
             index_check_max_prune_percent: 100,
         }
     }
@@ -1965,6 +1982,7 @@ mod tests {
             ]),
             stale_recheck_delay: Duration::ZERO,
             index_check_enabled: true,
+            index_check_interval: Duration::ZERO,
             index_check_max_prune_percent: 100,
         }
     }
@@ -2671,6 +2689,156 @@ mod tests {
         assert_eq!(h.snapshot_count().await, snapshots);
     }
 
+    /// Waits until `logs()` holds `n` index check summaries, or 10 s pass.
+    async fn wait_for_index_check_runs(logs: impl Fn() -> String, n: usize) -> usize {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let runs = logs()
+                .matches("checked the parquet index against object storage")
+                .count();
+            if runs >= n || std::time::Instant::now() >= deadline {
+                return runs;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The index check runs again after `index_check_interval`, so an entry that goes stale while
+    /// the server runs is pruned without a restart.
+    #[tokio::test]
+    async fn test_index_check_runs_again_after_its_interval() {
+        let h = CompactionHarness::new().await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 70000000000").await;
+        h.write_gen1("testtable value=3 130000000000").await;
+        let service = h.service_with_config(CompactionConfig {
+            min_files_for_compaction: 10,
+            index_check_interval: Duration::from_millis(200),
+            ..two_minute_gen2_config()
+        });
+        let capture = test_helpers::tracing::TracingCapture::new();
+        let task = Arc::clone(&service).start();
+        assert_eq!(
+            wait_for_index_check_runs(|| capture.to_string(), 1).await,
+            1
+        );
+
+        let stale = h.indexed_file_at(10_000_000_000);
+        h.delete_object(&stale).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while h.indexed_files().iter().any(|f| f.path == stale.path)
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        task.abort();
+
+        assert!(
+            !h.indexed_files().iter().any(|f| f.path == stale.path),
+            "no later run pruned the entry that went stale after the first"
+        );
+    }
+
+    /// A refusal lasts until the next run, not until a restart: once the stale share drops below
+    /// the limit, the next run prunes.
+    #[tokio::test]
+    async fn test_a_refused_index_check_run_is_followed_by_one_that_prunes() {
+        let h = CompactionHarness::new().await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 70000000000").await;
+        let stale = h.indexed_files();
+        for file in &stale {
+            h.delete_object(file).await;
+        }
+        let service = h.service_with_config(CompactionConfig {
+            min_files_for_compaction: 10,
+            index_check_interval: Duration::from_millis(200),
+            index_check_max_prune_percent: 50,
+            ..two_minute_gen2_config()
+        });
+        let capture = test_helpers::tracing::TracingCapture::new();
+        let task = Arc::clone(&service).start();
+        assert_eq!(
+            wait_for_index_check_runs(|| capture.to_string(), 1).await,
+            1
+        );
+        assert_eq!(
+            h.indexed_files().len(),
+            2,
+            "test setup: the first run refuses"
+        );
+
+        // Three valid entries make the share 2 of 5, under the 50% limit.
+        for ts in [130, 190, 250] {
+            h.write_gen1(&format!("testtable value={ts} {}", ts * 1_000_000_000_i64))
+                .await;
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while h.indexed_files().len() > 3 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        task.abort();
+
+        let indexed = sorted_paths(&h.indexed_files());
+        assert!(
+            stale.iter().all(|f| !indexed.contains(&f.path)),
+            "the refusal outlived the run that made it"
+        );
+    }
+
+    /// An interval of zero runs the check once, at startup, and never loops.
+    #[tokio::test]
+    async fn test_index_check_with_a_zero_interval_runs_only_at_startup() {
+        let h = CompactionHarness::new().await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 70000000000").await;
+        let service = h.service_with_config(CompactionConfig {
+            min_files_for_compaction: 10,
+            index_check_interval: Duration::ZERO,
+            ..two_minute_gen2_config()
+        });
+        let capture = test_helpers::tracing::TracingCapture::new();
+        let task = Arc::clone(&service).start();
+        assert_eq!(
+            wait_for_index_check_runs(|| capture.to_string(), 1).await,
+            1
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        task.abort();
+
+        assert_eq!(
+            capture
+                .to_string()
+                .matches("checked the parquet index against object storage")
+                .count(),
+            1
+        );
+    }
+
+    /// Shutdown ends the wait between index check runs, so the service stops promptly.
+    #[tokio::test]
+    async fn test_shutdown_ends_the_wait_between_index_check_runs() {
+        let h = CompactionHarness::new().await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        let service = h.service_with_config(CompactionConfig {
+            min_files_for_compaction: 10,
+            index_check_interval: Duration::from_secs(3600),
+            ..two_minute_gen2_config()
+        });
+        let capture = test_helpers::tracing::TracingCapture::new();
+        let task = Arc::clone(&service).start();
+        assert_eq!(
+            wait_for_index_check_runs(|| capture.to_string(), 1).await,
+            1
+        );
+
+        service.shutdown_token.trigger_shutdown();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the compaction service did not stop while waiting for the next index check")
+            .unwrap();
+    }
+
     /// With `index_check_enabled` off, the service starts without checking the index.
     #[tokio::test]
     async fn test_disabled_index_check_does_not_run() {
@@ -3306,6 +3474,7 @@ mod tests {
             generation_durations,
             stale_recheck_delay: Duration::ZERO,
             index_check_enabled: true,
+            index_check_interval: Duration::ZERO,
             index_check_max_prune_percent: 100,
         };
 

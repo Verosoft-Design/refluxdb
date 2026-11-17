@@ -39,6 +39,11 @@ pub struct CompactionConfig {
     /// How long to wait before looking a second time at an index entry whose object looked
     /// missing or the wrong size. Only an entry that looks stale both times is pruned.
     pub stale_recheck_delay: Duration,
+    /// Check every index entry against object storage when the service starts.
+    pub index_check_enabled: bool,
+    /// The startup check prunes nothing, and logs an error, when more than this percentage of
+    /// the entries it checked are stale. 100 lifts the limit.
+    pub index_check_max_prune_percent: u8,
 }
 
 impl Default for CompactionConfig {
@@ -50,6 +55,8 @@ impl Default for CompactionConfig {
             min_files_for_compaction: 10,
             generation_durations: HashMap::new(),
             stale_recheck_delay: Duration::from_secs(30),
+            index_check_enabled: true,
+            index_check_max_prune_percent: 50,
         }
     }
 }
@@ -234,12 +241,16 @@ impl CompactionService {
             info!("Starting compaction service with interval: {:?}", self.config.interval);
 
             // Before the first cycle, in this task: no job runs while the check does.
-            tokio::select! {
-                _ = self.check_index_for_missing_files() => {}
-                _ = self.shutdown_token.wait_for_shutdown() => {
-                    info!("Shutdown signal received, stopping compaction service");
-                    return;
+            if self.config.index_check_enabled {
+                tokio::select! {
+                    _ = self.check_index_for_missing_files() => {}
+                    _ = self.shutdown_token.wait_for_shutdown() => {
+                        info!("Shutdown signal received, stopping compaction service");
+                        return;
+                    }
                 }
+            } else {
+                info!("parquet index check is disabled");
             }
 
             let mut interval = tokio::time::interval(self.config.interval);
@@ -1023,17 +1034,34 @@ impl CompactionService {
 
         let confirmed = self.confirm_stale(candidates).await;
         unknown += confirmed.unknown.len();
-        // A first start after a long drift may find many stale entries: log some, count the
-        // rest. The removal snapshot lists every one of them.
-        confirmed
-            .stale
-            .iter()
-            .take(STALE_LOG_LIMIT)
-            .for_each(log_stale);
-        let not_logged = confirmed.stale.len().saturating_sub(STALE_LOG_LIMIT);
-        let pruned = self.prune_index_entries(by_table(confirmed.stale)).await;
+        let stale = confirmed.stale.len();
+        let max_percent = usize::from(self.config.index_check_max_prune_percent);
+        let (pruned, not_logged) = if stale * 100 > checked * max_percent {
+            // Far more than drift leaves behind: more likely object storage answering NotFound
+            // for objects it holds. Pruning would hide their rows for good, so keep everything.
+            error!(
+                checked,
+                stale,
+                max_prune_percent = max_percent,
+                sample = ?confirmed.stale.iter().take(5).map(|e| e.file.path.as_str()).collect::<Vec<_>>(),
+                "too much of the parquet index looks stale to prune safely, so no entry was removed; check object storage, then set --index-check-max-prune-percent (INFLUXDB3_INDEX_CHECK_MAX_PRUNE_PERCENT) to 100 to prune them"
+            );
+            (0, 0)
+        } else {
+            // A first start after a long drift may find many stale entries: log some, count the
+            // rest. The removal snapshot lists every one of them.
+            confirmed
+                .stale
+                .iter()
+                .take(STALE_LOG_LIMIT)
+                .for_each(log_stale);
+            let not_logged = stale.saturating_sub(STALE_LOG_LIMIT);
+            let pruned = self.prune_index_entries(by_table(confirmed.stale)).await;
+            (pruned, not_logged)
+        };
         info!(
             checked,
+            stale,
             pruned,
             not_logged,
             cleared = confirmed.cleared.len(),
@@ -1342,6 +1370,8 @@ mod tests {
                 (2, Duration::from_secs(120)),
             ]),
             stale_recheck_delay: Duration::ZERO,
+            index_check_enabled: true,
+            index_check_max_prune_percent: 100,
         }
     }
 
@@ -1920,6 +1950,8 @@ mod tests {
                 (2, Duration::from_secs(86_400)),
             ]),
             stale_recheck_delay: Duration::ZERO,
+            index_check_enabled: true,
+            index_check_max_prune_percent: 100,
         }
     }
 
@@ -2519,6 +2551,85 @@ mod tests {
         assert!(logs.contains("not_logged = 2"), "{logs}");
     }
 
+    /// The startup check prunes nothing when a larger share of the index looks stale than
+    /// `index_check_max_prune_percent` allows. Object storage that answers NotFound for objects it
+    /// holds (a wrong bucket or prefix, MinIO drives not yet healed) must not empty the index.
+    /// One error line says so, and a limit of 100 lets the same check prune.
+    #[tokio::test]
+    async fn test_startup_index_check_refuses_to_prune_most_of_the_index() {
+        let h = CompactionHarness::new().await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 70000000000").await;
+        h.write_gen1("testtable value=3 130000000000").await;
+        for ts in [10_000_000_000, 70_000_000_000] {
+            h.delete_object(&h.indexed_file_at(ts)).await;
+        }
+        let indexed = sorted_paths(&h.indexed_files());
+        let snapshots = h.snapshot_count().await;
+
+        let limited = h.service_with_config(CompactionConfig {
+            index_check_max_prune_percent: 50,
+            ..two_minute_gen2_config()
+        });
+        let capture = test_helpers::tracing::TracingCapture::new();
+        limited.check_index_for_missing_files().await;
+        let logs = capture.to_string();
+
+        assert_eq!(
+            sorted_paths(&h.indexed_files()),
+            indexed,
+            "two of three entries looked stale and the check pruned them with a 50% limit"
+        );
+        assert_eq!(h.snapshot_count().await, snapshots);
+        assert_eq!(logs.matches("level = ERROR").count(), 1, "{logs}");
+
+        let unlimited = h.service_with_config(CompactionConfig {
+            index_check_max_prune_percent: 100,
+            ..two_minute_gen2_config()
+        });
+        unlimited.check_index_for_missing_files().await;
+        assert_eq!(
+            sorted_paths(&h.indexed_files()),
+            vec![h.indexed_file_at(130_000_000_000).path],
+        );
+    }
+
+    /// With `index_check_enabled` off, the service starts without checking the index.
+    #[tokio::test]
+    async fn test_disabled_index_check_does_not_run() {
+        let h = CompactionHarness::new().await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 70000000000").await;
+        h.delete_object(&h.indexed_file_at(10_000_000_000)).await;
+        let indexed = sorted_paths(&h.indexed_files());
+
+        let service = h.service_with_config(CompactionConfig {
+            index_check_enabled: false,
+            min_files_for_compaction: 10,
+            ..two_minute_gen2_config()
+        });
+        let capture = test_helpers::tracing::TracingCapture::new();
+        let task = Arc::clone(&service).start();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !capture
+            .to_string()
+            .contains("parquet index check is disabled")
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        task.abort();
+
+        assert!(
+            capture
+                .to_string()
+                .contains("parquet index check is disabled"),
+            "{capture}"
+        );
+        assert_eq!(sorted_paths(&h.indexed_files()), indexed);
+    }
+
     /// A single NotFound never prunes: object storage that briefly answers NotFound for an object
     /// it holds would otherwise remove the entry for good. The check looks again after
     /// `stale_recheck_delay` and keeps an entry whose object is there the second time.
@@ -2990,6 +3101,8 @@ mod tests {
             min_files_for_compaction: 1,
             generation_durations,
             stale_recheck_delay: Duration::ZERO,
+            index_check_enabled: true,
+            index_check_max_prune_percent: 100,
         };
 
         // Use .clone() so we can use write_buffer later

@@ -1064,6 +1064,13 @@ impl CompactionService {
         // Only entries with a definite answer (present, missing, other size) say anything about
         // the index; a store that times out on most requests must not make the rest look small.
         let definite = checked - unknown;
+        if checked > 0 && definite == 0 {
+            warn!(
+                checked,
+                unknown,
+                "no parquet index entry could be checked: every HEAD failed some other way than NotFound, so nothing was pruned this run"
+            );
+        }
         let refused = stale * 100 > definite * max_percent;
         let (pruned, not_logged) = if refused {
             // Far more than drift leaves behind: more likely object storage answering NotFound
@@ -2872,6 +2879,28 @@ mod tests {
         assert!(
             kept.is_empty(),
             "an entry replaced with another size counts as the entry that was checked"
+        );
+    }
+
+    /// A run in which no entry got a definite answer (every HEAD failed some other way) checked
+    /// nothing. It says so at warn, instead of only an info summary that reads like a clean run.
+    #[tokio::test]
+    async fn test_index_check_warns_when_no_entry_could_be_checked() {
+        let store = Arc::new(HeadFailingObjectStore::new(Arc::new(InMemory::new())));
+        let h = CompactionHarness::with_object_store(Arc::clone(&store) as _).await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 70000000000").await;
+        for file in h.indexed_files() {
+            store.fail_head(&file.path);
+        }
+
+        let capture = test_helpers::tracing::TracingCapture::new();
+        h.service.check_index_for_missing_files().await;
+        let logs = capture.to_string();
+
+        assert!(
+            logs.contains("level = WARN; message = no parquet index entry could be checked"),
+            "{logs}"
         );
     }
 

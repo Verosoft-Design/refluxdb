@@ -1915,6 +1915,10 @@ async fn record_batch_stream_to_body(
                     mut self: Pin<&mut Self>,
                     ctx: &mut std::task::Context<'_>,
                 ) -> Poll<Self::Output> {
+                    // The closing bytes are out and the stream has ended; don't poll it again.
+                    if matches!(self.state, State::Done) {
+                        return Poll::Ready(None);
+                    }
                     match self.stream.poll_next_unpin(ctx) {
                         Poll::Ready(Some(batch)) => {
                             let batch = match batch {
@@ -2609,6 +2613,66 @@ mod tests {
                 panic!("{format:?} after batches {sizes:?}: the error was left to the body")
             });
             assert!(err.to_string().contains(MISSING_OBJECT), "{err}");
+        }
+    }
+
+    use futures::Stream;
+    use std::pin::Pin;
+    use std::task::Poll;
+
+    /// A record batch stream that panics if polled again after it ended. Streams in general
+    /// don't promise that a poll after `None` is safe.
+    struct PanicsWhenPolledAfterEnd {
+        batches: std::vec::IntoIter<datafusion::error::Result<RecordBatch>>,
+        ended: bool,
+    }
+
+    impl Stream for PanicsWhenPolledAfterEnd {
+        type Item = datafusion::error::Result<RecordBatch>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _ctx: &mut std::task::Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            assert!(!self.ended, "the stream was polled after it ended");
+            let next = self.batches.next();
+            self.ended = next.is_none();
+            Poll::Ready(next)
+        }
+    }
+
+    /// No encoder polls the record batch stream again once it has ended.
+    #[tokio::test]
+    async fn test_encoders_stop_polling_a_finished_stream() {
+        let schema = record_batch!(("a", Int32, [1])).unwrap().schema();
+        for format in [
+            QueryFormat::Json,
+            QueryFormat::JsonLines,
+            QueryFormat::Csv,
+            QueryFormat::Pretty,
+            QueryFormat::Parquet,
+        ] {
+            for sizes in [vec![], vec![0], vec![1, 2]] {
+                let batches: Vec<_> = sizes
+                    .iter()
+                    .map(|&n| {
+                        Ok(RecordBatch::try_new(
+                            Arc::clone(&schema),
+                            vec![Arc::new(Int32Array::from_iter_values(vec![1; n]))],
+                        )
+                        .unwrap())
+                    })
+                    .collect();
+                let stream = Box::pin(RecordBatchStreamAdapter::new(
+                    Arc::clone(&schema),
+                    PanicsWhenPolledAfterEnd {
+                        batches: batches.into_iter(),
+                        ended: false,
+                    },
+                ));
+                let body = record_batch_stream_to_body(stream, format).await.unwrap();
+                read_body_bytes_for_tests(body).await;
+            }
         }
     }
 

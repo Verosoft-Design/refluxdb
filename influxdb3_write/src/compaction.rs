@@ -1059,6 +1059,14 @@ impl CompactionService {
             info!("shutdown during the parquet index check; nothing was pruned");
             return;
         };
+        if let Some((entry, error)) = confirmed.unknown.first() {
+            warn!(
+                path = %entry.file.path,
+                %error,
+                failed = confirmed.unknown.len(),
+                "could not check a parquet index entry on the second look; keeping it"
+            );
+        }
         unknown += confirmed.unknown.len();
         let stale = confirmed.stale.len();
         let max_percent = usize::from(self.config.index_check_max_prune_percent);
@@ -2905,6 +2913,33 @@ mod tests {
         );
     }
 
+    /// An entry that looked missing but whose second HEAD fails some other way is kept, and the
+    /// failure is logged with its path, as the first look's failures are.
+    #[tokio::test]
+    async fn test_index_check_logs_a_second_look_failure() {
+        let store = Arc::new(HeadFailingObjectStore::new(Arc::new(InMemory::new())));
+        let h = CompactionHarness::with_object_store(Arc::clone(&store) as _).await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 70000000000").await;
+        let flaky = h.indexed_file_at(10_000_000_000);
+        store.not_found_once(&flaky.path);
+        store.fail_head(&flaky.path);
+
+        let capture = test_helpers::tracing::TracingCapture::new();
+        h.service.check_index_for_missing_files().await;
+        let logs = capture.to_string();
+
+        assert!(h.indexed_files().iter().any(|f| f.path == flaky.path));
+        let line = logs
+            .lines()
+            .find(|l| l.contains("on the second look"))
+            .unwrap_or_else(|| panic!("no second-look warning: {logs}"));
+        assert!(
+            line.contains("level = WARN") && line.contains(&flaky.path),
+            "{line}"
+        );
+    }
+
     /// With `index_check_enabled` off, the service starts without checking the index.
     #[tokio::test]
     async fn test_disabled_index_check_does_not_run() {
@@ -3084,9 +3119,9 @@ mod tests {
         assert_eq!(h.snapshot_count().await, snapshots);
     }
 
-    /// Forwards to `inner`, except for HEAD of the paths set with [`Self::fail_head`] (fails with
-    /// an error other than NotFound), [`Self::not_found_once`] (the next HEAD says NotFound) and
-    /// [`Self::hold_head`] (HEAD waits for a permit).
+    /// Forwards to `inner`, except for HEAD of the paths set with [`Self::not_found_once`] (the
+    /// next HEAD says NotFound), [`Self::fail_head`] (fails with an error other than NotFound,
+    /// after any NotFound-once) and [`Self::hold_head`] (HEAD waits for a permit).
     #[derive(Debug)]
     struct HeadFailingObjectStore {
         inner: Arc<dyn ObjectStore>,
@@ -3162,6 +3197,12 @@ mod tests {
         }
 
         async fn head(&self, location: &ObjPath) -> object_store::Result<object_store::ObjectMeta> {
+            if self.not_found_once.lock().remove(location) {
+                return Err(object_store::Error::NotFound {
+                    path: location.to_string(),
+                    source: "briefly missing".into(),
+                });
+            }
             if self.failing.lock().contains(location) {
                 return Err(object_store::Error::Generic {
                     store: "test",
@@ -3178,12 +3219,6 @@ mod tests {
                 self.held_waiting
                     .store(true, std::sync::atomic::Ordering::SeqCst);
                 let _permit = permits.acquire().await;
-            }
-            if self.not_found_once.lock().remove(location) {
-                return Err(object_store::Error::NotFound {
-                    path: location.to_string(),
-                    source: "briefly missing".into(),
-                });
             }
             self.inner.head(location).await
         }

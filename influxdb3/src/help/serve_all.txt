@@ -63,6 +63,18 @@ Examples:
                                   [env: INFLUXDB3_MAX_COMPACTION_FILES=]
   --min-files-for-compaction <N>   Minimum files required for compaction [default: 10]
                                   [env: INFLUXDB3_MIN_FILES_FOR_COMPACTION=]
+  --enable-index-check <BOOL>      Check every parquet index entry against object storage at
+                                  startup and every --index-check-interval, and remove entries
+                                  whose objects are missing or have another size [default: true]
+                                  [env: INFLUXDB3_ENABLE_INDEX_CHECK=]
+  --index-check-interval <INTERVAL>
+                                   Time from the end of one index check to the start of the next;
+                                   0 runs it only at startup [default: 1h]
+                                  [env: INFLUXDB3_INDEX_CHECK_INTERVAL=]
+  --index-check-max-prune-percent <PERCENT>
+                                   Remove none of a database's entries when more than this share
+                                   of them look stale; 100 lifts the limit [default: 50]
+                                  [env: INFLUXDB3_INDEX_CHECK_MAX_PRUNE_PERCENT=]
   --gen1-lookback-duration <DURATION>
                                    The amount of time that the server looks back on startup
                                    when populating the in-memory index of gen1 files.

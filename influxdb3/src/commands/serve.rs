@@ -298,12 +298,13 @@ pub struct Config {
     )]
     pub enable_index_check: bool,
 
-    /// How long after one run of the index check ends the next one starts. 0 runs it only at
-    /// startup.
+    /// How long after one run of the index check ends the next one starts, e.g. `30m` or `2h`.
+    /// 0 runs it only at startup.
     #[clap(
         long = "index-check-interval",
         env = "INFLUXDB3_INDEX_CHECK_INTERVAL",
         default_value = "1h",
+        value_parser = parse_index_check_interval,
         action
     )]
     pub index_check_interval: humantime::Duration,
@@ -1434,6 +1435,16 @@ pub fn setup_metric_registry() -> Arc<metric::Registry> {
     registry
 }
 
+/// A humantime duration, or a bare `0` for "startup only": humantime alone needs a unit.
+fn parse_index_check_interval(
+    value: &str,
+) -> Result<humantime::Duration, humantime::DurationError> {
+    if value.trim() == "0" {
+        return Ok(std::time::Duration::ZERO.into());
+    }
+    value.parse()
+}
+
 #[cfg(test)]
 mod tests {
     use super::Config;
@@ -1483,5 +1494,10 @@ mod tests {
         assert_eq!(Duration::from(config.index_check_interval), Duration::ZERO);
 
         assert!(parse(&["--index-check-max-prune-percent", "101"]).is_err());
+
+        // The help says 0 means startup only, so a bare 0 must parse (humantime alone needs a
+        // unit, and a pod with INFLUXDB3_INDEX_CHECK_INTERVAL=0 would not start).
+        let config = parse(&["--index-check-interval", "0"]).unwrap();
+        assert_eq!(Duration::from(config.index_check_interval), Duration::ZERO);
     }
 }

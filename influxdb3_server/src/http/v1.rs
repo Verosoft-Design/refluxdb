@@ -269,7 +269,7 @@ struct QueryResponse {
     format: QueryFormat,
 }
 
-/// Convert `QueryResponse` to [`Bytes`] for the [`stream_results_to_response_body`] method
+/// Convert `QueryResponse` to [`Bytes`] for [`super::start_response_body`]
 impl From<QueryResponse> for Bytes {
     fn from(s: QueryResponse) -> Self {
         /// Convert a [`QueryResponse`] to a JSON byte vector.

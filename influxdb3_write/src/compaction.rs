@@ -81,6 +81,9 @@ pub struct CompactionResult {
 /// runs.
 const INDEX_CHECK_CONCURRENCY: usize = 16;
 
+/// Stale entries the startup check logs one by one; it counts the rest in its summary.
+const STALE_LOG_LIMIT: usize = 20;
+
 /// What object storage says about an index entry.
 #[derive(Debug)]
 enum ObjectCheck {
@@ -1020,11 +1023,19 @@ impl CompactionService {
 
         let confirmed = self.confirm_stale(candidates).await;
         unknown += confirmed.unknown.len();
-        confirmed.stale.iter().for_each(log_stale);
+        // A first start after a long drift may find many stale entries: log some, count the
+        // rest. The removal snapshot lists every one of them.
+        confirmed
+            .stale
+            .iter()
+            .take(STALE_LOG_LIMIT)
+            .for_each(log_stale);
+        let not_logged = confirmed.stale.len().saturating_sub(STALE_LOG_LIMIT);
         let pruned = self.prune_index_entries(by_table(confirmed.stale)).await;
         info!(
             checked,
             pruned,
+            not_logged,
             cleared = confirmed.cleared.len(),
             unknown,
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -2479,6 +2490,33 @@ mod tests {
             snapshots,
             "a check that found nothing stale wrote a snapshot"
         );
+    }
+
+    /// A first start of the new image may prune many entries at once (tagmobi-prod logged 134765
+    /// stale entries in July). The startup check logs the first [`STALE_LOG_LIMIT`] paths and
+    /// counts the rest in its summary; the removal snapshot lists all of them.
+    #[tokio::test]
+    async fn test_startup_index_check_logs_the_first_stale_paths_and_counts_the_rest() {
+        let h = CompactionHarness::new().await;
+        let stale = STALE_LOG_LIMIT + 2;
+        for i in 0..stale {
+            let ts = (10 + 60 * i as u64) * 1_000_000_000;
+            h.write_gen1(&format!("testtable value={i} {ts}")).await;
+            h.delete_object(&h.indexed_file_at(ts as i64)).await;
+        }
+
+        let capture = test_helpers::tracing::TracingCapture::new();
+        h.service.check_index_for_missing_files().await;
+        let logs = capture.to_string();
+
+        assert!(h.indexed_files().is_empty(), "every stale entry is pruned");
+        assert_eq!(
+            logs.matches("Skipping missing parquet file in catalog")
+                .count(),
+            STALE_LOG_LIMIT,
+            "{logs}"
+        );
+        assert!(logs.contains("not_logged = 2"), "{logs}");
     }
 
     /// A single NotFound never prunes: object storage that briefly answers NotFound for an object

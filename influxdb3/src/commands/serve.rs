@@ -1006,6 +1006,7 @@ pub async fn command(config: Config) -> Result<()> {
             max_files_per_run: config.max_compaction_files,
             min_files_for_compaction: config.min_files_for_compaction,
             generation_durations,
+            ..Default::default()
         };
 
         let compaction_service = Arc::new(influxdb3_write::compaction::CompactionService::new(

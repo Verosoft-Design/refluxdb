@@ -170,6 +170,7 @@ async fn drift_check_prunes_missing_and_size_mismatched_entries() {
             max_files_per_run: 10,
             min_files_for_compaction: 100,
             generation_durations: HashMap::from([(2, Duration::from_secs(120))]),
+            stale_recheck_delay: Duration::ZERO,
         },
         Arc::clone(&catalog),
         Arc::clone(&write_buffer) as Arc<dyn WriteBuffer>,

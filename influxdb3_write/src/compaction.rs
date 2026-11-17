@@ -901,7 +901,11 @@ impl CompactionService {
             match self.persister.persist_snapshot(&persisted_snapshot).await {
                 Ok(_) => break,
                 Err(e) => {
-                    error!(%e, "Error persisting compaction snapshot, sleeping and retrying...");
+                    error!(
+                        %e,
+                        snapshot_sequence_number = snapshot_sequence_number.as_u64(),
+                        "Error persisting index snapshot (compaction or prune), sleeping and retrying..."
+                    );
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }

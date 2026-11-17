@@ -272,16 +272,18 @@ impl CompactionService {
                 let mut interval = tokio::time::interval(self.config.interval);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
-                    // A cycle that has started runs to the end; shutdown is checked between them.
+                    // A cycle that has started runs to the end; shutdown is checked between them,
+                    // and wins over a tick that came due while the last cycle ran.
                     tokio::select! {
+                        biased;
+                        _ = self.shutdown_token.wait_for_shutdown() => {
+                            info!("Shutdown signal received, stopping compaction service");
+                            break;
+                        }
                         _ = interval.tick() => {
                             if let Err(e) = Arc::clone(&self).run_compaction_cycle().await {
                                 error!("Compaction cycle failed: {}", e);
                             }
-                        }
-                        _ = self.shutdown_token.wait_for_shutdown() => {
-                            info!("Shutdown signal received, stopping compaction service");
-                            break;
                         }
                     }
                 }
@@ -457,7 +459,13 @@ impl CompactionService {
                 .map(|c| (c.file.id, c.file.path.clone()))
                 .collect();
             if !candidates.is_empty() {
-                let confirmed = self.confirm_stale(candidates).await;
+                let Some(confirmed) = self.confirm_stale(candidates).await else {
+                    return Err(anyhow::anyhow!(
+                        "shutdown during the drift check of db={} table={}; nothing compacted or pruned",
+                        job.database_id,
+                        job.table_name
+                    ));
+                };
                 if let Some((_, e)) = confirmed.unknown.into_iter().next() {
                     return Err(e.into());
                 }
@@ -945,13 +953,17 @@ impl CompactionService {
     /// Look again, after `stale_recheck_delay`, at entries that looked stale. A single NotFound
     /// or size mismatch never prunes: object storage that briefly answers wrongly for objects it
     /// holds would otherwise remove their entries for good, and their rows with them. Entries
-    /// the index no longer holds are dropped before and after the wait.
-    async fn confirm_stale(&self, candidates: Vec<StaleEntry>) -> Confirmed {
+    /// the index no longer holds are dropped before and after the wait. Returns `None` if
+    /// shutdown starts during the wait; nothing has been changed by then.
+    async fn confirm_stale(&self, candidates: Vec<StaleEntry>) -> Option<Confirmed> {
         let candidates = self.still_indexed(candidates);
         if candidates.is_empty() {
-            return Confirmed::default();
+            return Some(Confirmed::default());
         }
-        tokio::time::sleep(self.config.stale_recheck_delay).await;
+        tokio::select! {
+            _ = tokio::time::sleep(self.config.stale_recheck_delay) => {}
+            _ = self.shutdown_token.wait_for_shutdown() => return None,
+        }
 
         let mut confirmed = Confirmed::default();
         let mut stale = Vec::new();
@@ -969,7 +981,7 @@ impl CompactionService {
             }
         }
         confirmed.stale = self.still_indexed(stale);
-        confirmed
+        Some(confirmed)
     }
 
     /// Remove stale index entries durably: a snapshot lists them in `removed_files` before they
@@ -1074,7 +1086,10 @@ impl CompactionService {
         }
         drop(results);
 
-        let confirmed = self.confirm_stale(candidates).await;
+        let Some(confirmed) = self.confirm_stale(candidates).await else {
+            info!("shutdown during the parquet index check; nothing was pruned");
+            return;
+        };
         unknown += confirmed.unknown.len();
         let stale = confirmed.stale.len();
         let max_percent = usize::from(self.config.index_check_max_prune_percent);
@@ -2807,6 +2822,40 @@ mod tests {
         assert!(
             inputs.iter().all(|p| !indexed.contains(p)),
             "the running job was dropped at shutdown; still indexed: {indexed:?}"
+        );
+    }
+
+    /// A job's second look waits `stale_recheck_delay`. Shutdown ends the wait, and the job stops
+    /// without pruning: nothing is saved before the second look, so stopping there is safe.
+    #[tokio::test]
+    async fn test_shutdown_ends_a_jobs_second_look_wait() {
+        let h = CompactionHarness::new().await;
+        h.write_gen1("testtable value=1 10000000000").await;
+        h.write_gen1("testtable value=2 20000000000").await;
+        let stale = h.indexed_file_at(10_000_000_000);
+        h.delete_object(&stale).await;
+        h.set_now(Duration::from_secs(120));
+        let service = h.service_with_config(CompactionConfig {
+            stale_recheck_delay: Duration::from_secs(600),
+            ..two_minute_gen2_config()
+        });
+        let job = service.identify_compaction_jobs().await.unwrap().remove(0);
+
+        let running = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.execute_compaction_job(job).await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        service.shutdown_token.trigger_shutdown();
+        let result = tokio::time::timeout(Duration::from_secs(10), running)
+            .await
+            .expect("the job kept waiting after shutdown")
+            .unwrap();
+
+        assert!(result.is_err(), "the job carried on after shutdown");
+        assert!(
+            h.indexed_files().iter().any(|f| f.path == stale.path),
+            "the job pruned an entry after shutdown"
         );
     }
 

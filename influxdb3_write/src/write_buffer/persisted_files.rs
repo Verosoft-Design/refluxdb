@@ -2,6 +2,7 @@
 //! When queries come in they will combine whatever chunks exist from `QueryableBuffer` with
 //! the persisted files to get the full set of data to query.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::deleter::ObjectDeleter;
@@ -14,7 +15,7 @@ use influxdb3_id::{DbId, SerdeVecMap};
 use influxdb3_telemetry::ParquetMetrics;
 use influxdb3_wal::WalFileSequenceNumber;
 use observability_deps::tracing::warn;
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 
 type DatabaseToTables = HashMap<DbId, TableToFiles>;
 type TableToFiles = HashMap<TableId, Vec<ParquetFile>>;
@@ -197,32 +198,31 @@ impl PersistedFiles {
         files
     }
 
-    /// Remove files that are marked for deletion or that violate their retention period.
+    /// Remove the entries of files that are marked for deletion or that violate their retention
+    /// period, and return the removed entries by database and table.
+    ///
+    /// Each due entry is removed by database, table, [`ParquetFileId`] and path, like
+    /// [`Self::remove_persisted_files`]. An entry that only shares an id with a due entry stays
+    /// indexed (builds before TAG-2495 could reuse ids after a restart). The returned map holds
+    /// exactly the entries removed from the index and from the metrics. The caller records them
+    /// in the next snapshot's `removed_files` and deletes their objects.
     pub fn remove_files_for_deletion(
         &self,
         catalog: Arc<Catalog>,
     ) -> SerdeVecMap<DbId, DatabaseTables> {
-        let mut removed: SerdeVecMap<DbId, DatabaseTables> = SerdeVecMap::new();
-        let mut removed_ids: HashSet<ParquetFileId> = HashSet::new();
+        // The scan holds an upgradable read lock, so queries keep running alongside it. Upgrading
+        // it to the write lock is atomic: nothing changes the index or the delete marks between
+        // the scan and the removal.
+        let guard = self.inner.upgradable_read();
 
-        // First pass is under a read lock to permit queries running concurrently.
+        // The id and path of each due entry, by table. A set, so each entry is queued once.
+        let mut due: BTreeMap<(DbId, TableId), HashSet<(ParquetFileId, String)>> = BTreeMap::new();
         {
             let mut queue_for_removal = |db_id: DbId, table_id: TableId, file: &ParquetFile| {
-                // Guard to prevent adding a file more than once.
-                if !removed_ids.insert(file.id) {
-                    return;
-                }
-
-                removed
-                    .entry(db_id)
+                due.entry((db_id, table_id))
                     .or_default()
-                    .tables
-                    .entry(table_id)
-                    .or_default()
-                    .push(file.clone());
+                    .insert((file.id, file.path.clone()));
             };
-
-            let guard = self.inner.read();
 
             // Remove any data marked for hard-deletion.
             for (db_id, deleted) in guard.deleted_data.iter() {
@@ -279,22 +279,43 @@ impl PersistedFiles {
 
         // if no persisted files are found to be in violation of their retention period, then
         // return an empty result to avoid unnecessarily acquiring a write lock
-        if removed.is_empty() {
-            return removed;
+        if due.is_empty() {
+            return SerdeVecMap::new();
         }
 
-        let mut guard = self.inner.write();
+        let mut guard = RwLockUpgradableReadGuard::upgrade(guard);
+        // The result is built from the entries this pass removes, so it always describes the same
+        // entries as the index and the metrics.
+        let mut removed: SerdeVecMap<DbId, DatabaseTables> = SerdeVecMap::new();
         let mut actually_removed = Removed::default();
-        for (_, tables) in guard.files.iter_mut() {
-            for (_, files) in tables.iter_mut() {
-                files.retain(|file| {
-                    if removed_ids.contains(&file.id) {
-                        actually_removed.add(file);
-                        false
-                    } else {
-                        true
-                    }
-                })
+        for ((db_id, table_id), due_in_table) in &due {
+            let Some(files) = guard
+                .files
+                .get_mut(db_id)
+                .and_then(|tables| tables.get_mut(table_id))
+            else {
+                continue;
+            };
+            let due_in_table: HashSet<(ParquetFileId, &str)> = due_in_table
+                .iter()
+                .map(|(id, path)| (*id, path.as_str()))
+                .collect();
+            let mut removed_from_table = Vec::new();
+            files.retain(|file| {
+                if due_in_table.contains(&(file.id, file.path.as_str())) {
+                    actually_removed.add(file);
+                    removed_from_table.push(file.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            if !removed_from_table.is_empty() {
+                removed
+                    .entry(*db_id)
+                    .or_default()
+                    .tables
+                    .insert(*table_id, removed_from_table);
             }
         }
         guard.subtract(&actually_removed);
@@ -405,7 +426,8 @@ impl Inner {
     /// Add all files from a persisted snapshot and apply its removals.
     ///
     /// Files are added with [`Self::add_persisted_file`] semantics (a file whose path is already
-    /// indexed replaces the existing entry), and removals match by [`ParquetFileId`].
+    /// indexed replaces the existing entry). Removals match by [`ParquetFileId`] and path, like
+    /// the snapshot loader's: an entry that only shares an id with a removed file stays.
     pub(crate) fn add_persisted_snapshot(&mut self, persisted_snapshot: PersistedSnapshot) {
         let mut added = Removed::default();
         let mut replaced = Removed::default();
@@ -430,10 +452,11 @@ impl Inner {
                 else {
                     continue;
                 };
-                let ids: HashSet<ParquetFileId> = files.iter().map(|f| f.id).collect();
+                let to_remove: HashSet<(ParquetFileId, &str)> =
+                    files.iter().map(|f| (f.id, f.path.as_str())).collect();
                 let mut removed = Removed::default();
                 table_files.retain(|file| {
-                    if ids.contains(&file.id) {
+                    if to_remove.contains(&(file.id, file.path.as_str())) {
                         removed.add(file);
                         false
                     } else {
@@ -581,14 +604,18 @@ mod tests {
     use datafusion::prelude::Expr;
     use datafusion::prelude::col;
     use datafusion::prelude::lit_timestamp_nano;
+    use influxdb3_catalog::catalog::CatalogArgs;
     use influxdb3_catalog::catalog::CatalogSequenceNumber;
     use influxdb3_catalog::catalog::TableDefinition;
+    use influxdb3_catalog::log::FieldDataType;
     use influxdb3_id::ColumnId;
     use influxdb3_wal::{SnapshotSequenceNumber, WalFileSequenceNumber};
+    use iox_time::{MockProvider, Time};
     use observability_deps::tracing::info;
     use pretty_assertions::assert_eq;
     use schema::InfluxColumnType;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use super::*;
 
@@ -1088,6 +1115,239 @@ mod tests {
             reloaded.get_files(db_id, table_id),
             persisted_files.get_files(db_id, table_id)
         );
+    }
+
+    /// Applying a snapshot's `removed_files` to the running index matches by id and path, as the
+    /// snapshot loader does: an entry that only shares the id with a removed file (builds before
+    /// TAG-2495 could reuse ids after a restart) stays indexed.
+    #[test]
+    fn add_persisted_snapshot_keeps_an_entry_that_only_shares_the_id() {
+        let db_id = DbId::from(0);
+        let table_id = TableId::from(0);
+        let stale = parquet_file(7, "gen1/2026-07-10/23-10/0000021161.parquet", 1_000, 10);
+        let reused_id = parquet_file(7, "gen1/2026-07-11/00-00/0000021200.parquet", 2_000, 20);
+
+        let snapshot_1 = build_snapshot(vec![stale.clone(), reused_id.clone()], 1, 1, 1);
+        let persisted_files =
+            PersistedFiles::new_from_persisted_snapshots(vec![snapshot_1.clone()]);
+
+        let mut snapshot_2 = build_snapshot(vec![], 2, 2, 2);
+        snapshot_2
+            .removed_files
+            .entry(db_id)
+            .or_default()
+            .tables
+            .insert(table_id, vec![stale]);
+        persisted_files.add_persisted_snapshot_files(snapshot_2.clone());
+
+        assert_eq!(
+            persisted_files.get_files(db_id, table_id),
+            vec![reused_id.clone()]
+        );
+        assert_metrics(&persisted_files, 1, 2_000, 20);
+
+        // Loading the same snapshots after a restart gives the same index.
+        let reloaded = PersistedFiles::new_from_persisted_snapshots(vec![snapshot_2, snapshot_1]);
+        assert_eq!(reloaded.get_files(db_id, table_id), vec![reused_id]);
+    }
+
+    /// The retention tests' clock: one day after the epoch, in nanoseconds.
+    const RETENTION_TEST_NOW_NANOS: i64 = 24 * 60 * 60 * 1_000_000_000;
+
+    /// A catalog whose clock reads [`RETENTION_TEST_NOW_NANOS`], so a one-hour retention period
+    /// puts the cutoff long after the `max_time` (200ns) of the entries `parquet_file` builds.
+    async fn catalog_for_retention() -> Arc<Catalog> {
+        let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(
+            RETENTION_TEST_NOW_NANOS,
+        )));
+        Arc::new(
+            Catalog::new_in_memory_with_args("test", time_provider as _, CatalogArgs::default())
+                .await
+                .unwrap(),
+        )
+    }
+
+    /// Create `table` in `db` (and `db` if it does not exist) and return their ids.
+    async fn create_table(catalog: &Catalog, db: &str, table: &str) -> (DbId, TableId) {
+        if catalog.db_name_to_id(db).is_none() {
+            catalog.create_database(db).await.unwrap();
+        }
+        catalog
+            .create_table(db, table, &["tag"], &[("field", FieldDataType::String)])
+            .await
+            .unwrap();
+        let db_schema = catalog.db_schema(db).unwrap();
+        (db_schema.id, db_schema.table_name_to_id(table).unwrap())
+    }
+
+    /// A snapshot holding each entry in its own database and table.
+    fn snapshot_with(entries: &[(DbId, TableId, &ParquetFile)]) -> PersistedSnapshot {
+        let mut snapshot = build_snapshot(vec![], 1, 1, 1);
+        for (db_id, table_id, file) in entries {
+            snapshot.add_parquet_file(*db_id, *table_id, (*file).clone());
+        }
+        snapshot
+    }
+
+    /// Restart after a removal: record `removed` in the next snapshot's `removed_files`, as
+    /// `QueryableBuffer` does, and load the index from it and `older` (newest first, as
+    /// `Persister::load_snapshots` returns them).
+    fn reload_after_removal(
+        older: PersistedSnapshot,
+        removed: SerdeVecMap<DbId, DatabaseTables>,
+    ) -> PersistedFiles {
+        let mut newer = build_snapshot(vec![], 2, 2, 2);
+        newer.removed_files = removed;
+        PersistedFiles::new_from_persisted_snapshots(vec![newer, older])
+    }
+
+    /// Builds before TAG-2495 could reuse file ids after a restart, so an index loaded from older
+    /// snapshots can hold entries in different tables, or databases, that share an id. Retention
+    /// removes only the entry past its retention period. The others stay indexed, and the returned
+    /// map, which the caller records in the snapshot's `removed_files` and deletes from object
+    /// storage, holds only the removed entry. A restart gives the same index.
+    #[tokio::test]
+    async fn retention_keeps_entries_that_only_share_the_id() {
+        let catalog = catalog_for_retention().await;
+        let (retained_db, expired_table) = create_table(&catalog, "retained", "expired").await;
+        let (_, recent_table) = create_table(&catalog, "retained", "recent").await;
+        let (other_db, other_table) = create_table(&catalog, "no_retention", "cpu").await;
+        catalog
+            .set_retention_period_for_database("retained", Duration::from_secs(60 * 60))
+            .await
+            .unwrap();
+        let cutoffs = catalog.get_retention_period_cutoff_map();
+        assert!(cutoffs.contains_key(&(retained_db, expired_table)));
+        assert!(cutoffs.contains_key(&(retained_db, recent_table)));
+        assert!(!cutoffs.contains_key(&(other_db, other_table)));
+
+        // Past the retention period (`max_time` is 200ns after the epoch).
+        let expired = parquet_file(7, "retained/expired/old.parquet", 1_000, 10);
+        // The same id, within the retention period: in the same table at another path, and in
+        // another table of the same database.
+        let same_table = ParquetFile {
+            max_time: RETENTION_TEST_NOW_NANOS,
+            ..parquet_file(7, "retained/expired/new.parquet", 2_000, 20)
+        };
+        let other_table_entry = ParquetFile {
+            max_time: RETENTION_TEST_NOW_NANOS,
+            ..parquet_file(7, "retained/recent/new.parquet", 4_000, 40)
+        };
+        // The same id, in a database without a retention period.
+        let other_db_entry = parquet_file(7, "no_retention/cpu/old.parquet", 8_000, 80);
+
+        let snapshot = snapshot_with(&[
+            (retained_db, expired_table, &expired),
+            (retained_db, expired_table, &same_table),
+            (retained_db, recent_table, &other_table_entry),
+            (other_db, other_table, &other_db_entry),
+        ]);
+        let persisted_files = PersistedFiles::new_from_persisted_snapshots(vec![snapshot.clone()]);
+
+        let removed = persisted_files.remove_files_for_deletion(catalog);
+
+        assert_eq!(
+            persisted_files.get_files(retained_db, expired_table),
+            vec![same_table]
+        );
+        assert_eq!(
+            persisted_files.get_files(retained_db, recent_table),
+            vec![other_table_entry]
+        );
+        assert_eq!(
+            persisted_files.get_files(other_db, other_table),
+            vec![other_db_entry]
+        );
+        assert_metrics(&persisted_files, 3, 2_000 + 4_000 + 8_000, 20 + 40 + 80);
+
+        assert_eq!(removed.len(), 1);
+        let removed_tables = &removed.get(&retained_db).unwrap().tables;
+        assert_eq!(removed_tables.len(), 1);
+        assert_eq!(removed_tables.get(&expired_table).unwrap(), &vec![expired]);
+
+        let reloaded = reload_after_removal(snapshot, removed);
+        for (db_id, table_id) in [
+            (retained_db, expired_table),
+            (retained_db, recent_table),
+            (other_db, other_table),
+        ] {
+            assert_eq!(
+                reloaded.get_files(db_id, table_id),
+                persisted_files.get_files(db_id, table_id)
+            );
+        }
+        assert_metrics(&reloaded, 3, 2_000 + 4_000 + 8_000, 20 + 40 + 80);
+    }
+
+    /// When several entries that share an id are all due, each one leaves the index and each one
+    /// is in the returned map, whether a hard delete or retention made it due. A restart gives
+    /// the same index.
+    #[tokio::test]
+    async fn retention_and_hard_delete_remove_every_due_entry_that_shares_the_id() {
+        let catalog = catalog_for_retention().await;
+        let (retained_db, table_a) = create_table(&catalog, "retained", "a").await;
+        let (_, table_b) = create_table(&catalog, "retained", "b").await;
+        let (other_db, deleted_table) = create_table(&catalog, "no_retention", "deleted").await;
+        let (_, kept_table) = create_table(&catalog, "no_retention", "kept").await;
+        catalog
+            .set_retention_period_for_database("retained", Duration::from_secs(60 * 60))
+            .await
+            .unwrap();
+        let cutoffs = catalog.get_retention_period_cutoff_map();
+        assert!(cutoffs.contains_key(&(retained_db, table_a)));
+        assert!(cutoffs.contains_key(&(retained_db, table_b)));
+        assert!(!cutoffs.contains_key(&(other_db, kept_table)));
+
+        // All share id 7 and are older than the retention cutoff.
+        let expired_a = parquet_file(7, "retained/a/old.parquet", 1_000, 10);
+        let expired_b = parquet_file(7, "retained/b/old.parquet", 2_000, 20);
+        let deleted = parquet_file(7, "no_retention/deleted/old.parquet", 4_000, 40);
+        // Neither deleted nor under a retention period.
+        let kept = parquet_file(7, "no_retention/kept/old.parquet", 8_000, 80);
+
+        let snapshot = snapshot_with(&[
+            (retained_db, table_a, &expired_a),
+            (retained_db, table_b, &expired_b),
+            (other_db, deleted_table, &deleted),
+            (other_db, kept_table, &kept),
+        ]);
+        let persisted_files = PersistedFiles::new_from_persisted_snapshots(vec![snapshot.clone()]);
+        persisted_files.delete_table(other_db, deleted_table);
+
+        let removed = persisted_files.remove_files_for_deletion(catalog);
+
+        assert_eq!(removed.len(), 2);
+        let retained_removed = &removed.get(&retained_db).unwrap().tables;
+        assert_eq!(retained_removed.len(), 2);
+        assert_eq!(retained_removed.get(&table_a).unwrap(), &vec![expired_a]);
+        assert_eq!(retained_removed.get(&table_b).unwrap(), &vec![expired_b]);
+        let other_removed = &removed.get(&other_db).unwrap().tables;
+        assert_eq!(other_removed.len(), 1);
+        assert_eq!(other_removed.get(&deleted_table).unwrap(), &vec![deleted]);
+
+        assert!(persisted_files.get_files(retained_db, table_a).is_empty());
+        assert!(persisted_files.get_files(retained_db, table_b).is_empty());
+        assert!(
+            persisted_files
+                .get_files(other_db, deleted_table)
+                .is_empty()
+        );
+        assert_eq!(persisted_files.get_files(other_db, kept_table), vec![kept]);
+        assert_metrics(&persisted_files, 1, 8_000, 80);
+
+        let reloaded = reload_after_removal(snapshot, removed);
+        for (db_id, table_id) in [
+            (retained_db, table_a),
+            (retained_db, table_b),
+            (other_db, deleted_table),
+            (other_db, kept_table),
+        ] {
+            assert_eq!(
+                reloaded.get_files(db_id, table_id),
+                persisted_files.get_files(db_id, table_id)
+            );
+        }
+        assert_metrics(&reloaded, 1, 8_000, 80);
     }
 
     #[test]

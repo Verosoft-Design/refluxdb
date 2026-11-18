@@ -196,6 +196,18 @@ pub struct PersistedSnapshot {
     /// The tables will then have their name and the parquet file that was removed.
     #[serde(default)]
     pub removed_files: SerdeVecMap<DbId, DatabaseTables>,
+    /// True for an index checkpoint: a snapshot whose `databases` hold every file of the index
+    /// as of its sequence number, with nothing in `removed_files` (see
+    /// `CompactionService::write_index_checkpoint`). It is stored under its own name
+    /// (`SnapshotInfoFilePath::new_checkpoint`), and startup loads the newest one and the
+    /// snapshots after it. Left out of the JSON when false, so other snapshots are unchanged;
+    /// images that predate it ignore the field and load a checkpoint as an ordinary snapshot.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub checkpoint: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl PersistedSnapshot {
@@ -217,7 +229,50 @@ impl PersistedSnapshot {
             max_time: i64::MIN,
             databases: SerdeVecMap::new(),
             removed_files: SerdeVecMap::new(),
+            checkpoint: false,
         }
+    }
+
+    /// An index checkpoint (see [`Self::checkpoint`]) holding `files`, the whole index as of
+    /// `snapshot_sequence_number`. The other fields are what a restart takes from the newest
+    /// snapshot, captured as for any snapshot that persists no WAL data.
+    pub(crate) fn new_index_checkpoint(
+        node_id: String,
+        snapshot_sequence_number: SnapshotSequenceNumber,
+        wal_file_sequence_number: WalFileSequenceNumber,
+        catalog_sequence_number: CatalogSequenceNumber,
+        next_file_id: ParquetFileId,
+        files: std::collections::BTreeMap<(DbId, TableId), Vec<ParquetFile>>,
+    ) -> Self {
+        let mut snapshot = Self {
+            node_id,
+            next_file_id,
+            snapshot_sequence_number,
+            wal_file_sequence_number,
+            catalog_sequence_number,
+            parquet_size_bytes: 0,
+            row_count: 0,
+            min_time: i64::MAX,
+            max_time: i64::MIN,
+            databases: SerdeVecMap::new(),
+            removed_files: SerdeVecMap::new(),
+            checkpoint: true,
+        };
+        for ((database_id, table_id), files) in files {
+            for file in &files {
+                snapshot.parquet_size_bytes += file.size_bytes;
+                snapshot.row_count += file.row_count;
+                snapshot.min_time = snapshot.min_time.min(file.min_time);
+                snapshot.max_time = snapshot.max_time.max(file.max_time);
+            }
+            snapshot
+                .databases
+                .entry(database_id)
+                .or_default()
+                .tables
+                .insert(table_id, files);
+        }
+        snapshot
     }
 
     pub(crate) fn add_parquet_file(
@@ -647,6 +702,7 @@ mod tests {
             row_count: 0,
             parquet_size_bytes: 0,
             removed_files: SerdeVecMap::new(),
+            checkpoint: false,
         };
 
         // db 2 setup
@@ -690,6 +746,7 @@ mod tests {
             row_count: 0,
             parquet_size_bytes: 0,
             removed_files: SerdeVecMap::new(),
+            checkpoint: false,
         };
 
         let overall_counts = PersistedSnapshot::overall_db_table_file_counts(&[

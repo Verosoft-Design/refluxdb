@@ -174,6 +174,7 @@ async fn drift_check_leaves_stale_entries_out_and_the_index_check_prunes_them() 
             index_check_enabled: true,
             index_check_interval: Duration::ZERO,
             index_check_max_prune_percent: 100,
+            ..CompactionConfig::default()
         },
         Arc::clone(&catalog),
         Arc::clone(&write_buffer) as Arc<dyn WriteBuffer>,

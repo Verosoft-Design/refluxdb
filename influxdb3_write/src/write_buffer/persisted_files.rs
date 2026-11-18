@@ -9,11 +9,11 @@ use crate::deleter::ObjectDeleter;
 use crate::{ChunkFilter, DatabaseTables};
 use crate::{ParquetFile, ParquetFileId, PersistedSnapshot};
 use hashbrown::{HashMap, HashSet};
-use influxdb3_catalog::catalog::Catalog;
+use influxdb3_catalog::catalog::{Catalog, CatalogSequenceNumber};
 use influxdb3_id::TableId;
 use influxdb3_id::{DbId, SerdeVecMap};
 use influxdb3_telemetry::ParquetMetrics;
-use influxdb3_wal::WalFileSequenceNumber;
+use influxdb3_wal::{SnapshotSequenceNumber, WalFileSequenceNumber};
 use observability_deps::tracing::warn;
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 
@@ -66,6 +66,14 @@ impl PersistedFiles {
         let inner = Inner::new_from_persisted_snapshots(persisted_snapshots);
         Self {
             inner: RwLock::new(inner),
+        }
+    }
+
+    /// Create a new `PersistedFiles` from snapshots folded oldest to newest (see
+    /// `Persister::load_index`).
+    pub(crate) fn from_fold(fold: SnapshotFold) -> Self {
+        Self {
+            inner: RwLock::new(Inner::from_fold(fold)),
         }
     }
 
@@ -367,35 +375,20 @@ impl Inner {
     pub(crate) fn new_from_persisted_snapshots(
         persisted_snapshots: Vec<PersistedSnapshot>,
     ) -> Self {
-        let mut tables: HashMap<(DbId, TableId), TableLoader> = HashMap::new();
-        let mut collapsed_duplicates = 0_u64;
-        // The WAL replay on startup starts after this snapshot's number (see `WriteBufferImpl::new`).
-        let last_persisted_wal_sequence_number = persisted_snapshots
-            .first()
-            .map(|s| s.wal_file_sequence_number);
-
+        let mut fold = SnapshotFold::default();
         for persisted_snapshot in persisted_snapshots.into_iter().rev() {
-            for (db_id, db_tables) in persisted_snapshot.databases {
-                for (table_id, files) in db_tables.tables {
-                    let loader = tables.entry((db_id, table_id)).or_default();
-                    for file in files {
-                        if loader.upsert(file) {
-                            collapsed_duplicates += 1;
-                        }
-                    }
-                }
-            }
-            for (db_id, db_tables) in persisted_snapshot.removed_files {
-                for (table_id, files) in db_tables.tables {
-                    if let Some(loader) = tables.get_mut(&(db_id, table_id)) {
-                        for file in &files {
-                            loader.remove(file);
-                        }
-                    }
-                }
-            }
+            fold.apply(persisted_snapshot);
         }
+        Self::from_fold(fold)
+    }
 
+    fn from_fold(fold: SnapshotFold) -> Self {
+        let SnapshotFold {
+            tables,
+            collapsed_duplicates,
+            newest,
+            ..
+        } = fold;
         if collapsed_duplicates > 0 {
             warn!(
                 collapsed_duplicates,
@@ -419,7 +412,9 @@ impl Inner {
                 .insert(table_id, files);
         }
         inner.parquet_files_size_mb = as_mb(size_bytes);
-        inner.last_persisted_wal_sequence_number = last_persisted_wal_sequence_number;
+        // The WAL replay on startup starts after the newest snapshot's number (see
+        // `WriteBufferImpl::new`).
+        inner.last_persisted_wal_sequence_number = newest.map(|h| h.wal_file_sequence_number);
         inner
     }
 
@@ -548,6 +543,102 @@ impl Removed {
     }
 }
 
+/// The fields of the newest snapshot a [`SnapshotFold`] applied. Startup takes the WAL replay
+/// start, the snapshot sequence number and the next parquet file id from them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SnapshotHeader {
+    pub(crate) snapshot_sequence_number: SnapshotSequenceNumber,
+    pub(crate) wal_file_sequence_number: WalFileSequenceNumber,
+    pub(crate) catalog_sequence_number: CatalogSequenceNumber,
+    pub(crate) next_file_id: ParquetFileId,
+}
+
+/// Builds the parquet index from persisted snapshots applied one at a time, oldest to newest.
+/// The startup loader and the index checkpoint writer both use it, so a checkpoint holds exactly
+/// what a restart that loads the same snapshots would index.
+///
+/// A snapshot's files are added (an entry whose path is already indexed is replaced: the newest
+/// write describes the object), then its `removed_files` are removed by id and path, so a removal
+/// only applies to files added by older snapshots and an entry that only shares an id stays.
+#[derive(Debug, Default)]
+pub(crate) struct SnapshotFold {
+    tables: HashMap<(DbId, TableId), TableLoader>,
+    collapsed_duplicates: u64,
+    newest: Option<SnapshotHeader>,
+    applied: usize,
+}
+
+impl SnapshotFold {
+    /// Apply `snapshot`, which must be newer than every snapshot applied before it.
+    pub(crate) fn apply(&mut self, snapshot: PersistedSnapshot) {
+        self.newest = Some(SnapshotHeader {
+            snapshot_sequence_number: snapshot.snapshot_sequence_number,
+            wal_file_sequence_number: snapshot.wal_file_sequence_number,
+            catalog_sequence_number: snapshot.catalog_sequence_number,
+            next_file_id: snapshot.next_file_id,
+        });
+        self.applied += 1;
+        for (db_id, db_tables) in snapshot.databases {
+            for (table_id, files) in db_tables.tables {
+                let loader = self.tables.entry((db_id, table_id)).or_default();
+                for file in files {
+                    if loader.upsert(file) {
+                        self.collapsed_duplicates += 1;
+                    }
+                }
+            }
+        }
+        for (db_id, db_tables) in snapshot.removed_files {
+            for (table_id, files) in db_tables.tables {
+                if let Some(loader) = self.tables.get_mut(&(db_id, table_id)) {
+                    for file in &files {
+                        loader.remove(file);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The newest snapshot applied so far, if any.
+    pub(crate) fn newest(&self) -> Option<SnapshotHeader> {
+        self.newest
+    }
+
+    /// How many snapshots have been applied.
+    pub(crate) fn applied(&self) -> usize {
+        self.applied
+    }
+
+    /// Every indexed file, by database and table, in the order the fold first indexed each
+    /// path. Tables whose files were all removed are left out.
+    pub(crate) fn files(&self) -> BTreeMap<(DbId, TableId), Vec<ParquetFile>> {
+        self.tables
+            .iter()
+            .map(|(key, loader)| (*key, loader.files().cloned().collect::<Vec<_>>()))
+            .filter(|(_, files)| !files.is_empty())
+            .collect()
+    }
+
+    /// Drop the slots of removed entries and the tables left empty. A fold kept across many
+    /// snapshots (the checkpoint writer's) would otherwise grow with every entry ever removed.
+    pub(crate) fn compact(&mut self) {
+        self.tables.retain(|_, loader| {
+            loader.compact();
+            !loader.files.is_empty()
+        });
+    }
+
+    /// Like [`Self::files`], consuming the fold.
+    #[cfg(test)]
+    pub(crate) fn into_files(self) -> BTreeMap<(DbId, TableId), Vec<ParquetFile>> {
+        self.tables
+            .into_iter()
+            .map(|(key, loader)| (key, loader.into_files()))
+            .filter(|(_, files)| !files.is_empty())
+            .collect()
+    }
+}
+
 /// Per-table state while loading snapshots: keeps one entry per path in insertion order, with a
 /// path lookup so loading many snapshots stays linear.
 #[derive(Debug, Default)]
@@ -589,6 +680,21 @@ impl TableLoader {
 
     fn into_files(self) -> Vec<ParquetFile> {
         self.files.into_iter().flatten().collect()
+    }
+
+    fn files(&self) -> impl Iterator<Item = &ParquetFile> {
+        self.files.iter().flatten()
+    }
+
+    /// Drop the empty slots that removals leave, keeping the order.
+    fn compact(&mut self) {
+        self.files.retain(Option::is_some);
+        self.by_path = self
+            .files
+            .iter()
+            .enumerate()
+            .map(|(i, file)| (file.as_ref().expect("retained").path.clone(), i))
+            .collect();
     }
 }
 

@@ -1,5 +1,5 @@
-use crate::persister::Persister;
-use crate::write_buffer::persisted_files::PersistedFiles;
+use crate::persister::{IndexCheckpointBase, Persister};
+use crate::write_buffer::persisted_files::{PersistedFiles, SnapshotFold};
 use crate::{ParquetFile, ParquetFileId, PersistedSnapshot, PersistedSnapshotVersion, WriteBuffer};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -48,6 +48,18 @@ pub struct CompactionConfig {
     /// more than this percentage of that database's entries it could check are stale. 100 lifts
     /// the limit.
     pub index_check_max_prune_percent: u8,
+    /// Write an index checkpoint once this many snapshot sequence numbers have been handed out
+    /// since the last one, and once right after startup. 0 writes none. See
+    /// [`CompactionService::write_index_checkpoint`].
+    pub index_checkpoint_snapshots: u64,
+    /// While snapshots are being written, write an index checkpoint at least this often.
+    pub index_checkpoint_max_age: Duration,
+    /// How often the checkpoint loop looks whether a checkpoint is due.
+    pub index_checkpoint_poll_interval: Duration,
+    /// How long an index checkpoint waits for compaction and prune snapshots still uploading
+    /// before it gives up and tries again later. While it waits, new index snapshots queue
+    /// behind it, so an upload that keeps failing must not hold them all up.
+    pub index_checkpoint_gate_timeout: Duration,
 }
 
 impl Default for CompactionConfig {
@@ -62,6 +74,10 @@ impl Default for CompactionConfig {
             index_check_enabled: true,
             index_check_interval: Duration::from_secs(3600),
             index_check_max_prune_percent: 50,
+            index_checkpoint_snapshots: 1_000,
+            index_checkpoint_max_age: Duration::from_secs(24 * 3600),
+            index_checkpoint_poll_interval: Duration::from_secs(60),
+            index_checkpoint_gate_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -95,6 +111,62 @@ const INDEX_CHECK_CONCURRENCY: usize = 16;
 
 /// Stale entries the startup check logs one by one; it counts the rest in its summary.
 const STALE_LOG_LIMIT: usize = 20;
+
+/// Index checkpoints kept in object storage; older ones are deleted after a new one is written.
+/// A restart needs only the newest; the others are there if it can't be read.
+const INDEX_CHECKPOINTS_KEPT: usize = 3;
+
+/// Snapshot GETs in flight at once while an index checkpoint folds the snapshots since its base.
+const INDEX_CHECKPOINT_FETCH_CONCURRENCY: usize = 16;
+
+/// An index checkpoint folds at most this many sequence numbers after its base; past that it
+/// is not written (and logs an error), as numbers are expected to be consecutive since startup.
+/// About four weeks of snapshots at the 50-jobs-per-10-minutes compaction cap.
+const INDEX_CHECKPOINT_MAX_TAIL: u64 = 200_000;
+
+/// How long the checkpoint loop waits after a failed attempt before it tries again.
+const INDEX_CHECKPOINT_RETRY_DELAY: Duration = Duration::from_secs(300);
+
+/// Upload attempts for one index checkpoint before the attempt is given up.
+const INDEX_CHECKPOINT_UPLOAD_ATTEMPTS: usize = 5;
+
+/// The index checkpoint loop's state (see [`CompactionService::write_index_checkpoint`]).
+#[derive(Debug)]
+struct IndexCheckpointState {
+    /// The index folded from durable snapshots, oldest to newest, through `folded_through`: the
+    /// index as loaded at startup, then every snapshot a checkpoint fetched since. Kept between
+    /// checkpoints, so each one fetches only the snapshots after the previous one. A checkpoint
+    /// that stops part-way leaves it consistent through the last snapshot it applied.
+    fold: SnapshotFold,
+    /// The highest sequence number the fold covers. `None` before any snapshot existed.
+    folded_through: Option<SnapshotSequenceNumber>,
+    /// The newest index checkpoint this process loaded or wrote. `None` until there is one.
+    last_checkpoint: Option<SnapshotSequenceNumber>,
+    /// When `last_checkpoint` was loaded or written.
+    last_checkpoint_at: std::time::Instant,
+    /// Index checkpoints in object storage, newest first, readable or not.
+    checkpoints: Vec<SnapshotSequenceNumber>,
+    /// No attempt before this, after one failed.
+    retry_at: Option<std::time::Instant>,
+}
+
+impl IndexCheckpointState {
+    fn new(base: IndexCheckpointBase) -> Self {
+        let folded_through = base.index.as_ref().map(|i| i.snapshot_sequence_number);
+        let mut fold = SnapshotFold::default();
+        if let Some(index) = base.index {
+            fold.apply(index);
+        }
+        Self {
+            fold,
+            folded_through,
+            last_checkpoint: base.loaded_checkpoint,
+            last_checkpoint_at: std::time::Instant::now(),
+            checkpoints: base.checkpoints,
+            retry_at: None,
+        }
+    }
+}
 
 /// What object storage says about an index entry.
 #[derive(Debug)]
@@ -189,6 +261,14 @@ pub struct CompactionService {
     /// Index entries a job left out as stale, by id and path. Planning skips them until an index
     /// check run decides: pruned, or present after all. In memory only; a restart forgets them.
     left_out: parking_lot::Mutex<HashSet<(ParquetFileId, String)>>,
+    /// Index snapshots (a compaction's or a prune's) hold this shared from before they reserve
+    /// their sequence number until their upload has succeeded. An index checkpoint holds it
+    /// exclusive while it reserves its number, so every index snapshot numbered below the
+    /// checkpoint is in object storage by then and every later one gets a higher number.
+    index_snapshot_gate: tokio::sync::RwLock<()>,
+    /// The index as loaded at startup, until the checkpoint loop takes it (see
+    /// [`Self::with_index_checkpoint_base`]).
+    index_checkpoint_base: parking_lot::Mutex<Option<IndexCheckpointBase>>,
 }
 
 impl CompactionService {
@@ -221,7 +301,16 @@ impl CompactionService {
             time_provider,
             shutdown_token,
             left_out: Default::default(),
+            index_snapshot_gate: Default::default(),
+            index_checkpoint_base: Default::default(),
         }
+    }
+
+    /// Write index checkpoints, starting from the index the server loaded at startup
+    /// (`WriteBufferImpl::take_index_checkpoint_base`). Without it the service writes none.
+    pub fn with_index_checkpoint_base(self, base: IndexCheckpointBase) -> Self {
+        *self.index_checkpoint_base.lock() = Some(base);
+        self
     }
 
     /// Send HEADs to `store` instead of the store reads use: the server passes the one without
@@ -312,10 +401,48 @@ impl CompactionService {
                 }
             };
 
-            // The check runs alongside the cycles, in this task, so aborting the task stops
-            // both. See `check_index_for_missing_files` for why jobs running at the same time
-            // are safe.
-            futures::future::join(check, cycles).await;
+            // Index checkpoints: one right after startup, then whenever enough snapshots have
+            // been written or the last one is old. Shutdown ends an attempt or the wait.
+            let checkpoints = async {
+                let Some(base) = self.index_checkpoint_base.lock().take() else {
+                    info!(
+                        "index checkpoints are off: the service was not given the index loaded at startup"
+                    );
+                    return;
+                };
+                if self.config.index_checkpoint_snapshots == 0 {
+                    info!("index checkpoints are disabled");
+                    return;
+                }
+                let mut state = IndexCheckpointState::new(base);
+                loop {
+                    if self.index_checkpoint_due(&state).await {
+                        tokio::select! {
+                            result = self.write_index_checkpoint(&mut state) => {
+                                if let Err(e) = result {
+                                    error!(
+                                        error = %format!("{e:#}"),
+                                        retry_in_secs = INDEX_CHECKPOINT_RETRY_DELAY.as_secs(),
+                                        "could not write an index checkpoint; a restart still loads the previous one and every snapshot after it"
+                                    );
+                                    state.retry_at =
+                                        Some(std::time::Instant::now() + INDEX_CHECKPOINT_RETRY_DELAY);
+                                }
+                            }
+                            _ = self.shutdown_token.wait_for_shutdown() => return,
+                        }
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(self.config.index_checkpoint_poll_interval) => {}
+                        _ = self.shutdown_token.wait_for_shutdown() => return,
+                    }
+                }
+            };
+
+            // The check and the checkpoints run alongside the cycles, in this task, so aborting
+            // the task stops all three. See `check_index_for_missing_files` for why jobs running
+            // at the same time are safe, and `write_index_checkpoint` for checkpoints.
+            futures::future::join3(check, cycles, checkpoints).await;
         })
     }
 
@@ -859,26 +986,11 @@ impl CompactionService {
         &self,
         record: impl FnOnce(&mut PersistedSnapshot),
     ) -> SnapshotSequenceNumber {
-        let wal = self.write_buffer.wal();
-        let snapshot_sequence_number = wal.reserve_next_snapshot_sequence_number().await;
-        // A data snapshot with a lower sequence number may still be writing its files; it holds
-        // the WAL's snapshot permit until it is done. Wait for it, so that this snapshot records
-        // its WAL number and a `next_file_id` above its file ids. The number is reserved first
-        // because a flush that starts a snapshot waits for this permit while holding the WAL lock.
-        let snapshot_permit = wal.acquire_snapshot_permit().await;
-        // This snapshot becomes the newest, and startup replays the WAL after its
-        // `wal_file_sequence_number`. It persists no WAL data, so it carries the number of the last
-        // snapshot that did: the last WAL file written would skip rows that exist only in the WAL.
-        let wal_file_sequence_number = self
-            .persisted_files()
-            .last_persisted_wal_sequence_number()
-            .unwrap_or_default();
-        let mut snapshot = PersistedSnapshot::new(
-            self.node_identifier_prefix.clone(),
-            snapshot_sequence_number,
-            wal_file_sequence_number,
-            self.catalog.sequence_number(),
-        );
+        // Held until the upload below has succeeded: an index checkpoint waits for it before it
+        // reserves its number (see `index_snapshot_gate`).
+        let _gate = self.index_snapshot_gate.read().await;
+        let (mut snapshot, snapshot_permit) = self.reserve_index_snapshot().await;
+        let snapshot_sequence_number = snapshot.snapshot_sequence_number;
         record(&mut snapshot);
         // Release the permit before the upload, which retries until it succeeds: a flush that
         // starts a data snapshot waits for it while holding the WAL lock, and so does every write.
@@ -901,6 +1013,209 @@ impl CompactionService {
             }
         }
         snapshot_sequence_number
+    }
+
+    /// Reserve the next snapshot sequence number for a snapshot that persists no WAL data (a
+    /// compaction's, a prune's or an index checkpoint) and start it with the fields a restart
+    /// takes from the newest snapshot. Returns the WAL's snapshot permit, held: release it
+    /// before uploading.
+    async fn reserve_index_snapshot(
+        &self,
+    ) -> (PersistedSnapshot, tokio::sync::OwnedSemaphorePermit) {
+        let wal = self.write_buffer.wal();
+        let snapshot_sequence_number = wal.reserve_next_snapshot_sequence_number().await;
+        // A data snapshot with a lower sequence number may still be writing its files; it holds
+        // the WAL's snapshot permit until it is done. Wait for it, so that this snapshot records
+        // its WAL number and a `next_file_id` above its file ids. The number is reserved first
+        // because a flush that starts a snapshot waits for this permit while holding the WAL lock.
+        let snapshot_permit = wal.acquire_snapshot_permit().await;
+        // This snapshot becomes the newest, and startup replays the WAL after its
+        // `wal_file_sequence_number`. It persists no WAL data, so it carries the number of the last
+        // snapshot that did: the last WAL file written would skip rows that exist only in the WAL.
+        let wal_file_sequence_number = self
+            .persisted_files()
+            .last_persisted_wal_sequence_number()
+            .unwrap_or_default();
+        let snapshot = PersistedSnapshot::new(
+            self.node_identifier_prefix.clone(),
+            snapshot_sequence_number,
+            wal_file_sequence_number,
+            self.catalog.sequence_number(),
+        );
+        (snapshot, snapshot_permit)
+    }
+
+    /// Whether the checkpoint loop should write an index checkpoint now: as soon as there is a
+    /// snapshot while no checkpoint exists (the first start of this image), then once
+    /// `index_checkpoint_snapshots` numbers have been handed out since the newest checkpoint
+    /// (loaded at startup or written since), or once any have and that checkpoint is
+    /// `index_checkpoint_max_age` old. A restart from a checkpoint counts from that checkpoint, so
+    /// it doesn't rewrite the whole index right away.
+    async fn index_checkpoint_due(&self, state: &IndexCheckpointState) -> bool {
+        if state
+            .retry_at
+            .is_some_and(|at| std::time::Instant::now() < at)
+        {
+            return false;
+        }
+        let newest = self
+            .write_buffer
+            .wal()
+            .last_snapshot_sequence_number()
+            .await
+            .as_u64();
+        match state.last_checkpoint {
+            None => state.folded_through.is_some() || newest > 0,
+            Some(checkpoint) => {
+                let since = newest.saturating_sub(checkpoint.as_u64());
+                since >= self.config.index_checkpoint_snapshots
+                    || (since > 0
+                        && state.last_checkpoint_at.elapsed()
+                            >= self.config.index_checkpoint_max_age)
+            }
+        }
+    }
+
+    /// Write an index checkpoint: a snapshot that holds every file of the index as of its
+    /// sequence number k, so a restart loads it and the snapshots after it instead of every
+    /// snapshot (TAG-2497).
+    ///
+    /// It is built from durable snapshots, not from the in-memory index: the base (the previous
+    /// checkpoint, or the index as loaded at startup) and then every snapshot numbered between the
+    /// base and k, each fetched at the path its number gives (a number without a file was never
+    /// written: a data snapshot with nothing to persist, or a reservation cancelled by shutdown).
+    /// So it holds exactly what a restart that loads every snapshot would index.
+    ///
+    /// That needs every snapshot numbered below k to be in object storage when k is reserved.
+    /// Data snapshots hold the WAL's snapshot permit until theirs is written, and the reservation
+    /// takes that permit; index snapshots hold `index_snapshot_gate` shared until theirs is
+    /// written, and the reservation holds it exclusive. Anything written later gets a number
+    /// above k and is loaded after the checkpoint.
+    ///
+    /// Then the checkpoints beyond the newest [`INDEX_CHECKPOINTS_KEPT`] are deleted. Snapshot
+    /// info files are never deleted, so images that predate checkpoints still load everything
+    /// they need from their own window, and a checkpoint that can't be read is skipped.
+    async fn write_index_checkpoint(
+        &self,
+        state: &mut IndexCheckpointState,
+    ) -> Result<SnapshotSequenceNumber> {
+        let started = std::time::Instant::now();
+        let first = state.folded_through.map_or(0, |seq| seq.as_u64() + 1);
+        // Checked before reserving: past the cap an attempt would only use up a number and hold
+        // up index snapshots while it waits for the gate.
+        let newest = self
+            .write_buffer
+            .wal()
+            .last_snapshot_sequence_number()
+            .await
+            .as_u64();
+        let pending = (newest + 1).saturating_sub(first);
+        anyhow::ensure!(
+            pending <= INDEX_CHECKPOINT_MAX_TAIL,
+            "{pending} snapshot sequence numbers lie after {:?}, the last one folded, more than the {INDEX_CHECKPOINT_MAX_TAIL} a checkpoint folds",
+            state.folded_through
+        );
+        let header = {
+            // While this waits, new index snapshots queue behind it: give up after a while
+            // rather than hold them all up behind an upload that keeps failing.
+            let _gate = tokio::time::timeout(
+                self.config.index_checkpoint_gate_timeout,
+                self.index_snapshot_gate.write(),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "compaction or prune snapshots were still uploading after {:?}",
+                    self.config.index_checkpoint_gate_timeout
+                )
+            })?;
+            let (header, snapshot_permit) = self.reserve_index_snapshot().await;
+            drop(snapshot_permit);
+            header
+        };
+        let checkpoint_sequence_number = header.snapshot_sequence_number;
+
+        let mut fetched = 0_usize;
+        let mut gets = futures::stream::iter(first..checkpoint_sequence_number.as_u64())
+            .map(|seq| async move {
+                let snapshot = self
+                    .persister
+                    .get_snapshot_by_sequence_number(SnapshotSequenceNumber::new(seq))
+                    .await;
+                (seq, snapshot)
+            })
+            .buffered(INDEX_CHECKPOINT_FETCH_CONCURRENCY);
+        while let Some((seq, snapshot)) = gets.next().await {
+            if let Some(snapshot) =
+                snapshot.context("fetching a snapshot to fold into the index checkpoint")?
+            {
+                fetched += 1;
+                state.fold.apply(snapshot);
+            }
+            state.folded_through = Some(SnapshotSequenceNumber::new(seq));
+        }
+        drop(gets);
+        // The checkpoint's own number holds no snapshot info file.
+        state.folded_through = Some(checkpoint_sequence_number);
+        state.fold.compact();
+
+        let checkpoint = PersistedSnapshot::new_index_checkpoint(
+            header.node_id,
+            checkpoint_sequence_number,
+            header.wal_file_sequence_number,
+            header.catalog_sequence_number,
+            header.next_file_id,
+            state.fold.files(),
+        );
+        let (_, _, entries) = checkpoint.db_table_and_file_count();
+        let json = Persister::serialize_index_checkpoint(&checkpoint)?;
+        drop(checkpoint);
+        let bytes = json.len();
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match self
+                .persister
+                .persist_index_checkpoint(checkpoint_sequence_number, json.clone())
+                .await
+            {
+                Ok(()) => break,
+                Err(e) if attempt < INDEX_CHECKPOINT_UPLOAD_ATTEMPTS => {
+                    warn!(%e, attempt, "could not upload the index checkpoint; retrying");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                Err(e) => return Err(e).context("uploading the index checkpoint"),
+            }
+        }
+
+        state.last_checkpoint = Some(checkpoint_sequence_number);
+        state.last_checkpoint_at = std::time::Instant::now();
+        state.retry_at = None;
+        // Numbers are handed out above every name listed at startup, so this one is the newest.
+        state.checkpoints.insert(0, checkpoint_sequence_number);
+        let expired = state
+            .checkpoints
+            .split_off(INDEX_CHECKPOINTS_KEPT.min(state.checkpoints.len()));
+        for seq in &expired {
+            if let Err(e) = self.persister.delete_index_checkpoint(*seq).await {
+                warn!(%e, snapshot_sequence_number = seq.as_u64(), "could not delete an old index checkpoint; it stays in object storage");
+            }
+        }
+        let (in_memory_entries, _, _) =
+            influxdb3_telemetry::ParquetMetrics::get_metrics(self.persisted_files.as_ref());
+        info!(
+            snapshot_sequence_number = checkpoint_sequence_number.as_u64(),
+            entries,
+            bytes,
+            in_memory_entries,
+            fetched,
+            not_found = (checkpoint_sequence_number.as_u64().saturating_sub(first) as usize)
+                .saturating_sub(fetched),
+            deleted_checkpoints = expired.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "wrote an index checkpoint"
+        );
+        Ok(checkpoint_sequence_number)
     }
 
     /// HEAD the object of an index entry.
@@ -983,6 +1298,12 @@ impl CompactionService {
     /// added them. Entries that are no longer indexed (compaction or retention removed them
     /// meanwhile) are left out; if none is left, no snapshot is written. Returns how many entries
     /// were removed.
+    ///
+    /// To undo a wrong prune: stop the server, delete that removal snapshot (the info line below
+    /// gives its sequence number) and every index checkpoint numbered above it
+    /// (`*.checkpoint.json` sorting before it by name), and start again. A checkpoint written
+    /// after the prune holds the index without the pruned entries, so it must go too; startup then
+    /// loads an older checkpoint, or every snapshot.
     async fn prune_index_entries(&self, stale: StaleEntries) -> usize {
         let persisted_files = self.persisted_files();
         let indexed: StaleEntries = stale
@@ -1047,6 +1368,13 @@ impl CompactionService {
     /// written before they were indexed.
     async fn check_index_for_missing_files(&self) {
         let started = std::time::Instant::now();
+        // Entries past their table's retention cutoff are not checked, counted or pruned:
+        // retention removes them at the next data snapshot whether their object exists or not,
+        // and queries never read them. Checking them would let expired history (a full load of
+        // old snapshots restores some, TAG-2497) make a database look mostly stale, so that the
+        // limit refuses to prune the entries in it that matter. Same cutoff as retention uses.
+        let cutoffs = self.catalog.get_retention_period_cutoff_map();
+        let mut expired: Vec<(ParquetFileId, String)> = Vec::new();
         let mut entries = Vec::new();
         for db_schema in self.catalog.list_db_schema() {
             if db_schema.deleted {
@@ -1057,17 +1385,24 @@ impl CompactionService {
                     continue;
                 }
                 let key = (db_schema.id, table_def.table_id);
+                let cutoff = cutoffs.get(&key).copied();
                 for file in self.write_buffer.parquet_files(key.0, key.1) {
+                    if cutoff.is_some_and(|cutoff| file.max_time < cutoff) {
+                        expired.push((file.id, file.path.clone()));
+                        continue;
+                    }
                     entries.push((key, file));
                 }
             }
         }
         let checked = entries.len();
+        let expired_count = expired.len();
 
         let mut candidates = Vec::new();
         let mut unknown = 0_usize;
         // Entries this run can't decide on; any a job left out stay skipped by planning.
-        let mut undecided: HashSet<(ParquetFileId, String)> = HashSet::new();
+        // Expired entries are left to retention, so they stay skipped too.
+        let mut undecided: HashSet<(ParquetFileId, String)> = expired.into_iter().collect();
         // Entries checked and HEADs that failed, per database, for the per-database limit.
         let mut per_db: HashMap<DbId, (usize, usize)> = HashMap::new();
         let mut results = futures::stream::iter(entries)
@@ -1198,6 +1533,7 @@ impl CompactionService {
             not_logged,
             cleared,
             unknown,
+            expired = expired_count,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "checked the parquet index against object storage"
         );
@@ -1480,6 +1816,8 @@ mod tests {
     use metric::Registry;
     use object_store::memory::InMemory;
 
+    mod checkpoint_tests;
+
     struct CompactionHarness {
         object_store: Arc<dyn ObjectStore>,
         catalog: Arc<Catalog>,
@@ -1505,6 +1843,7 @@ mod tests {
             index_check_enabled: true,
             index_check_interval: Duration::ZERO,
             index_check_max_prune_percent: 100,
+            ..CompactionConfig::default()
         }
     }
 
@@ -2129,6 +2468,7 @@ mod tests {
             index_check_enabled: true,
             index_check_interval: Duration::ZERO,
             index_check_max_prune_percent: 100,
+            ..CompactionConfig::default()
         }
     }
 
@@ -2305,6 +2645,106 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert_eq!(rows, 3, "2 compacted rows + 1 replayed from the WAL");
+    }
+
+    /// TAG-2497 tests: gen1 -> gen2 into 2 minute windows, at least 2 files a job, so a lone gen1
+    /// file never compacts. The index check is off: these tests restart, they don't prune.
+    fn tag_2497_config() -> CompactionConfig {
+        CompactionConfig {
+            enabled: true,
+            interval: Duration::from_secs(1),
+            max_files_per_run: 10,
+            min_files_for_compaction: 2,
+            generation_durations: HashMap::from([
+                (1, Duration::from_secs(60)),
+                (2, Duration::from_secs(120)),
+            ]),
+            index_check_enabled: false,
+            ..CompactionConfig::default()
+        }
+    }
+
+    /// Write two gen1 files into the 2 minute window `window`, end it, and compact it: two data
+    /// snapshots and one compaction snapshot. Returns the gen2 output's path.
+    async fn compact_tag_2497_window(h: &CompactionHarness, window: u64) -> String {
+        let start_ns = window * 120 * 1_000_000_000;
+        h.write_gen1(&format!(
+            "testtable value={window} {}",
+            start_ns + 10_000_000_000
+        ))
+        .await;
+        h.write_gen1(&format!(
+            "testtable value={window} {}",
+            start_ns + 70_000_000_000
+        ))
+        .await;
+        h.set_now(Duration::from_secs((window + 1) * 120));
+        let compacted = h.compact().await;
+        assert_eq!(compacted.len(), 1);
+        compacted[0].path.clone()
+    }
+
+    /// Regression test (TAG-2497): startup indexed only the files in the newest
+    /// `n_snapshots_to_load_on_start` snapshots (`--gen1-lookback-duration / --gen1-duration`),
+    /// and every compaction job writes a snapshot of its own. Once compaction snapshots pushed a
+    /// file's only snapshot out of that window, the file dropped out of the index (and out of
+    /// queries) on the next restart, although its object was still in the bucket. Startup now
+    /// loads the newest index checkpoint and every snapshot after it, or every snapshot.
+    ///
+    /// Here the window holds 4 snapshots. A gen1 file that never compacts (its window is below
+    /// `min_files_for_compaction`) is followed by 9 snapshots: three windows of two data
+    /// snapshots and one compaction snapshot each. A restart must index every file the running
+    /// server indexed: that gen1 file, and the oldest window's gen2 output too.
+    #[tokio::test]
+    async fn test_restart_indexes_files_whose_snapshots_are_beyond_the_load_window() {
+        const LOAD_WINDOW: usize = 4;
+        let h = CompactionHarness::with_config(tag_2497_config()).await;
+
+        // Window 0: one gen1 file, below the minimum, so it stays in its data snapshot only.
+        h.write_gen1("testtable value=0 10000000000").await;
+        let lone_gen1 = h.indexed_files()[0].path.clone();
+
+        // Windows 1 to 3: two gen1 files each, then the window ends and is compacted.
+        let mut expected = vec![lone_gen1];
+        for window in 1..=3 {
+            expected.push(compact_tag_2497_window(&h, window).await);
+        }
+        expected.sort();
+
+        let snapshot_count = h.snapshot_count().await;
+        assert_eq!(
+            snapshot_count,
+            1 + 3 * 3,
+            "test setup: one data snapshot, then 3 windows of 2 data + 1 compaction snapshot"
+        );
+        let running = sorted_paths(&h.indexed_files());
+        assert_eq!(
+            running, expected,
+            "test setup: the running server indexes the lone gen1 file and the 3 gen2 outputs"
+        );
+        h.assert_index_readable(1 + 3 * 2).await;
+
+        // Control: loading every snapshot rebuilds exactly the running index, so the files and
+        // the snapshots that describe them are all still in the bucket.
+        let (catalog, all) = h.restart_loading_all().await;
+        assert_eq!(
+            CompactionHarness::paths_after_restart(&catalog, &all),
+            running,
+            "loading every snapshot should rebuild the running index"
+        );
+
+        // The server's load window: the newest LOAD_WINDOW snapshots only.
+        let (catalog, windowed) = h.restart_loading(LOAD_WINDOW).await;
+        let restarted = CompactionHarness::paths_after_restart(&catalog, &windowed);
+        let missing: Vec<&String> = running.iter().filter(|p| !restarted.contains(p)).collect();
+        assert!(
+            missing.is_empty(),
+            "after a restart that loads the newest {LOAD_WINDOW} of {snapshot_count} snapshots, \
+             {} of {} indexed files are gone from the index: {missing:?}",
+            missing.len(),
+            running.len(),
+        );
+        assert_eq!(restarted, running);
     }
 
     /// Regression test (TAG-2495): a data snapshot gets its sequence number when the WAL is
@@ -4006,6 +4446,7 @@ mod tests {
             index_check_enabled: true,
             index_check_interval: Duration::ZERO,
             index_check_max_prune_percent: 100,
+            ..CompactionConfig::default()
         };
 
         // Use .clone() so we can use write_buffer later

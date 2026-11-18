@@ -75,9 +75,15 @@ Examples:
                                    Remove none of a database's entries when more than this share
                                    of them look stale; 100 lifts the limit [default: 50]
                                   [env: INFLUXDB3_INDEX_CHECK_MAX_PRUNE_PERCENT=]
+  --index-checkpoint-snapshots <N>
+                                   Write an index checkpoint (the whole parquet index) every N
+                                   snapshots; startup loads the newest one and the snapshots
+                                   after it. 0 writes none [default: 1000]
+                                  [env: INFLUXDB3_INDEX_CHECKPOINT_SNAPSHOTS=]
   --gen1-lookback-duration <DURATION>
-                                   The amount of time that the server looks back on startup
-                                   when populating the in-memory index of gen1 files.
+                                   No longer limits what startup loads (it loads the newest
+                                   index checkpoint and every snapshot after it); keep it large
+                                   (e.g. 3650d) while rolling back to an older image is possible
                                   [env: INFLUXDB3_GEN1_LOOKBACK_DURATION=]
   --delete-grace-period <DURATION> Grace period for hard deleted databases and tables before they are
                                    removed permanently from the catalog [default: 24h]

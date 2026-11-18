@@ -15,7 +15,7 @@ use influxdb3_id::{DbId, SerdeVecMap};
 use influxdb3_telemetry::ParquetMetrics;
 use influxdb3_wal::WalFileSequenceNumber;
 use observability_deps::tracing::warn;
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 
 type DatabaseToTables = HashMap<DbId, TableToFiles>;
 type TableToFiles = HashMap<TableId, Vec<ParquetFile>>;
@@ -210,18 +210,19 @@ impl PersistedFiles {
         &self,
         catalog: Arc<Catalog>,
     ) -> SerdeVecMap<DbId, DatabaseTables> {
+        // The scan holds an upgradable read lock, so queries keep running alongside it. Upgrading
+        // it to the write lock is atomic: nothing changes the index or the delete marks between
+        // the scan and the removal.
+        let guard = self.inner.upgradable_read();
+
         // The id and path of each due entry, by table. A set, so each entry is queued once.
         let mut due: BTreeMap<(DbId, TableId), HashSet<(ParquetFileId, String)>> = BTreeMap::new();
-
-        // First pass is under a read lock to permit queries running concurrently.
         {
             let mut queue_for_removal = |db_id: DbId, table_id: TableId, file: &ParquetFile| {
                 due.entry((db_id, table_id))
                     .or_default()
                     .insert((file.id, file.path.clone()));
             };
-
-            let guard = self.inner.read();
 
             // Remove any data marked for hard-deletion.
             for (db_id, deleted) in guard.deleted_data.iter() {
@@ -282,10 +283,10 @@ impl PersistedFiles {
             return SerdeVecMap::new();
         }
 
-        // The index can change between the two locks, so the result is built from the entries
-        // this pass removes rather than from the ones queued.
+        let mut guard = RwLockUpgradableReadGuard::upgrade(guard);
+        // The result is built from the entries this pass removes, so it always describes the same
+        // entries as the index and the metrics.
         let mut removed: SerdeVecMap<DbId, DatabaseTables> = SerdeVecMap::new();
-        let mut guard = self.inner.write();
         let mut actually_removed = Removed::default();
         for ((db_id, table_id), due_in_table) in &due {
             let Some(files) = guard

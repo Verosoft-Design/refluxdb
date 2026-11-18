@@ -1287,7 +1287,11 @@ mod tests {
 
         assert!(persisted_files.get_files(retained_db, table_a).is_empty());
         assert!(persisted_files.get_files(retained_db, table_b).is_empty());
-        assert!(persisted_files.get_files(other_db, deleted_table).is_empty());
+        assert!(
+            persisted_files
+                .get_files(other_db, deleted_table)
+                .is_empty()
+        );
         assert_eq!(persisted_files.get_files(other_db, kept_table), vec![kept]);
         assert_metrics(&persisted_files, 1, 8_000, 80);
     }

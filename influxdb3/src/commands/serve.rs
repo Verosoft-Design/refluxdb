@@ -323,25 +323,28 @@ pub struct Config {
     )]
     pub index_check_max_prune_percent: u8,
 
-    /// The amount of time that the server looks back on startup when populating the in-memory
-    /// index of gen1 files.
+    /// Write an index checkpoint, a snapshot that holds the whole parquet index, once this many
+    /// snapshots have been written since the last one (and once right after startup, and at
+    /// least daily while snapshots are written). Startup loads the newest checkpoint and the
+    /// snapshots after it. 0 writes none: startup then loads the newest checkpoint already
+    /// written and every snapshot after it, or every snapshot. Runs only when compaction is
+    /// enabled.
+    #[clap(
+        long = "index-checkpoint-snapshots",
+        env = "INFLUXDB3_INDEX_CHECKPOINT_SNAPSHOTS",
+        default_value = "1000",
+        action
+    )]
+    pub index_checkpoint_snapshots: u64,
+
+    /// No longer limits what startup loads, so no index entry is left out (TAG-2497): startup
+    /// loads the newest index checkpoint and every snapshot after it, or every snapshot when there
+    /// is no checkpoint yet, and logs a warning when that is more snapshots than this covers
+    /// (this divided by --gen1-duration, e.g. 4383 for 1 month of 10 minutes).
     ///
-    /// This has two dimensions of impact on performance. The first is in terms of S3 API usage on
-    /// startup; the second is in terms of initial memory usage on startup. To get a rough sense of
-    /// both of these performance impacts, take the --gen1-duration value and divide that number
-    /// into this parameter to get the total number of gen1 index snapshots loaded on startup. You
-    /// can then take that number and multiply it by a rough approximation of the gen1 metadata
-    /// stored in this index to obtain a rough estimate of memory usage.
-    ///
-    /// As an example, let's say we have the following values:
-    ///
-    /// * Estimated average of 128 bytes of parquet file metadata
-    /// * --gen1-duration value of 10 minutes
-    /// * --gen1-lookback-duration value of 1 month
-    ///
-    /// This leads to 144 files per day for 30 days for a total of 4320 index snapshots read in
-    /// (via object store API calls) on startup and a (very rough) memory consumption estimate of
-    /// ~533 KB.
+    /// Images before TAG-2497 load only the newest (this / --gen1-duration) snapshots, by
+    /// sequence number: keep it large enough to cover every snapshot (e.g. 3650d) while
+    /// rolling back to one of them is possible.
     #[clap(
         long = "gen1-lookback-duration",
         env = "INFLUXDB3_GEN1_LOOKBACK_DURATION",
@@ -1039,6 +1042,10 @@ pub async fn command(config: Config) -> Result<()> {
         ).await?;
     }
 
+    // The index as loaded at startup: the compaction service's first index checkpoint starts
+    // from it. Taken either way, so it isn't kept in memory when compaction is off.
+    let index_checkpoint_base = write_buffer_impl.take_index_checkpoint_base();
+
     // Initialize and start compaction service
     if config.enable_compaction {
         info!("setting up compaction service");
@@ -1051,30 +1058,34 @@ pub async fn command(config: Config) -> Result<()> {
             index_check_enabled: config.enable_index_check,
             index_check_interval: config.index_check_interval.into(),
             index_check_max_prune_percent: config.index_check_max_prune_percent,
+            index_checkpoint_snapshots: config.index_checkpoint_snapshots,
             ..Default::default()
         };
 
-        let compaction_service = Arc::new(
-            influxdb3_write::compaction::CompactionService::new(
-                compaction_config,
-                Arc::clone(&catalog),
-                Arc::clone(&write_buffer_impl) as Arc<dyn WriteBuffer>,
-                Arc::clone(&persisted_files),
-                Arc::clone(&persister),
-                Arc::clone(&write_path_executor),
-                config.iox_query_datafusion_config.clone().build(),
-                Arc::clone(&object_store),
-                persister.object_store_url().clone(),
-                config.node_identifier_prefix.clone(),
-                Arc::clone(&time_provider),
-                shutdown_manager.register(),
-            )
-            .with_head_store(uncached_object_store),
-        );
+        let mut compaction_service = influxdb3_write::compaction::CompactionService::new(
+            compaction_config,
+            Arc::clone(&catalog),
+            Arc::clone(&write_buffer_impl) as Arc<dyn WriteBuffer>,
+            Arc::clone(&persisted_files),
+            Arc::clone(&persister),
+            Arc::clone(&write_path_executor),
+            config.iox_query_datafusion_config.clone().build(),
+            Arc::clone(&object_store),
+            persister.object_store_url().clone(),
+            config.node_identifier_prefix.clone(),
+            Arc::clone(&time_provider),
+            shutdown_manager.register(),
+        )
+        .with_head_store(uncached_object_store);
+        if let Some(base) = index_checkpoint_base {
+            compaction_service = compaction_service.with_index_checkpoint_base(base);
+        }
+        let compaction_service = Arc::new(compaction_service);
 
         compaction_service.start();
         info!("compaction service started");
     } else {
+        drop(index_checkpoint_base);
         info!("compaction service disabled");
     }
 
@@ -1467,6 +1478,7 @@ mod tests {
             "enable_index_check",
             "index_check_interval",
             "index_check_max_prune_percent",
+            "index_checkpoint_snapshots",
         ]
         .into_iter()
         .fold(Config::command(), |command, id| {
@@ -1507,5 +1519,14 @@ mod tests {
         // unit, and a pod with INFLUXDB3_INDEX_CHECK_INTERVAL=0 would not start).
         let config = parse(&["--index-check-interval", "0"]).unwrap();
         assert_eq!(Duration::from(config.index_check_interval), Duration::ZERO);
+    }
+
+    /// Index checkpoints every 1000 snapshots by default; 0 turns writing them off.
+    #[test]
+    fn index_checkpoint_flag() {
+        assert_eq!(parse(&[]).unwrap().index_checkpoint_snapshots, 1000);
+        let config = parse(&["--index-checkpoint-snapshots", "0"]).unwrap();
+        assert_eq!(config.index_checkpoint_snapshots, 0);
+        assert!(parse(&["--index-checkpoint-snapshots", "-1"]).is_err());
     }
 }

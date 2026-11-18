@@ -14,7 +14,7 @@ use crate::{
     LastCacheManager, ParquetFile, PersistedSnapshot, PersistedSnapshotVersion, Precision,
     WriteBuffer, WriteLineError,
     chunk::ParquetChunk,
-    persister::{Persister, PersisterError},
+    persister::{IndexCheckpointBase, Persister, PersisterError},
     write_buffer::{
         persisted_files::PersistedFiles, queryable_buffer::QueryableBuffer,
         validator::WriteValidator,
@@ -166,6 +166,9 @@ pub struct WriteBufferImpl {
     last_cache: Arc<LastCacheProvider>,
     /// The number of files we will accept for a query
     query_file_limit: usize,
+    /// The index as loaded at startup, until the compaction service takes it for its first
+    /// index checkpoint.
+    index_checkpoint_base: parking_lot::Mutex<Option<IndexCheckpointBase>>,
 }
 
 /// The maximum number of snapshots to load on start
@@ -208,30 +211,39 @@ impl WriteBufferImpl {
             wal_replay_concurrency_limit,
         }: WriteBufferImplArgs,
     ) -> Result<Arc<Self>> {
-        // load snapshots and replay the wal into the in memory buffer
-        let persisted_snapshots = persister
-            .load_snapshots(n_snapshots_to_load_on_start)
-            .await?
-            .into_iter()
-            // map the persisted snapshots into the newest version
-            .map(|psv| match psv {
-                PersistedSnapshotVersion::V1(ps) => ps,
-            })
-            .collect::<Vec<PersistedSnapshot>>();
-        let last_wal_sequence_number = persisted_snapshots
-            .first()
-            .map(|s| s.wal_file_sequence_number);
-        let last_snapshot_sequence_number = persisted_snapshots
-            .first()
-            .map(|s| s.snapshot_sequence_number);
+        // Load the parquet index (the newest index checkpoint and every snapshot after it), then
+        // replay the wal into the in memory buffer.
+        let loaded = persister.load_index(n_snapshots_to_load_on_start).await?;
+        let newest = loaded.fold.newest();
+        let last_wal_sequence_number = newest.map(|h| h.wal_file_sequence_number);
+        // New snapshots are numbered above every name in the snapshot folder, including an
+        // index checkpoint that was skipped because it couldn't be read (see
+        // `LoadedIndex::highest_listed`).
+        let last_snapshot_sequence_number = newest
+            .map(|h| h.snapshot_sequence_number)
+            .max(loaded.highest_listed);
         // If we have any snapshots, set sequential IDs from the newest one.
-        if let Some(first_snapshot) = persisted_snapshots.first() {
-            first_snapshot.next_file_id.set_next_id();
+        if let Some(newest) = newest {
+            newest.next_file_id.set_next_id();
         }
+        // The index as loaded, before the WAL replay changes it: every durable snapshot up to
+        // the newest one, which the first index checkpoint starts from.
+        let index_checkpoint_base = IndexCheckpointBase {
+            index: newest.map(|h| {
+                PersistedSnapshot::new_index_checkpoint(
+                    persister.node_identifier_prefix().to_string(),
+                    h.snapshot_sequence_number,
+                    h.wal_file_sequence_number,
+                    h.catalog_sequence_number,
+                    h.next_file_id,
+                    loaded.fold.files(),
+                )
+            }),
+            loaded_checkpoint: loaded.checkpoint,
+            checkpoints: loaded.checkpoints,
+        };
 
-        let persisted_files = Arc::new(PersistedFiles::new_from_persisted_snapshots(
-            persisted_snapshots,
-        ));
+        let persisted_files = Arc::new(PersistedFiles::from_fold(loaded.fold));
         let queryable_buffer = Arc::new(QueryableBuffer::new(QueryableBufferArgs {
             executor,
             catalog: Arc::clone(&catalog),
@@ -270,12 +282,19 @@ impl WriteBufferImpl {
             buffer: queryable_buffer,
             metrics: WriteMetrics::new(&metric_registry),
             query_file_limit: query_file_limit.unwrap_or(432),
+            index_checkpoint_base: parking_lot::Mutex::new(Some(index_checkpoint_base)),
         });
         Ok(result)
     }
 
     pub fn wal(&self) -> Arc<dyn Wal> {
         Arc::clone(&self.wal)
+    }
+
+    /// The index as loaded at startup, for the compaction service's first index checkpoint
+    /// (`CompactionService::with_index_checkpoint_base`). `None` after the first call.
+    pub fn take_index_checkpoint_base(&self) -> Option<IndexCheckpointBase> {
+        self.index_checkpoint_base.lock().take()
     }
 
     pub fn persisted_files(&self) -> Arc<PersistedFiles> {

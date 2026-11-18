@@ -16,6 +16,10 @@ pub const PARQUET_FILE_EXTENSION: &str = "parquet";
 /// File extension for snapshot info files
 pub const SNAPSHOT_INFO_FILE_EXTENSION: &str = "info.json";
 
+/// File extension for index checkpoints, which are kept with the snapshot info files (see
+/// [`SnapshotInfoFilePath::new_checkpoint`]).
+pub const INDEX_CHECKPOINT_FILE_EXTENSION: &str = "checkpoint.json";
+
 fn object_store_file_stem(n: u64) -> u64 {
     u64::MAX - n
 }
@@ -112,6 +116,34 @@ impl SnapshotInfoFilePath {
         Self(path)
     }
 
+    /// Where the index checkpoint with this sequence number is stored: in the snapshots folder,
+    /// named like a snapshot info file but with its own extension. Images that predate
+    /// checkpoints list and load it as an ordinary snapshot; startup finds the newest one by
+    /// name alone.
+    pub fn new_checkpoint(
+        host_prefix: &str,
+        snapshot_sequence_number: SnapshotSequenceNumber,
+    ) -> Self {
+        let path = ObjPath::from(format!(
+            "{host_prefix}/snapshots/{:020}.{}",
+            object_store_file_stem(snapshot_sequence_number.as_u64()),
+            INDEX_CHECKPOINT_FILE_EXTENSION
+        ));
+        Self(path)
+    }
+
+    /// Whether `path` names an index checkpoint.
+    pub fn is_checkpoint(path: &ObjPath) -> bool {
+        path.filename()
+            .is_some_and(|name| name.ends_with(&format!(".{INDEX_CHECKPOINT_FILE_EXTENSION}")))
+    }
+
+    /// The sequence number in the name of a snapshot info file or index checkpoint.
+    pub fn sequence_number(path: &ObjPath) -> Option<SnapshotSequenceNumber> {
+        let stem: u64 = path.filename()?.split('.').next()?.parse().ok()?;
+        Some(SnapshotSequenceNumber::new(object_store_file_stem(stem)))
+    }
+
     pub fn dir(host_prefix: &str) -> Self {
         Self(ObjPath::from(format!("{host_prefix}/snapshots")))
     }
@@ -185,4 +217,32 @@ fn snapshot_info_file_path_new() {
         *SnapshotInfoFilePath::new("my_host", SnapshotSequenceNumber::new(0)),
         ObjPath::from("my_host/snapshots/18446744073709551615.info.json")
     );
+}
+
+#[test]
+fn index_checkpoint_path_sorts_with_the_snapshot_of_the_same_number() {
+    let seq = SnapshotSequenceNumber::new(11_000_000_000_000_000_123);
+    let checkpoint = SnapshotInfoFilePath::new_checkpoint("my_host", seq);
+    assert_eq!(
+        *checkpoint,
+        ObjPath::from("my_host/snapshots/07446744073709551492.checkpoint.json")
+    );
+    assert!(SnapshotInfoFilePath::is_checkpoint(&checkpoint));
+    assert!(!SnapshotInfoFilePath::is_checkpoint(
+        &SnapshotInfoFilePath::new("my_host", seq)
+    ));
+    assert_eq!(
+        SnapshotInfoFilePath::sequence_number(&checkpoint),
+        Some(seq)
+    );
+    assert_eq!(
+        SnapshotInfoFilePath::sequence_number(&SnapshotInfoFilePath::new("my_host", seq)),
+        Some(seq)
+    );
+    // Startup sorts names ascending, newest first: the snapshot after the checkpoint sorts
+    // before it, the one before it after.
+    let newer = SnapshotInfoFilePath::new("my_host", seq.next());
+    let older = SnapshotInfoFilePath::new("my_host", SnapshotSequenceNumber::new(seq.as_u64() - 1));
+    assert!(newer.as_ref() < checkpoint.as_ref());
+    assert!(checkpoint.as_ref() < older.as_ref());
 }

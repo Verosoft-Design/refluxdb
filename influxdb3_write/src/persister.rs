@@ -1,9 +1,10 @@
 //! This is the implementation of the `Persister` used to write data from the buffer to object
 //! storage.
 
-use crate::PersistedSnapshotVersion;
 use crate::paths::ParquetFilePath;
 use crate::paths::SnapshotInfoFilePath;
+use crate::write_buffer::persisted_files::SnapshotFold;
+use crate::{PersistedSnapshot, PersistedSnapshotVersion};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
@@ -18,10 +19,11 @@ use futures_util::pin_mut;
 use futures_util::stream::StreamExt;
 use futures_util::stream::TryStreamExt;
 use influxdb3_cache::parquet_cache::ParquetFileDataToCache;
+use influxdb3_wal::SnapshotSequenceNumber;
 use iox_time::TimeProvider;
 use object_store::ObjectStore;
 use object_store::path::Path as ObjPath;
-use observability_deps::tracing::info;
+use observability_deps::tracing::{error, info, warn};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -88,6 +90,108 @@ pub struct Persister {
 /// Maximum number of snapshot GETs in flight at once when loading snapshots.
 const FETCH_CONCURRENCY: usize = 64;
 
+async fn get_snapshot(
+    location: ObjPath,
+    object_store: Arc<dyn ObjectStore>,
+) -> Result<PersistedSnapshotVersion> {
+    let bytes = object_store.get(&location).await?.bytes().await?;
+    serde_json::from_slice(&bytes).map_err(Into::into)
+}
+
+/// Index checkpoints are written and read in parts of this many bytes, each its own request,
+/// [`CHECKPOINT_TRANSFER_CONCURRENCY`] at a time. One request for a checkpoint the size of a
+/// large index (hundreds of MB) could outlast the object store client's request timeout (30 s
+/// by default). Snapshot info files are small and move in one request.
+const CHECKPOINT_TRANSFER_PART_SIZE: usize = 16 * 1024 * 1024;
+const CHECKPOINT_TRANSFER_CONCURRENCY: usize = 4;
+
+/// GET `location` (`size` bytes) in ranges of `part_size`, or in one request if it is no larger.
+async fn get_in_parts(
+    store: &Arc<dyn ObjectStore>,
+    location: &ObjPath,
+    size: usize,
+    part_size: usize,
+) -> object_store::Result<Bytes> {
+    if size <= part_size {
+        return store.get(location).await?.bytes().await;
+    }
+    let ranges: Vec<std::ops::Range<usize>> = (0..size)
+        .step_by(part_size)
+        .map(|start| start..(start + part_size).min(size))
+        .collect();
+    let parts: Vec<Bytes> = futures_util::stream::iter(ranges)
+        .map(|range| store.get_range(location, range))
+        .buffered(CHECKPOINT_TRANSFER_CONCURRENCY)
+        .try_collect()
+        .await?;
+    let mut bytes = bytes::BytesMut::with_capacity(size);
+    for part in parts {
+        bytes.extend_from_slice(&part);
+    }
+    Ok(bytes.freeze())
+}
+
+/// PUT `bytes` to `location` as a multipart upload in parts of `part_size`, or in one request if
+/// it is no larger. A failed multipart upload is aborted.
+async fn put_in_parts(
+    store: &Arc<dyn ObjectStore>,
+    location: &ObjPath,
+    bytes: Bytes,
+    part_size: usize,
+) -> object_store::Result<()> {
+    if bytes.len() <= part_size {
+        store.put(location, bytes.into()).await?;
+        return Ok(());
+    }
+    let upload = store.put_multipart(location).await?;
+    let mut write = object_store::WriteMultipart::new_with_chunk_size(upload, part_size);
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if let Err(e) = write
+            .wait_for_capacity(CHECKPOINT_TRANSFER_CONCURRENCY)
+            .await
+        {
+            let _ = write.abort().await;
+            return Err(e);
+        }
+        let end = (offset + part_size).min(bytes.len());
+        write.put(bytes.slice(offset..end));
+        offset = end;
+    }
+    write.finish().await?;
+    Ok(())
+}
+
+/// What [`Persister::load_index`] read.
+#[derive(Debug)]
+pub(crate) struct LoadedIndex {
+    /// The newest checkpoint and every snapshot after it, folded oldest to newest.
+    pub(crate) fold: SnapshotFold,
+    /// The checkpoint the load started from; `None` if every snapshot was loaded.
+    pub(crate) checkpoint: Option<SnapshotSequenceNumber>,
+    /// Every index checkpoint in the listing, newest first, readable or not.
+    pub(crate) checkpoints: Vec<SnapshotSequenceNumber>,
+    /// The highest sequence number of any name in the snapshot folder, loaded or not. New
+    /// snapshots must be numbered above it: a checkpoint skipped because it couldn't be read
+    /// may be readable at the next start, and startup then loads only names that sort before it,
+    /// so a snapshot written under its number or a lower one would be left out.
+    pub(crate) highest_listed: Option<SnapshotSequenceNumber>,
+}
+
+/// The index a server started with, kept for its first index checkpoint (see
+/// `CompactionService::with_index_checkpoint_base`): the fold of every durable snapshot up to the
+/// newest one at startup, so that checkpoint only has to fetch the snapshots written since.
+#[derive(Debug, Clone)]
+pub struct IndexCheckpointBase {
+    /// The fold, as a checkpoint snapshot numbered like the newest snapshot it holds. `None`
+    /// when there was no snapshot at startup.
+    pub(crate) index: Option<PersistedSnapshot>,
+    /// The checkpoint the startup load started from, if any.
+    pub(crate) loaded_checkpoint: Option<SnapshotSequenceNumber>,
+    /// The index checkpoints in object storage at startup, newest first.
+    pub(crate) checkpoints: Vec<SnapshotSequenceNumber>,
+}
+
 impl Persister {
     pub fn new(
         object_store: Arc<dyn ObjectStore>,
@@ -128,14 +232,6 @@ impl Persister {
         &self,
         most_recent_n: usize,
     ) -> Result<Vec<PersistedSnapshotVersion>> {
-        async fn get_snapshot(
-            location: ObjPath,
-            object_store: Arc<dyn ObjectStore>,
-        ) -> Result<PersistedSnapshotVersion> {
-            let bytes = object_store.get(&location).await?.bytes().await?;
-            serde_json::from_slice(&bytes).map_err(Into::into)
-        }
-
         if most_recent_n == 0 {
             return Ok(Vec::new());
         }
@@ -184,6 +280,201 @@ impl Persister {
             "loaded snapshots"
         );
         Ok(results)
+    }
+
+    /// Load the parquet index on server start: the newest index checkpoint and every snapshot
+    /// after it, or every snapshot when there is no checkpoint yet (the first start of an image
+    /// that writes checkpoints). The snapshot folder is listed once, as in [`Self::load_snapshots`];
+    /// the snapshots are fetched with a bounded number of concurrent GETs and folded oldest to
+    /// newest as they arrive, so memory stays near the size of the index rather than of every
+    /// snapshot loaded.
+    ///
+    /// A checkpoint that can't be read is logged and skipped, and the next older one is tried:
+    /// a checkpoint only repeats what the snapshots before it hold, and those are never deleted.
+    /// Any other snapshot that can't be read fails startup, as before.
+    ///
+    /// `n_snapshots_to_load_on_start` (from `--gen1-lookback-duration`) no longer limits the
+    /// load: loading only the newest n snapshots drops every file whose only entry is in an
+    /// older one (TAG-2497). It is logged with a warning when the load exceeds it.
+    pub(crate) async fn load_index(
+        &self,
+        n_snapshots_to_load_on_start: usize,
+    ) -> Result<LoadedIndex> {
+        let total_start = std::time::Instant::now();
+        let mut snapshot_list = self.object_store.list(Some(&SnapshotInfoFilePath::dir(
+            &self.node_identifier_prefix,
+        )));
+        let mut list = Vec::new();
+        while let Some(item) = snapshot_list.next().await {
+            list.push(item?);
+        }
+        let listed = list.len();
+        let list_elapsed = total_start.elapsed();
+        // Names are u64::MAX - sequence number: ascending order is newest first.
+        list.sort_unstable_by(|a, b| a.location.cmp(&b.location));
+        let highest_listed = list
+            .iter()
+            .filter_map(|meta| SnapshotInfoFilePath::sequence_number(&meta.location))
+            .max();
+
+        let fetch_start = std::time::Instant::now();
+        let checkpoints: Vec<(usize, SnapshotSequenceNumber)> = list
+            .iter()
+            .enumerate()
+            .filter(|(_, meta)| SnapshotInfoFilePath::is_checkpoint(&meta.location))
+            .filter_map(|(i, meta)| {
+                SnapshotInfoFilePath::sequence_number(&meta.location).map(|seq| (i, seq))
+            })
+            .collect();
+        let mut fold = SnapshotFold::default();
+        // Everything before this position in `list` is newer than the checkpoint loaded.
+        let mut newer_than_checkpoint = list.len();
+        let mut checkpoint = None;
+        for &(i, seq) in &checkpoints {
+            let meta = &list[i];
+            match self.get_index_checkpoint(&meta.location, meta.size).await {
+                Ok(PersistedSnapshotVersion::V1(snapshot)) if snapshot.checkpoint => {
+                    fold.apply(snapshot);
+                    newer_than_checkpoint = i;
+                    checkpoint = Some(seq);
+                    break;
+                }
+                Ok(_) => error!(
+                    path = %meta.location,
+                    "index checkpoint is not marked as one; skipping it and trying an older one"
+                ),
+                Err(e) => error!(
+                    path = %meta.location,
+                    %e,
+                    "could not read the index checkpoint; skipping it and trying an older one"
+                ),
+            }
+        }
+        // Oldest first, so each snapshot's removals apply to the files added before it. Newer
+        // checkpoints than the one loaded could not be read; they are skipped.
+        let tail: Vec<ObjPath> = list[..newer_than_checkpoint]
+            .iter()
+            .rev()
+            .filter(|meta| !SnapshotInfoFilePath::is_checkpoint(&meta.location))
+            .map(|meta| meta.location.clone())
+            .collect();
+        drop(list);
+        let mut fetches = futures_util::stream::iter(tail)
+            .map(|location| get_snapshot(location, Arc::clone(&self.object_store)))
+            .buffered(FETCH_CONCURRENCY);
+        while let Some(result) = fetches.next().await {
+            let PersistedSnapshotVersion::V1(snapshot) = result?;
+            fold.apply(snapshot);
+        }
+
+        let loaded = fold.applied();
+        info!(
+            listed,
+            loaded,
+            checkpoint_seq = checkpoint.map(|seq| seq.as_u64()),
+            checkpoints = checkpoints.len(),
+            lookback_snapshots = n_snapshots_to_load_on_start,
+            list_ms = list_elapsed.as_millis() as u64,
+            fetch_ms = fetch_start.elapsed().as_millis() as u64,
+            total_ms = total_start.elapsed().as_millis() as u64,
+            "loaded snapshots"
+        );
+        if loaded > n_snapshots_to_load_on_start {
+            warn!(
+                loaded,
+                lookback_snapshots = n_snapshots_to_load_on_start,
+                checkpoint_seq = checkpoint.map(|seq| seq.as_u64()),
+                "loaded more snapshots than --gen1-lookback-duration covers: startup loads the newest index checkpoint and every snapshot after it (every snapshot when there is no checkpoint yet), so no indexed file is left out"
+            );
+        }
+        Ok(LoadedIndex {
+            fold,
+            checkpoint,
+            checkpoints: checkpoints.into_iter().map(|(_, seq)| seq).collect(),
+            highest_listed,
+        })
+    }
+
+    /// GET an index checkpoint in parts (see [`CHECKPOINT_TRANSFER_PART_SIZE`]) and parse it.
+    async fn get_index_checkpoint(
+        &self,
+        location: &ObjPath,
+        size: usize,
+    ) -> Result<PersistedSnapshotVersion> {
+        let bytes = get_in_parts(
+            &self.object_store,
+            location,
+            size,
+            CHECKPOINT_TRANSFER_PART_SIZE,
+        )
+        .await?;
+        serde_json::from_slice(&bytes).map_err(Into::into)
+    }
+
+    /// Fetch the snapshot info file with this sequence number. `Ok(None)` if there is none: a
+    /// number that a data snapshot with nothing to persist, or a reservation that was never
+    /// written, left unused.
+    pub(crate) async fn get_snapshot_by_sequence_number(
+        &self,
+        snapshot_sequence_number: SnapshotSequenceNumber,
+    ) -> Result<Option<PersistedSnapshot>> {
+        let location =
+            SnapshotInfoFilePath::new(&self.node_identifier_prefix, snapshot_sequence_number);
+        match get_snapshot((*location).clone(), Arc::clone(&self.object_store)).await {
+            Ok(PersistedSnapshotVersion::V1(snapshot)) => Ok(Some(snapshot)),
+            Err(PersisterError::ObjectStore(object_store::Error::NotFound { .. })) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// An index checkpoint as the JSON [`Self::persist_index_checkpoint`] uploads: compact, and
+    /// serialized exactly like `PersistedSnapshotVersion::V1` without copying the whole index.
+    /// Done once per checkpoint, outside the upload's retries.
+    pub(crate) fn serialize_index_checkpoint(checkpoint: &PersistedSnapshot) -> Result<Bytes> {
+        debug_assert!(checkpoint.checkpoint);
+        #[derive(serde::Serialize)]
+        #[serde(tag = "version")]
+        enum Version<'a> {
+            #[serde(rename = "1")]
+            V1(&'a PersistedSnapshot),
+        }
+        Ok(serde_json::to_vec(&Version::V1(checkpoint))?.into())
+    }
+
+    /// Persist an index checkpoint (`json` from [`Self::serialize_index_checkpoint`]) under its
+    /// own name (see [`SnapshotInfoFilePath::new_checkpoint`]), in parts when it is large.
+    pub(crate) async fn persist_index_checkpoint(
+        &self,
+        snapshot_sequence_number: SnapshotSequenceNumber,
+        json: Bytes,
+    ) -> Result<()> {
+        let path = SnapshotInfoFilePath::new_checkpoint(
+            &self.node_identifier_prefix,
+            snapshot_sequence_number,
+        );
+        put_in_parts(
+            &self.object_store,
+            path.as_ref(),
+            json,
+            CHECKPOINT_TRANSFER_PART_SIZE,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Delete the index checkpoint with this sequence number.
+    pub(crate) async fn delete_index_checkpoint(
+        &self,
+        snapshot_sequence_number: SnapshotSequenceNumber,
+    ) -> Result<()> {
+        let path = SnapshotInfoFilePath::new_checkpoint(
+            &self.node_identifier_prefix,
+            snapshot_sequence_number,
+        );
+        match self.object_store.delete(path.as_ref()).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Loads a Parquet file from ObjectStore
@@ -364,6 +655,7 @@ mod tests {
             catalog_sequence_number: CatalogSequenceNumber::new(0),
             databases: SerdeVecMap::new(),
             removed_files: SerdeVecMap::new(),
+            checkpoint: false,
             min_time: 0,
             max_time: 1,
             row_count: 0,
@@ -387,6 +679,7 @@ mod tests {
             catalog_sequence_number: CatalogSequenceNumber::default(),
             databases: SerdeVecMap::new(),
             removed_files: SerdeVecMap::new(),
+            checkpoint: false,
             max_time: 1,
             min_time: 0,
             row_count: 0,
@@ -400,6 +693,7 @@ mod tests {
             catalog_sequence_number: CatalogSequenceNumber::default(),
             databases: SerdeVecMap::new(),
             removed_files: SerdeVecMap::new(),
+            checkpoint: false,
             min_time: 0,
             max_time: 1,
             row_count: 0,
@@ -413,6 +707,7 @@ mod tests {
             catalog_sequence_number: CatalogSequenceNumber::default(),
             databases: SerdeVecMap::new(),
             removed_files: SerdeVecMap::new(),
+            checkpoint: false,
             min_time: 0,
             max_time: 1,
             row_count: 0,
@@ -448,6 +743,7 @@ mod tests {
             catalog_sequence_number: CatalogSequenceNumber::default(),
             databases: SerdeVecMap::new(),
             removed_files: SerdeVecMap::new(),
+            checkpoint: false,
             min_time: 0,
             max_time: 1,
             row_count: 0,
@@ -476,6 +772,7 @@ mod tests {
                 catalog_sequence_number: CatalogSequenceNumber::new(id),
                 databases: SerdeVecMap::new(),
                 removed_files: SerdeVecMap::new(),
+                checkpoint: false,
                 min_time: 0,
                 max_time: 1,
                 row_count: 0,
@@ -705,6 +1002,7 @@ mod tests {
                 catalog_sequence_number: CatalogSequenceNumber::new(id),
                 databases: SerdeVecMap::new(),
                 removed_files: SerdeVecMap::new(),
+                checkpoint: false,
                 min_time: 0,
                 max_time: 1,
                 row_count: 0,
@@ -941,6 +1239,7 @@ mod tests {
                 catalog_sequence_number: CatalogSequenceNumber::new(id),
                 databases: tables_with(added),
                 removed_files: removed,
+                checkpoint: false,
                 min_time: 0,
                 max_time: 1,
                 row_count: 10,
@@ -1052,6 +1351,7 @@ mod tests {
             min_time: 0,
             max_time: 1,
             removed_files: SerdeVecMap::new(),
+            checkpoint: false,
             databases,
         });
         insta::assert_json_snapshot!(snapshot);
@@ -1126,5 +1426,55 @@ mod tests {
         // Assert that we have a file of bytes > 0
         assert!(!bytes.is_empty());
         assert_eq!(bytes.len() as u64, bytes_written);
+    }
+
+    /// Index checkpoints move in parts: bigger than a part, smaller, and an exact multiple.
+    #[tokio::test]
+    async fn index_checkpoint_transfer_in_parts_round_trips() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        for len in [0_usize, 100, 4096, 3 * 4096, 40_000] {
+            let path = ObjPath::from(format!("test_host/snapshots/{len}.checkpoint.json"));
+            let bytes = Bytes::from((0..len).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+            put_in_parts(&store, &path, bytes.clone(), 4096)
+                .await
+                .unwrap();
+            assert_eq!(store.head(&path).await.unwrap().size, len);
+            assert_eq!(
+                get_in_parts(&store, &path, len, 4096).await.unwrap(),
+                bytes,
+                "{len} bytes"
+            );
+        }
+    }
+
+    /// The checkpoint JSON is serialized without copying the index, so check it is exactly
+    /// what `PersistedSnapshotVersion::V1` gives and parses back to it.
+    #[test]
+    fn index_checkpoint_json_is_a_v1_snapshot() {
+        let file = ParquetFile {
+            id: ParquetFileId::from(7),
+            path: "test_host/dbs/db-1/table-2/2026-01-01/00-00/0000000001.parquet".to_string(),
+            size_bytes: 100,
+            row_count: 3,
+            chunk_time: 0,
+            min_time: 0,
+            max_time: 10,
+        };
+        let checkpoint = PersistedSnapshot::new_index_checkpoint(
+            "test_host".to_string(),
+            SnapshotSequenceNumber::new(9),
+            WalFileSequenceNumber::new(4),
+            CatalogSequenceNumber::new(5),
+            ParquetFileId::from(8),
+            std::collections::BTreeMap::from([((DbId::from(1), TableId::from(2)), vec![file])]),
+        );
+        let json = Persister::serialize_index_checkpoint(&checkpoint).unwrap();
+        let owned = PersistedSnapshotVersion::V1(checkpoint);
+        assert_eq!(
+            json.as_ref(),
+            serde_json::to_vec(&owned).unwrap().as_slice()
+        );
+        let parsed: PersistedSnapshotVersion = serde_json::from_slice(&json).unwrap();
+        assert_eq!(parsed, owned);
     }
 }

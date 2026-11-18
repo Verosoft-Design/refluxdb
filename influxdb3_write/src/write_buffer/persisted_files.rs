@@ -425,7 +425,8 @@ impl Inner {
     /// Add all files from a persisted snapshot and apply its removals.
     ///
     /// Files are added with [`Self::add_persisted_file`] semantics (a file whose path is already
-    /// indexed replaces the existing entry), and removals match by [`ParquetFileId`].
+    /// indexed replaces the existing entry). Removals match by [`ParquetFileId`] and path, like
+    /// the snapshot loader's: an entry that only shares an id with a removed file stays.
     pub(crate) fn add_persisted_snapshot(&mut self, persisted_snapshot: PersistedSnapshot) {
         let mut added = Removed::default();
         let mut replaced = Removed::default();
@@ -450,10 +451,11 @@ impl Inner {
                 else {
                     continue;
                 };
-                let ids: HashSet<ParquetFileId> = files.iter().map(|f| f.id).collect();
+                let to_remove: HashSet<(ParquetFileId, &str)> =
+                    files.iter().map(|f| (f.id, f.path.as_str())).collect();
                 let mut removed = Removed::default();
                 table_files.retain(|file| {
-                    if ids.contains(&file.id) {
+                    if to_remove.contains(&(file.id, file.path.as_str())) {
                         removed.add(file);
                         false
                     } else {
@@ -1112,6 +1114,40 @@ mod tests {
             reloaded.get_files(db_id, table_id),
             persisted_files.get_files(db_id, table_id)
         );
+    }
+
+    /// Applying a snapshot's `removed_files` to the running index matches by id and path, as the
+    /// snapshot loader does: an entry that only shares the id with a removed file (builds before
+    /// TAG-2495 could reuse ids after a restart) stays indexed.
+    #[test]
+    fn add_persisted_snapshot_keeps_an_entry_that_only_shares_the_id() {
+        let db_id = DbId::from(0);
+        let table_id = TableId::from(0);
+        let stale = parquet_file(7, "gen1/2026-07-10/23-10/0000021161.parquet", 1_000, 10);
+        let reused_id = parquet_file(7, "gen1/2026-07-11/00-00/0000021200.parquet", 2_000, 20);
+
+        let snapshot_1 = build_snapshot(vec![stale.clone(), reused_id.clone()], 1, 1, 1);
+        let persisted_files =
+            PersistedFiles::new_from_persisted_snapshots(vec![snapshot_1.clone()]);
+
+        let mut snapshot_2 = build_snapshot(vec![], 2, 2, 2);
+        snapshot_2
+            .removed_files
+            .entry(db_id)
+            .or_default()
+            .tables
+            .insert(table_id, vec![stale]);
+        persisted_files.add_persisted_snapshot_files(snapshot_2.clone());
+
+        assert_eq!(
+            persisted_files.get_files(db_id, table_id),
+            vec![reused_id.clone()]
+        );
+        assert_metrics(&persisted_files, 1, 2_000, 20);
+
+        // Loading the same snapshots after a restart gives the same index.
+        let reloaded = PersistedFiles::new_from_persisted_snapshots(vec![snapshot_2, snapshot_1]);
+        assert_eq!(reloaded.get_files(db_id, table_id), vec![reused_id]);
     }
 
     /// The retention tests' clock: one day after the epoch, in nanoseconds.

@@ -1077,6 +1077,31 @@ mod tests {
         );
     }
 
+    /// A sync trigger (`run_async: false`, the CLI default) runs its batches in its own
+    /// loop, so the old endless retry also stopped it from ever reading the next batch.
+    #[tokio::test]
+    async fn test_sync_trigger_runs_the_next_batch_after_one_it_cannot_convert() {
+        let settings = TriggerSettings {
+            run_async: false,
+            error_behavior: ErrorBehavior::Log,
+        };
+        let (pem, _file) = setup_with_trigger(
+            "sync_bad_batch",
+            &TriggerSpecificationDefinition::AllTablesWalWrite.string_rep(),
+            settings,
+            &None,
+        )
+        .await;
+
+        pem.notify(Arc::new(wal_contents_with_unknown_column(&pem)))
+            .await;
+        pem.notify(Arc::new(wal_contents_with_reading(&pem))).await;
+
+        // The test plugin logs "done" for each batch it receives.
+        wait_for_engine_logs(&pem, "sync_bad_batch", "done", 1).await;
+        assert_eq!(engine_log_count(&pem, "sync_bad_batch", BATCH_ERROR), 1);
+    }
+
     /// A forced delete removes the trigger from the catalog before the engine is told,
     /// and the engine used to find the trigger to stop through the catalog. The running
     /// WAL trigger then kept receiving every write, and nothing could disable it.
@@ -1173,11 +1198,28 @@ mod tests {
     /// One write to `foo.cpu` whose only field has a column id the table doesn't have,
     /// so the engine can't convert it (`field not found`).
     fn wal_contents_with_unknown_column(pem: &ProcessingEngineManagerImpl) -> WalContents {
+        cpu_write(pem, Field::new(ColumnId::new(9_999), FieldData::Float(1.0)))
+    }
+
+    /// One write to `foo.cpu` with a `reading` value, which the engine converts.
+    fn wal_contents_with_reading(pem: &ProcessingEngineManagerImpl) -> WalContents {
+        let cpu = pem
+            .catalog
+            .db_schema("foo")
+            .unwrap()
+            .table_definition("cpu")
+            .unwrap();
+        let reading = cpu.column_name_to_id("reading").unwrap();
+        cpu_write(pem, Field::new(reading, FieldData::Float(37.0)))
+    }
+
+    /// One WAL write to `foo.cpu` holding a single row with `field`.
+    fn cpu_write(pem: &ProcessingEngineManagerImpl, field: Field) -> WalContents {
         let db = pem.catalog.db_schema("foo").unwrap();
         let table_id = db.table_name_to_id("cpu").unwrap();
         let row = Row {
             time: 0,
-            fields: vec![Field::new(ColumnId::new(9_999), FieldData::Float(1.0))],
+            fields: vec![field],
         };
         let mut table_chunks = SerdeVecMap::new();
         table_chunks.insert(

@@ -70,11 +70,10 @@ impl PluginChannels {
         &self,
         db: String,
         trigger: String,
-        trigger_spec: &TriggerSpecificationDefinition,
+        plugin_type: PluginType,
     ) -> Result<Option<Receiver<()>>, ProcessingEngineError> {
-        match trigger_spec {
-            TriggerSpecificationDefinition::SingleTableWalWrite { .. }
-            | TriggerSpecificationDefinition::AllTablesWalWrite => {
+        match plugin_type {
+            PluginType::WalRows => {
                 if let Some(trigger_map) = self.wal_triggers.get(&db) {
                     if let Some(sender) = trigger_map.get(&trigger) {
                         // create a one shot to wait for the shutdown to complete
@@ -89,8 +88,7 @@ impl PluginChannels {
                     }
                 }
             }
-            TriggerSpecificationDefinition::Schedule { .. }
-            | TriggerSpecificationDefinition::Every { .. } => {
+            PluginType::Schedule => {
                 if let Some(trigger_map) = self.schedule_triggers.get(&db) {
                     if let Some(sender) = trigger_map.get(&trigger) {
                         // create a one shot to wait for the shutdown to complete
@@ -105,7 +103,7 @@ impl PluginChannels {
                     }
                 }
             }
-            TriggerSpecificationDefinition::RequestPath { .. } => {
+            PluginType::Request => {
                 if let Some(sender) = self.request_triggers.get(&trigger) {
                     // create a one shot to wait for the shutdown to complete
                     let (tx, rx) = oneshot::channel();
@@ -123,28 +121,41 @@ impl PluginChannels {
         Ok(None)
     }
 
-    fn remove_trigger(
-        &mut self,
-        db: String,
-        trigger: String,
-        trigger_spec: &TriggerSpecificationDefinition,
-    ) {
-        match trigger_spec {
-            TriggerSpecificationDefinition::SingleTableWalWrite { .. }
-            | TriggerSpecificationDefinition::AllTablesWalWrite => {
+    fn remove_trigger(&mut self, db: String, trigger: String, plugin_type: PluginType) {
+        match plugin_type {
+            PluginType::WalRows => {
                 if let Some(trigger_map) = self.wal_triggers.get_mut(&db) {
                     trigger_map.remove(&trigger);
                 }
             }
-            TriggerSpecificationDefinition::Schedule { .. }
-            | TriggerSpecificationDefinition::Every { .. } => {
+            PluginType::Schedule => {
                 if let Some(trigger_map) = self.schedule_triggers.get_mut(&db) {
                     trigger_map.remove(&trigger);
                 }
             }
-            TriggerSpecificationDefinition::RequestPath { .. } => {
+            PluginType::Request => {
                 self.request_triggers.remove(&trigger);
             }
+        }
+    }
+
+    /// The type of a running WAL or scheduled trigger, found by name. Used when the
+    /// catalog no longer has the trigger but its plugin may still be running.
+    fn running_plugin_type(&self, db: &str, trigger: &str) -> Option<PluginType> {
+        if self
+            .wal_triggers
+            .get(db)
+            .is_some_and(|triggers| triggers.contains_key(trigger))
+        {
+            Some(PluginType::WalRows)
+        } else if self
+            .schedule_triggers
+            .get(db)
+            .is_some_and(|triggers| triggers.contains_key(trigger))
+        {
+            Some(PluginType::Schedule)
+        } else {
+            None
         }
     }
 
@@ -461,23 +472,30 @@ impl ProcessingEngineManagerImpl {
             .catalog
             .db_schema(db_name)
             .ok_or_else(|| ProcessingEngineError::DatabaseNotFound(db_name.to_string()))?;
-        let trigger = db_schema
+        // A forced delete reaches the catalog before this runs, so a trigger that is
+        // still running may already be gone from it. Find that one by name, or it
+        // would keep running with no way to stop it.
+        let plugin_type = match db_schema
             .processing_engine_triggers
             .get_by_name(trigger_name)
-            .ok_or_else(|| CatalogError::ProcessingEngineTriggerNotFound {
-                database_name: db_name.to_string(),
-                trigger_name: trigger_name.to_string(),
-            })?;
+        {
+            Some(trigger) => trigger.trigger.plugin_type(),
+            None => self
+                .plugin_event_tx
+                .read()
+                .await
+                .running_plugin_type(db_name, trigger_name)
+                .ok_or_else(|| CatalogError::ProcessingEngineTriggerNotFound {
+                    database_name: db_name.to_string(),
+                    trigger_name: trigger_name.to_string(),
+                })?,
+        };
 
         let Some(shutdown_rx) = self
             .plugin_event_tx
             .write()
             .await
-            .send_shutdown(
-                db_name.to_string(),
-                trigger_name.to_string(),
-                &trigger.trigger,
-            )
+            .send_shutdown(db_name.to_string(), trigger_name.to_string(), plugin_type)
             .await?
         else {
             return Ok(());
@@ -491,7 +509,7 @@ impl ProcessingEngineManagerImpl {
             self.plugin_event_tx.write().await.remove_trigger(
                 db_name.to_string(),
                 trigger_name.to_string(),
-                &trigger.trigger,
+                plugin_type,
             );
         }
         self.cache
@@ -745,17 +763,23 @@ mod tests {
     use crate::ProcessingEngineManagerImpl;
     use crate::environment::DisabledManager;
     use crate::plugins::ProcessingEngineEnvironmentManager;
+    use arrow_array::{Array, StringArray};
     use data_types::NamespaceName;
     use datafusion_util::config::register_iox_object_store;
     use influxdb3_cache::distinct_cache::DistinctCacheProvider;
     use influxdb3_cache::last_cache::LastCacheProvider;
     use influxdb3_catalog::CatalogError;
     use influxdb3_catalog::catalog::Catalog;
-    use influxdb3_catalog::log::{TriggerSettings, TriggerSpecificationDefinition};
+    use influxdb3_catalog::log::{ErrorBehavior, TriggerSettings, TriggerSpecificationDefinition};
+    use influxdb3_id::{ColumnId, SerdeVecMap};
     use influxdb3_internal_api::query_executor::UnimplementedQueryExecutor;
+    use influxdb3_py_api::logging::ProcessingEngineLog;
     use influxdb3_shutdown::ShutdownManager;
     use influxdb3_sys_events::SysEventStore;
-    use influxdb3_wal::{Gen1Duration, WalConfig};
+    use influxdb3_wal::{
+        Field, FieldData, Gen1Duration, Row, TableChunk, TableChunks, WalConfig, WalContents,
+        WalFileNotifier, WalFileSequenceNumber, WalOp, WriteBatch,
+    };
     use influxdb3_write::persister::Persister;
     use influxdb3_write::write_buffer::{
         N_SNAPSHOTS_TO_LOAD_ON_START, WriteBufferImpl, WriteBufferImplArgs,
@@ -768,10 +792,11 @@ mod tests {
     use metric::Registry;
     use object_store::ObjectStore;
     use object_store::memory::InMemory;
+    use observability_deps::tracing;
     use parquet_file::storage::{ParquetStorage, StorageId};
     use std::io::Write;
     use std::num::NonZeroUsize;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tempfile::NamedTempFile;
 
@@ -968,6 +993,335 @@ mod tests {
         };
 
         Ok(())
+    }
+
+    const BATCH_ERROR: &str = "error executing against batch";
+
+    /// A WAL batch the engine can't turn into Python rows must be logged and dropped
+    /// under `ErrorBehavior::Log`. It used to be retried forever against the same
+    /// schema, logging every attempt (TAG-2772: about 20k lines a minute).
+    #[tokio::test]
+    async fn test_unconvertible_wal_batch_is_logged_once() {
+        let settings = TriggerSettings {
+            run_async: true,
+            error_behavior: ErrorBehavior::Log,
+        };
+        let (pem, _file) = setup_with_trigger(
+            "bad_batch",
+            &TriggerSpecificationDefinition::AllTablesWalWrite.string_rep(),
+            settings,
+            &None,
+        )
+        .await;
+
+        pem.notify(Arc::new(wal_contents_with_unknown_column(&pem)))
+            .await;
+        wait_for_engine_logs(&pem, "bad_batch", BATCH_ERROR, 1).await;
+        // Room for a looping trigger to repeat the batch.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(engine_log_count(&pem, "bad_batch", BATCH_ERROR), 1);
+    }
+
+    /// The engine's error line must not carry trigger arguments: they hold webhook
+    /// secrets, API keys and tokens, and the line ends up in the log store.
+    #[tokio::test]
+    async fn test_batch_error_log_omits_trigger_arguments() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer = {
+            let captured = Arc::clone(&captured);
+            move || CapturedLog(Arc::clone(&captured))
+        };
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_ansi(false)
+            .finish();
+        // The test runtime is single-threaded, so the plugin task logs on this thread.
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let args = Some(hashbrown::HashMap::from([(
+            "twilio_token".to_string(),
+            "not-a-real-token-6d1f".to_string(),
+        )]));
+        let settings = TriggerSettings {
+            run_async: true,
+            error_behavior: ErrorBehavior::Log,
+        };
+        let (pem, _file) = setup_with_trigger(
+            "secret_args",
+            &TriggerSpecificationDefinition::AllTablesWalWrite.string_rep(),
+            settings,
+            &args,
+        )
+        .await;
+
+        // Other tests hit the same log callsites with no subscriber; make sure the
+        // cached interest includes this one before the batch is sent.
+        tracing::callsite::rebuild_interest_cache();
+        pem.notify(Arc::new(wal_contents_with_unknown_column(&pem)))
+            .await;
+        wait_for_engine_logs(&pem, "secret_args", BATCH_ERROR, 1).await;
+
+        let logs = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("error running against batch"),
+            "the batch error was not captured: {logs}"
+        );
+        assert!(
+            logs.contains("secret_args"),
+            "the batch error doesn't name its trigger: {logs}"
+        );
+        assert!(
+            !logs.contains("not-a-real-token-6d1f"),
+            "a trigger argument value reached the log: {logs}"
+        );
+    }
+
+    /// A sync trigger (`run_async: false`, the CLI default) runs its batches in its own
+    /// loop, so the old endless retry also stopped it from ever reading the next batch.
+    #[tokio::test]
+    async fn test_sync_trigger_runs_the_next_batch_after_one_it_cannot_convert() {
+        let settings = TriggerSettings {
+            run_async: false,
+            error_behavior: ErrorBehavior::Log,
+        };
+        let (pem, _file) = setup_with_trigger(
+            "sync_bad_batch",
+            &TriggerSpecificationDefinition::AllTablesWalWrite.string_rep(),
+            settings,
+            &None,
+        )
+        .await;
+
+        pem.notify(Arc::new(wal_contents_with_unknown_column(&pem)))
+            .await;
+        pem.notify(Arc::new(wal_contents_with_reading(&pem))).await;
+
+        // The test plugin logs "done" for each batch it receives.
+        wait_for_engine_logs(&pem, "sync_bad_batch", "done", 1).await;
+        assert_eq!(engine_log_count(&pem, "sync_bad_batch", BATCH_ERROR), 1);
+    }
+
+    /// A forced delete removes the trigger from the catalog before the engine is told,
+    /// and the engine used to find the trigger to stop through the catalog. The running
+    /// WAL trigger then kept receiving every write, and nothing could disable it.
+    #[tokio::test]
+    async fn test_force_deleted_wal_trigger_stops_receiving_writes() {
+        let (pem, _file) = setup_with_trigger(
+            "doomed_wal",
+            &TriggerSpecificationDefinition::AllTablesWalWrite.string_rep(),
+            TriggerSettings::default(),
+            &None,
+        )
+        .await;
+        assert!(wal_trigger_registered(&pem, "doomed_wal").await);
+
+        pem.catalog
+            .delete_processing_engine_trigger("foo", "doomed_wal", true)
+            .await
+            .unwrap();
+
+        assert!(
+            !wal_trigger_registered(&pem, "doomed_wal").await,
+            "a force-deleted WAL trigger still receives writes"
+        );
+    }
+
+    /// The same for a scheduled trigger: after a forced delete it must not keep running.
+    #[tokio::test]
+    async fn test_force_deleted_schedule_trigger_stops_running() {
+        let (pem, _file) = setup_with_trigger(
+            "doomed_schedule",
+            "every:1h",
+            TriggerSettings::default(),
+            &None,
+        )
+        .await;
+        assert!(schedule_trigger_registered(&pem, "doomed_schedule").await);
+
+        pem.catalog
+            .delete_processing_engine_trigger("foo", "doomed_schedule", true)
+            .await
+            .unwrap();
+
+        assert!(
+            !schedule_trigger_registered(&pem, "doomed_schedule").await,
+            "a force-deleted scheduled trigger is still running"
+        );
+    }
+
+    /// Creates database `foo` with table `cpu`, then an enabled trigger on it.
+    async fn setup_with_trigger(
+        trigger_name: &str,
+        trigger_spec: &str,
+        settings: TriggerSettings,
+        args: &Option<hashbrown::HashMap<String, String>>,
+    ) -> (Arc<ProcessingEngineManagerImpl>, NamedTempFile) {
+        let start_time = Time::from_rfc3339("2024-11-14T11:00:00+00:00").unwrap();
+        let wal_config = WalConfig {
+            gen1_duration: Gen1Duration::new_1m(),
+            max_write_buffer_size: 100,
+            flush_interval: Duration::from_millis(10),
+            snapshot_size: 1,
+            ..Default::default()
+        };
+        let (pem, file) = setup(start_time, Arc::new(InMemory::new()), wal_config).await;
+        pem.write_buffer
+            .write_lp(
+                NamespaceName::new("foo").unwrap(),
+                "cpu,warehouse=us-east,room=01a,device=10001 reading=37\n",
+                start_time,
+                false,
+                Precision::Nanosecond,
+                false,
+            )
+            .await
+            .unwrap();
+        let file_name = file.path().file_name().unwrap().to_str().unwrap();
+        let file_name = pem.validate_plugin_filename(file_name).await.unwrap();
+        pem.catalog
+            .create_processing_engine_trigger(
+                "foo",
+                trigger_name,
+                Arc::clone(&pem.node_id),
+                file_name,
+                trigger_spec,
+                settings,
+                args,
+                false,
+            )
+            .await
+            .unwrap();
+        (pem, file)
+    }
+
+    /// One write to `foo.cpu` whose only field has a column id the table doesn't have,
+    /// so the engine can't convert it (`field not found`).
+    fn wal_contents_with_unknown_column(pem: &ProcessingEngineManagerImpl) -> WalContents {
+        cpu_write(pem, Field::new(ColumnId::new(9_999), FieldData::Float(1.0)))
+    }
+
+    /// One write to `foo.cpu` with a `reading` value, which the engine converts.
+    fn wal_contents_with_reading(pem: &ProcessingEngineManagerImpl) -> WalContents {
+        let cpu = pem
+            .catalog
+            .db_schema("foo")
+            .unwrap()
+            .table_definition("cpu")
+            .unwrap();
+        let reading = cpu.column_name_to_id("reading").unwrap();
+        cpu_write(pem, Field::new(reading, FieldData::Float(37.0)))
+    }
+
+    /// One WAL write to `foo.cpu` holding a single row with `field`.
+    fn cpu_write(pem: &ProcessingEngineManagerImpl, field: Field) -> WalContents {
+        let db = pem.catalog.db_schema("foo").unwrap();
+        let table_id = db.table_name_to_id("cpu").unwrap();
+        let row = Row {
+            time: 0,
+            fields: vec![field],
+        };
+        let mut table_chunks = SerdeVecMap::new();
+        table_chunks.insert(
+            table_id,
+            TableChunks {
+                min_time: 0,
+                max_time: 0,
+                chunk_time_to_chunk: hashbrown::HashMap::from([(
+                    0,
+                    TableChunk { rows: vec![row] },
+                )]),
+            },
+        );
+        WalContents {
+            persist_timestamp_ms: 0,
+            min_timestamp_ns: 0,
+            max_timestamp_ns: 0,
+            wal_file_number: WalFileSequenceNumber::new(1),
+            ops: vec![WalOp::Write(WriteBatch {
+                catalog_sequence: 0,
+                database_id: db.id,
+                database_name: Arc::clone(&db.name),
+                table_chunks,
+                min_time_ns: 0,
+                max_time_ns: 0,
+            })],
+            snapshot: None,
+        }
+    }
+
+    /// Lines in `system.processing_engine_logs` for this trigger that start with `prefix`.
+    fn engine_log_count(
+        pem: &ProcessingEngineManagerImpl,
+        trigger_name: &str,
+        prefix: &str,
+    ) -> usize {
+        let Some(batch) = pem.sys_event_store.as_record_batch::<ProcessingEngineLog>() else {
+            return 0;
+        };
+        let batch = batch.unwrap();
+        let column = |name: &str| {
+            batch
+                .column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .clone()
+        };
+        let (names, texts) = (column("trigger_name"), column("log_text"));
+        (0..batch.num_rows())
+            .filter(|&i| names.value(i) == trigger_name && texts.value(i).starts_with(prefix))
+            .count()
+    }
+
+    async fn wait_for_engine_logs(
+        pem: &ProcessingEngineManagerImpl,
+        trigger_name: &str,
+        prefix: &str,
+        at_least: usize,
+    ) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while engine_log_count(pem, trigger_name, prefix) < at_least {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no '{prefix}' log for {trigger_name} within 10s"));
+    }
+
+    async fn wal_trigger_registered(pem: &ProcessingEngineManagerImpl, trigger_name: &str) -> bool {
+        pem.plugin_event_tx
+            .read()
+            .await
+            .wal_triggers
+            .get("foo")
+            .is_some_and(|triggers| triggers.contains_key(trigger_name))
+    }
+
+    async fn schedule_trigger_registered(
+        pem: &ProcessingEngineManagerImpl,
+        trigger_name: &str,
+    ) -> bool {
+        pem.plugin_event_tx
+            .read()
+            .await
+            .schedule_triggers
+            .get("foo")
+            .is_some_and(|triggers| triggers.contains_key(trigger_name))
+    }
+
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     async fn setup(

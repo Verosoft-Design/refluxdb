@@ -124,9 +124,10 @@ pub(crate) fn run_schedule_plugin(
     // Ensure that the plugin is a schedule plugin
     let plugin_type = trigger_definition.trigger.plugin_type();
     if !matches!(plugin_type, influxdb3_catalog::log::PluginType::Schedule) {
-        return Err(PluginError::NonSchedulePluginWithScheduleTrigger(format!(
-            "{trigger_definition:?}"
-        )));
+        // Name only: the definition's arguments can hold secrets.
+        return Err(PluginError::NonSchedulePluginWithScheduleTrigger(
+            trigger_definition.trigger_name.to_string(),
+        ));
     }
 
     let trigger_plugin = TriggerPlugin::new(db_name, plugin_code, trigger_definition, context);
@@ -309,7 +310,7 @@ mod python_plugin {
                                 }
                             }
                             Err(err) => {
-                                error!(?self.trigger_definition, "error processing wal contents: {err}");
+                                error!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, "error processing wal contents: {err}");
                             }
                         }
                     }
@@ -364,7 +365,7 @@ mod python_plugin {
                                         PluginNextState::SuccessfulRun => {}
                                         PluginNextState::LogError(err) => {
                                             self.logger.log(LogLevel::Error, format!("error running scheduled plugin: {err}"));
-                                            error!(?self.trigger_definition, "error running scheduled plugin: {err}");
+                                            error!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, "error running scheduled plugin: {err}");
                                         }
                                         PluginNextState::Disable(trigger_definition) => {
                                             warn!("disabling trigger {} due to error", trigger_definition.trigger_name);
@@ -383,7 +384,7 @@ mod python_plugin {
                                 }
                                 Err(err) => {
                                     self.logger.log(LogLevel::Error, format!("error running scheduled plugin: {err}"));
-                                    error!(?self.trigger_definition, "error running scheduled plugin: {}", err);
+                                    error!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, "error running scheduled plugin: {}", err);
                                 }
                             }
 
@@ -392,7 +393,7 @@ mod python_plugin {
                     event = receiver.recv() => {
                         match event {
                             None => {
-                                warn!(?self.trigger_definition, "trigger plugin receiver closed");
+                                warn!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, "trigger plugin receiver closed");
                                 break;
                             }
                             Some(ScheduleEvent::Shutdown(sender)) => {
@@ -405,14 +406,14 @@ mod python_plugin {
                         match result {
                             Err(e) => {
                                 self.logger.log(LogLevel::Error, format!("error running async scheduled plugin: {e}"));
-                                error!(?self.trigger_definition, "error running async scheduled plugin: {e}");
+                                error!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, "error running async scheduled plugin: {e}");
                             }
                             Ok(result) => {
                                 match result {
                                     PluginNextState::SuccessfulRun => {}
                                     PluginNextState::LogError(err) => {
                                         self.logger.log(LogLevel::Error, format!("error running async scheduled plugin: {err}"));
-                                        error!(?self.trigger_definition, "error running async scheduled plugin: {err}");
+                                        error!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, "error running async scheduled plugin: {err}");
                                     }
                                     PluginNextState::Disable(trigger_definition) => {
                                         warn!("disabling trigger {} due to error", trigger_definition.trigger_name);
@@ -447,14 +448,14 @@ mod python_plugin {
             loop {
                 match receiver.recv().await {
                     None => {
-                        warn!(?self.trigger_definition, "trigger plugin receiver closed");
+                        warn!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, "trigger plugin receiver closed");
                         break;
                     }
                     Some(RequestEvent::Request(request)) => {
                         let Some(schema) =
                             self.write_buffer.catalog().db_schema(self.db_name.as_str())
                         else {
-                            error!(?self.trigger_definition, "missing db schema");
+                            error!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, "missing db schema");
                             return Err(PluginError::MissingDb);
                         };
                         let plugin_code = self.plugin_code.code();
@@ -497,7 +498,7 @@ mod python_plugin {
                                         LogLevel::Error,
                                         format!("error running request plugin: {error}"),
                                     );
-                                    error!(?self.trigger_definition, "error running request plugin: {error}");
+                                    error!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, "error running request plugin: {error}");
                                 }
 
                                 let response_status = StatusCode::from_u16(response_code)
@@ -522,7 +523,7 @@ mod python_plugin {
                                     LogLevel::Error,
                                     format!("error running request plugin: {e}"),
                                 );
-                                error!(?self.trigger_definition, "error running request plugin: {e}");
+                                error!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, "error running request plugin: {e}");
                                 let body = serde_json::json!({"error": e.to_string()}).to_string();
                                 ResponseBuilder::new()
                                     .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -532,7 +533,7 @@ mod python_plugin {
                         };
 
                         if request.response_tx.send(response).is_err() {
-                            error!(?self.trigger_definition, "error sending response");
+                            error!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, "error sending response");
                         }
                     }
                     Some(RequestEvent::Shutdown(sender)) => {
@@ -630,7 +631,7 @@ mod python_plugin {
                                             LogLevel::Error,
                                             format!("error running wal plugin: {error}"),
                                         );
-                                        error!(?self.trigger_definition, "error running wal plugin: {error}");
+                                        error!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, "error running wal plugin: {error}");
                                     }
                                     break;
                                 }
@@ -641,7 +642,10 @@ mod python_plugin {
                                                 LogLevel::Error,
                                                 format!("error executing against batch {err}"),
                                             );
-                                            error!(?self.trigger_definition, "error running against batch: {err}");
+                                            error!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, "error running against batch: {err}");
+                                            // Log means log and move on. Looping here retried the
+                                            // same batch against the same schema forever.
+                                            break;
                                         }
                                         ErrorBehavior::Retry => {
                                             info!(

@@ -3066,6 +3066,7 @@ name = "influxdb3_processing_engine"
 version = "3.3.0-nightly"
 dependencies = [
  "anyhow",
+ "arrow-array",
  "async-trait",
  "bytes",
  "chrono",
@@ -3079,6 +3080,7 @@ dependencies = [
  "influxdb3_cache",
  "influxdb3_catalog",
  "influxdb3_client",
+ "influxdb3_id",
  "influxdb3_internal_api",
  "influxdb3_py_api",
  "influxdb3_shutdown",
@@ -3101,6 +3103,7 @@ dependencies = [
  "test-log",
  "thiserror 1.0.69",
  "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]

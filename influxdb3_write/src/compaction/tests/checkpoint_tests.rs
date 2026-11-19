@@ -117,7 +117,7 @@ async fn run_step(h: &CompactionHarness, step: usize) {
                 .service
                 .prune_index_entries(BTreeMap::from([(test_table(h), vec![lone])]))
                 .await;
-            assert_eq!(pruned, 1, "test setup: the prune removed nothing");
+            assert_eq!(pruned.count(), 1, "test setup: the prune removed nothing");
         }
         3 => {
             compact_tag_2497_window(h, 2).await;
@@ -245,7 +245,7 @@ async fn test_checkpoint_waits_for_a_prune_snapshot_that_is_still_uploading() {
         .await
         .is_ok();
     release.notify_one();
-    assert_eq!(prune.await, 1);
+    assert_eq!(prune.await.count(), 1);
     if !written_during_upload {
         checkpoint.await.unwrap();
     }
@@ -926,7 +926,7 @@ async fn test_checkpoint_gives_up_the_gate_so_index_snapshots_keep_going() {
     .await
     .expect("prune B was held up behind the checkpoint waiting for the gate");
     assert!(checkpoint.is_err(), "the checkpoint should give up");
-    assert_eq!(pruned_b, 1);
+    assert_eq!(pruned_b.count(), 1);
     release.notify_one();
-    assert_eq!(prune_a.await, 1);
+    assert_eq!(prune_a.await.count(), 1);
 }

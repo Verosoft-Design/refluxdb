@@ -48,6 +48,11 @@ pub struct CompactionConfig {
     /// more than this percentage of that database's entries it could check are stale. 100 lifts
     /// the limit.
     pub index_check_max_prune_percent: u8,
+    /// A prune records its removals in snapshots of at most this many entries. A snapshot is one
+    /// PUT of pretty-printed JSON, about 430 bytes per entry on tagmobi-prod (Nov 2026), and the
+    /// object store gives each request 30 s: 346k entries in one snapshot would be about 148 MB,
+    /// and its upload retries until it succeeds. 20,000 entries is about 9 MB.
+    pub max_entries_per_removal_snapshot: usize,
     /// Write an index checkpoint once this many snapshot sequence numbers have been handed out
     /// since the last one, and once right after startup. 0 writes none. See
     /// [`CompactionService::write_index_checkpoint`].
@@ -74,6 +79,7 @@ impl Default for CompactionConfig {
             index_check_enabled: true,
             index_check_interval: Duration::from_secs(3600),
             index_check_max_prune_percent: 50,
+            max_entries_per_removal_snapshot: 20_000,
             index_checkpoint_snapshots: 1_000,
             index_checkpoint_max_age: Duration::from_secs(24 * 3600),
             index_checkpoint_poll_interval: Duration::from_secs(60),
@@ -217,6 +223,44 @@ fn by_table(entries: impl IntoIterator<Item = StaleEntry>) -> StaleEntries {
         by_table.entry(entry.key).or_default().push(entry.file);
     }
     by_table
+}
+
+/// Split stale entries into batches of at most `max` entries (at least 1), in table order. A
+/// table's entries may span batches.
+fn removal_batches(stale: StaleEntries, max: usize) -> Vec<StaleEntries> {
+    let max = max.max(1);
+    let mut batches = Vec::new();
+    let mut batch = StaleEntries::new();
+    let mut len = 0;
+    for (key, files) in stale {
+        for file in files {
+            if len == max {
+                batches.push(std::mem::take(&mut batch));
+                len = 0;
+            }
+            batch.entry(key).or_default().push(file);
+            len += 1;
+        }
+    }
+    if len > 0 {
+        batches.push(batch);
+    }
+    batches
+}
+
+/// What [`CompactionService::prune_index_entries`] removed.
+#[derive(Debug, Default)]
+struct Pruned {
+    /// Entries removed, per database.
+    by_db: BTreeMap<DbId, usize>,
+    /// Sequence numbers of the removal snapshots written, in order. An undo deletes them all.
+    snapshots: Vec<u64>,
+}
+
+impl Pruned {
+    fn count(&self) -> usize {
+        self.by_db.values().sum()
+    }
 }
 
 /// Log a stale entry before it is pruned. Pruning drops the entry, so the object's rows stop
@@ -1295,53 +1339,63 @@ impl CompactionService {
 
     /// Remove stale index entries durably: a snapshot lists them in `removed_files` before they
     /// leave the in-memory index, so a restart does not load them again from the snapshot that
-    /// added them. Entries that are no longer indexed (compaction or retention removed them
-    /// meanwhile) are left out; if none is left, no snapshot is written. Returns how many entries
-    /// were removed.
+    /// added them.
     ///
-    /// To undo a wrong prune: stop the server, delete that removal snapshot (the info line below
-    /// gives its sequence number) and every index checkpoint numbered above it
-    /// (`*.checkpoint.json` sorting before it by name), and start again. A checkpoint written
-    /// after the prune holds the index without the pruned entries, so it must go too; startup then
-    /// loads an older checkpoint, or every snapshot.
-    async fn prune_index_entries(&self, stale: StaleEntries) -> usize {
+    /// The removals go into one snapshot per `max_entries_per_removal_snapshot` entries, written
+    /// and applied in turn, so no upload grows with the prune: each snapshot is one PUT, which
+    /// the object store gives 30 s and [`Self::persist_index_snapshot`] retries until it succeeds.
+    /// Just before each snapshot, entries that are no longer indexed (compaction or retention
+    /// removed them meanwhile) are left out; a batch with none left writes no snapshot.
+    ///
+    /// To undo a wrong prune: stop the server, delete that run's removal snapshots (the run's
+    /// summary line lists their sequence numbers, and an info line below names each) and every
+    /// index checkpoint numbered above the first of them (`*.checkpoint.json` sorting before it
+    /// by name), and start again. A
+    /// checkpoint written after the prune holds the index without the pruned entries, so it must
+    /// go too; startup then loads an older checkpoint, or every snapshot.
+    async fn prune_index_entries(&self, stale: StaleEntries) -> Pruned {
         let persisted_files = self.persisted_files();
-        let indexed: StaleEntries = stale
-            .into_iter()
-            .map(|((db_id, table_id), files)| {
-                let files = persisted_files.indexed(db_id, table_id, &files);
-                ((db_id, table_id), files)
-            })
-            .filter(|(_, files)| !files.is_empty())
-            .collect();
-        let count = indexed.values().map(Vec::len).sum();
-        if count == 0 {
-            return 0;
-        }
+        let mut pruned = Pruned::default();
+        for batch in removal_batches(stale, self.config.max_entries_per_removal_snapshot) {
+            let indexed: StaleEntries = batch
+                .into_iter()
+                .map(|((db_id, table_id), files)| {
+                    let files = persisted_files.indexed(db_id, table_id, &files);
+                    ((db_id, table_id), files)
+                })
+                .filter(|(_, files)| !files.is_empty())
+                .collect();
+            let count: usize = indexed.values().map(Vec::len).sum();
+            if count == 0 {
+                continue;
+            }
 
-        let snapshot_sequence_number = self
-            .persist_index_snapshot(|snapshot| {
-                for ((db_id, table_id), files) in &indexed {
-                    snapshot
-                        .removed_files
-                        .entry(*db_id)
-                        .or_default()
-                        .tables
-                        .entry(*table_id)
-                        .or_default()
-                        .extend(files.iter().cloned());
-                }
-            })
-            .await;
-        for ((db_id, table_id), files) in &indexed {
-            persisted_files.remove_persisted_files(db_id, table_id, files);
+            let snapshot_sequence_number = self
+                .persist_index_snapshot(|snapshot| {
+                    for ((db_id, table_id), files) in &indexed {
+                        snapshot
+                            .removed_files
+                            .entry(*db_id)
+                            .or_default()
+                            .tables
+                            .entry(*table_id)
+                            .or_default()
+                            .extend(files.iter().cloned());
+                    }
+                })
+                .await;
+            for ((db_id, table_id), files) in &indexed {
+                persisted_files.remove_persisted_files(db_id, table_id, files);
+                *pruned.by_db.entry(*db_id).or_default() += files.len();
+            }
+            pruned.snapshots.push(snapshot_sequence_number.as_u64());
+            info!(
+                count,
+                snapshot_sequence_number = snapshot_sequence_number.as_u64(),
+                "removed stale parquet index entries and recorded the removal in a snapshot"
+            );
         }
-        info!(
-            count,
-            snapshot_sequence_number = snapshot_sequence_number.as_u64(),
-            "removed stale parquet index entries and recorded the removal in a snapshot"
-        );
-        count
+        pruned
     }
 
     /// Check every index entry against object storage and prune the ones whose object is
@@ -1376,10 +1430,13 @@ impl CompactionService {
         let cutoffs = self.catalog.get_retention_period_cutoff_map();
         let mut expired: Vec<(ParquetFileId, String)> = Vec::new();
         let mut entries = Vec::new();
+        // Database names, so the lines below name each database as well as its id.
+        let mut names: HashMap<DbId, Arc<str>> = HashMap::new();
         for db_schema in self.catalog.list_db_schema() {
             if db_schema.deleted {
                 continue;
             }
+            names.insert(db_schema.id, Arc::clone(&db_schema.name));
             for table_def in db_schema.tables() {
                 if table_def.deleted {
                     continue;
@@ -1490,6 +1547,7 @@ impl CompactionService {
                 .partition(|e| !over_limit.contains(&e.key.0))
         };
         undecided.extend(kept.iter().map(|e| (e.file.id, e.file.path.clone())));
+        let label = |db: &DbId| format!("{} (db {db})", names.get(db).map_or("?", |n| n.as_ref()));
         let sample = || {
             kept.iter()
                 .take(5)
@@ -1508,28 +1566,50 @@ impl CompactionService {
         } else if !kept.is_empty() {
             // Far more than drift leaves behind: more likely object storage answering NotFound
             // for objects it holds. Pruning would hide their rows for good, so keep them.
+            let refused: Vec<String> = over_limit
+                .iter()
+                .map(|db| {
+                    let (checked_db, unknown_db) = per_db.get(db).copied().unwrap_or_default();
+                    let stale_db = stale_by_db.get(db).copied().unwrap_or_default();
+                    format!(
+                        "{}: {stale_db} of {} stale",
+                        label(db),
+                        checked_db - unknown_db
+                    )
+                })
+                .collect();
             error!(
                 checked,
                 definite,
                 stale,
                 kept = kept.len(),
                 databases = ?over_limit,
+                refused = ?refused,
                 max_prune_percent = max_percent,
                 sample = ?sample(),
                 "too much of the parquet index looks stale to prune safely, so these databases' entries were not removed; check object storage, then set --index-check-max-prune-percent (INFLUXDB3_INDEX_CHECK_MAX_PRUNE_PERCENT) to 100 to prune them"
             );
         }
         // A first start after a long drift may find many stale entries: log some, count the
-        // rest. The removal snapshot lists every one of them.
+        // rest. The removal snapshots list every one of them.
         prunable.iter().take(STALE_LOG_LIMIT).for_each(log_stale);
         let not_logged = prunable.len().saturating_sub(STALE_LOG_LIMIT);
         let pruned = self.prune_index_entries(by_table(prunable)).await;
         // Entries this run pruned or found present come off the planning skip list.
         self.left_out.lock().retain(|key| undecided.contains(key));
+        let pruned_by_database: Vec<String> = pruned
+            .by_db
+            .iter()
+            .map(|(db, count)| format!("{}: {count}", label(db)))
+            .collect();
         info!(
             checked,
             stale,
-            pruned,
+            pruned = pruned.count(),
+            pruned_by_database = ?pruned_by_database,
+            removal_snapshots = pruned.snapshots.len(),
+            removal_snapshot_sequence_numbers = ?pruned.snapshots,
+            max_prune_percent = max_percent,
             not_logged,
             cleared,
             unknown,
@@ -3168,7 +3248,7 @@ mod tests {
 
     /// A first start of the new image may prune many entries at once (tagmobi-prod logged 134765
     /// stale entries in July). The startup check logs the first [`STALE_LOG_LIMIT`] paths and
-    /// counts the rest in its summary; the removal snapshot lists all of them.
+    /// counts the rest in its summary; the removal snapshots list all of them.
     #[tokio::test]
     async fn test_startup_index_check_logs_the_first_stale_paths_and_counts_the_rest() {
         let h = CompactionHarness::new().await;
@@ -3191,6 +3271,126 @@ mod tests {
             "{logs}"
         );
         assert!(logs.contains("not_logged = 2"), "{logs}");
+    }
+
+    /// Entries a snapshot lists as removed.
+    fn removed_entries(snapshot: &PersistedSnapshotVersion) -> usize {
+        let PersistedSnapshotVersion::V1(snapshot) = snapshot;
+        snapshot
+            .removed_files
+            .iter()
+            .map(|(_, db)| {
+                db.tables
+                    .iter()
+                    .map(|(_, files)| files.len())
+                    .sum::<usize>()
+            })
+            .sum()
+    }
+
+    /// A large prune is recorded in removal snapshots of at most
+    /// `max_entries_per_removal_snapshot` entries each, so no upload grows with the prune
+    /// (TAG-2497: prod's first full load prunes about 346k entries in one run). Every entry is
+    /// pruned, the summary lists the snapshots' sequence numbers (an undo deletes them all), and
+    /// a restart keeps all of them pruned.
+    #[tokio::test]
+    async fn test_a_large_prune_is_recorded_in_bounded_removal_snapshots() {
+        let h = CompactionHarness::new().await;
+        for i in 0..5_u64 {
+            let ts = (10 + 60 * i) * 1_000_000_000;
+            h.write_gen1(&format!("testtable value={i} {ts}")).await;
+            h.delete_object(&h.indexed_file_at(ts as i64)).await;
+        }
+        let snapshots = h.snapshot_count().await;
+        let service = h.service_with_config(CompactionConfig {
+            max_entries_per_removal_snapshot: 2,
+            ..two_minute_gen2_config()
+        });
+
+        let capture = test_helpers::tracing::TracingCapture::new();
+        service.check_index_for_missing_files().await;
+        let logs = capture.to_string();
+
+        assert!(h.indexed_files().is_empty(), "every stale entry is pruned");
+        let written = h.snapshot_count().await - snapshots;
+        let removals = h.persister.load_snapshots(written).await.unwrap();
+        let mut sizes: Vec<usize> = removals.iter().map(removed_entries).collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![1, 2, 2], "5 removals in snapshots of at most 2");
+        let mut numbers: Vec<u64> = removals
+            .iter()
+            .map(|snapshot| {
+                let PersistedSnapshotVersion::V1(snapshot) = snapshot;
+                snapshot.snapshot_sequence_number.as_u64()
+            })
+            .collect();
+        numbers.sort_unstable();
+        let summary = logs
+            .lines()
+            .find(|line| line.contains("checked the parquet index against object storage"))
+            .unwrap_or_else(|| panic!("no summary line: {logs}"));
+        assert!(summary.contains("removal_snapshots = 3"), "{summary}");
+        assert!(
+            summary.contains(&format!("removal_snapshot_sequence_numbers = {numbers:?}")),
+            "the summary lists every removal snapshot, for an undo: {summary}"
+        );
+        assert_eq!(
+            logs.matches("removed stale parquet index entries").count(),
+            3,
+            "one line per removal snapshot, for its sequence number: {logs}"
+        );
+
+        let (catalog, write_buffer) = h.restart_loading_all().await;
+        assert!(
+            CompactionHarness::paths_after_restart(&catalog, &write_buffer).is_empty(),
+            "a restart that loads every snapshot brought a pruned entry back"
+        );
+    }
+
+    /// A prune too large for one upload still completes. The store here fails any snapshot PUT
+    /// larger than a few entries, as a 30 s request timeout fails a large body. With one
+    /// removal snapshot per prune, its upload retried forever and nothing was pruned.
+    #[tokio::test]
+    async fn test_a_prune_too_large_for_one_upload_still_completes() {
+        use futures::TryStreamExt;
+
+        let store = Arc::new(HeadFailingObjectStore::new(Arc::new(InMemory::new())));
+        let h = CompactionHarness::with_object_store(Arc::clone(&store) as _).await;
+        for i in 0..8_u64 {
+            let ts = (10 + 60 * i) * 1_000_000_000;
+            h.write_gen1(&format!("testtable value={i} {ts}")).await;
+            h.delete_object(&h.indexed_file_at(ts as i64)).await;
+        }
+        // Each data snapshot so far adds one file. Allow three entries more than the largest of
+        // them: a removal snapshot of 2 entries fits, one of all 8 doesn't.
+        let entry_bytes = serde_json::to_vec_pretty(&h.indexed_files()[0])
+            .unwrap()
+            .len();
+        let largest_snapshot = h
+            .object_store
+            .list(None)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|meta| meta.location.as_ref().contains("/snapshots/"))
+            .map(|meta| meta.size)
+            .max()
+            .unwrap();
+        store.refuse_snapshot_puts_over(largest_snapshot + 3 * entry_bytes);
+        let service = h.service_with_config(CompactionConfig {
+            max_entries_per_removal_snapshot: 2,
+            ..two_minute_gen2_config()
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            service.check_index_for_missing_files(),
+        )
+        .await
+        .expect("the prune never finished: its removal snapshot was too large to upload");
+
+        assert!(h.indexed_files().is_empty(), "every stale entry is pruned");
     }
 
     /// The startup check prunes nothing when a larger share of the index looks stale than
@@ -3679,6 +3879,28 @@ mod tests {
             "otherdb, under the limit, was not pruned"
         );
         assert_eq!(logs.matches("level = ERROR").count(), 1, "{logs}");
+
+        // The refusal names each refused database with its counts, and the summary gives the
+        // limit in force and what each database pruned, so an operator can check both against
+        // what was expected (TAG-2497's prod rollout).
+        let id = |name: &str| h.catalog.db_schema(name).unwrap().id;
+        let refusal = logs
+            .lines()
+            .find(|line| line.contains("too much of the parquet index looks stale"))
+            .unwrap_or_else(|| panic!("no refusal line: {logs}"));
+        assert!(
+            refusal.contains(&format!("testdb (db {}): 2 of 2 stale", id("testdb"))),
+            "{refusal}"
+        );
+        let summary = logs
+            .lines()
+            .find(|line| line.contains("checked the parquet index against object storage"))
+            .unwrap_or_else(|| panic!("no summary line: {logs}"));
+        assert!(summary.contains("max_prune_percent = 50"), "{summary}");
+        assert!(
+            summary.contains(&format!("otherdb (db {}): 1", id("otherdb"))),
+            "{summary}"
+        );
     }
 
     /// With `index_check_enabled` off, the service starts without checking the index.
@@ -3990,7 +4212,8 @@ mod tests {
 
     /// Forwards to `inner`, except for HEAD of the paths set with [`Self::not_found_once`] (the
     /// next HEAD says NotFound), [`Self::fail_head`] (fails with an error other than NotFound,
-    /// after any NotFound-once) and [`Self::hold_head`] (HEAD waits for a permit).
+    /// after any NotFound-once) and [`Self::hold_head`] (HEAD waits for a permit), and for PUTs
+    /// of snapshot files above [`Self::refuse_snapshot_puts_over`].
     #[derive(Debug)]
     struct HeadFailingObjectStore {
         inner: Arc<dyn ObjectStore>,
@@ -3998,6 +4221,7 @@ mod tests {
         not_found_once: parking_lot::Mutex<HashSet<ObjPath>>,
         held: parking_lot::Mutex<Option<(ObjPath, Arc<tokio::sync::Semaphore>)>>,
         held_waiting: std::sync::atomic::AtomicBool,
+        max_snapshot_put_bytes: parking_lot::Mutex<Option<usize>>,
     }
 
     impl HeadFailingObjectStore {
@@ -4008,7 +4232,14 @@ mod tests {
                 not_found_once: Default::default(),
                 held: Default::default(),
                 held_waiting: Default::default(),
+                max_snapshot_put_bytes: Default::default(),
             }
+        }
+
+        /// A PUT into a `snapshots/` folder larger than `bytes` fails, as a request timeout fails
+        /// an upload too large to finish in time.
+        fn refuse_snapshot_puts_over(&self, bytes: usize) {
+            *self.max_snapshot_put_bytes.lock() = Some(bytes);
         }
 
         /// Whether a HEAD of the held path has started waiting.
@@ -4046,6 +4277,15 @@ mod tests {
             payload: object_store::PutPayload,
             opts: object_store::PutOptions,
         ) -> object_store::Result<object_store::PutResult> {
+            let limit = *self.max_snapshot_put_bytes.lock();
+            if let Some(limit) = limit {
+                if location.as_ref().contains("/snapshots/") && payload.content_length() > limit {
+                    return Err(object_store::Error::Generic {
+                        store: "test",
+                        source: "operation timed out".into(),
+                    });
+                }
+            }
             self.inner.put_opts(location, payload, opts).await
         }
 

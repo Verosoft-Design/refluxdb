@@ -253,8 +253,8 @@ fn removal_batches(stale: StaleEntries, max: usize) -> Vec<StaleEntries> {
 struct Pruned {
     /// Entries removed, per database.
     by_db: BTreeMap<DbId, usize>,
-    /// Removal snapshots written.
-    snapshots: usize,
+    /// Sequence numbers of the removal snapshots written, in order. An undo deletes them all.
+    snapshots: Vec<u64>,
 }
 
 impl Pruned {
@@ -1347,9 +1347,10 @@ impl CompactionService {
     /// Just before each snapshot, entries that are no longer indexed (compaction or retention
     /// removed them meanwhile) are left out; a batch with none left writes no snapshot.
     ///
-    /// To undo a wrong prune: stop the server, delete that run's removal snapshots (one info
-    /// line below each, with its sequence number) and every index checkpoint numbered above the
-    /// first of them (`*.checkpoint.json` sorting before it by name), and start again. A
+    /// To undo a wrong prune: stop the server, delete that run's removal snapshots (the run's
+    /// summary line lists their sequence numbers, and an info line below names each) and every
+    /// index checkpoint numbered above the first of them (`*.checkpoint.json` sorting before it
+    /// by name), and start again. A
     /// checkpoint written after the prune holds the index without the pruned entries, so it must
     /// go too; startup then loads an older checkpoint, or every snapshot.
     async fn prune_index_entries(&self, stale: StaleEntries) -> Pruned {
@@ -1387,7 +1388,7 @@ impl CompactionService {
                 persisted_files.remove_persisted_files(db_id, table_id, files);
                 *pruned.by_db.entry(*db_id).or_default() += files.len();
             }
-            pruned.snapshots += 1;
+            pruned.snapshots.push(snapshot_sequence_number.as_u64());
             info!(
                 count,
                 snapshot_sequence_number = snapshot_sequence_number.as_u64(),
@@ -1606,7 +1607,8 @@ impl CompactionService {
             stale,
             pruned = pruned.count(),
             pruned_by_database = ?pruned_by_database,
-            removal_snapshots = pruned.snapshots,
+            removal_snapshots = pruned.snapshots.len(),
+            removal_snapshot_sequence_numbers = ?pruned.snapshots,
             max_prune_percent = max_percent,
             not_logged,
             cleared,
@@ -3289,7 +3291,8 @@ mod tests {
     /// A large prune is recorded in removal snapshots of at most
     /// `max_entries_per_removal_snapshot` entries each, so no upload grows with the prune
     /// (TAG-2497: prod's first full load prunes about 346k entries in one run). Every entry is
-    /// pruned, the summary counts the snapshots, and a restart keeps all of them pruned.
+    /// pruned, the summary lists the snapshots' sequence numbers (an undo deletes them all), and
+    /// a restart keeps all of them pruned.
     #[tokio::test]
     async fn test_a_large_prune_is_recorded_in_bounded_removal_snapshots() {
         let h = CompactionHarness::new().await;
@@ -3310,17 +3313,27 @@ mod tests {
 
         assert!(h.indexed_files().is_empty(), "every stale entry is pruned");
         let written = h.snapshot_count().await - snapshots;
-        let mut sizes: Vec<usize> = h
-            .persister
-            .load_snapshots(written)
-            .await
-            .unwrap()
-            .iter()
-            .map(removed_entries)
-            .collect();
+        let removals = h.persister.load_snapshots(written).await.unwrap();
+        let mut sizes: Vec<usize> = removals.iter().map(removed_entries).collect();
         sizes.sort_unstable();
         assert_eq!(sizes, vec![1, 2, 2], "5 removals in snapshots of at most 2");
-        assert!(logs.contains("removal_snapshots = 3"), "{logs}");
+        let mut numbers: Vec<u64> = removals
+            .iter()
+            .map(|snapshot| {
+                let PersistedSnapshotVersion::V1(snapshot) = snapshot;
+                snapshot.snapshot_sequence_number.as_u64()
+            })
+            .collect();
+        numbers.sort_unstable();
+        let summary = logs
+            .lines()
+            .find(|line| line.contains("checked the parquet index against object storage"))
+            .unwrap_or_else(|| panic!("no summary line: {logs}"));
+        assert!(summary.contains("removal_snapshots = 3"), "{summary}");
+        assert!(
+            summary.contains(&format!("removal_snapshot_sequence_numbers = {numbers:?}")),
+            "the summary lists every removal snapshot, for an undo: {summary}"
+        );
         assert_eq!(
             logs.matches("removed stale parquet index entries").count(),
             3,

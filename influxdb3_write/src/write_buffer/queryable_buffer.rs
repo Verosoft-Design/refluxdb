@@ -3,10 +3,7 @@ use crate::paths::ParquetFilePath;
 use crate::persister::Persister;
 use crate::write_buffer::persisted_files::PersistedFiles;
 use crate::write_buffer::table_buffer::TableBuffer;
-use crate::{
-    ChunkFilter, DatabaseTables, ParquetFile, ParquetFileId, PersistedSnapshot,
-    PersistedSnapshotVersion,
-};
+use crate::{ChunkFilter, ParquetFile, ParquetFileId, PersistedSnapshot, PersistedSnapshotVersion};
 use anyhow::Context;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -21,7 +18,7 @@ use hashbrown::HashMap;
 use influxdb3_cache::parquet_cache::{CacheRequest, ParquetCacheOracle};
 use influxdb3_cache::{distinct_cache::DistinctCacheProvider, last_cache::LastCacheProvider};
 use influxdb3_catalog::catalog::{Catalog, DatabaseSchema, TableDefinition};
-use influxdb3_id::{DbId, SerdeVecMap, TableId};
+use influxdb3_id::{DbId, TableId};
 use influxdb3_wal::{SnapshotDetails, WalContents, WalFileNotifier, WalOp, WriteBatch};
 use iox_query::QueryChunk;
 use iox_query::chunk_statistics::{NoColumnRanges, create_chunk_statistics};
@@ -29,7 +26,7 @@ use iox_query::exec::Executor;
 use iox_query::frontend::reorg::ReorgPlanner;
 use object_store::path::Path;
 use object_store::{Error, ObjectStore};
-use observability_deps::tracing::{error, info};
+use observability_deps::tracing::{error, info, warn};
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 use parquet::format::FileMetaData;
@@ -228,8 +225,6 @@ impl QueryableBuffer {
             persisting_chunks
         };
 
-        // Their objects are deleted only once this flush's snapshot, which records the removal,
-        // is persisted (see `delete_removed_files`).
         let removed_files = self
             .persisted_files
             .remove_files_for_deletion(Arc::clone(&self.catalog));
@@ -258,6 +253,12 @@ impl QueryableBuffer {
                 catalog.sequence_number(),
             );
 
+            let removed_paths: Vec<Path> = removed_files
+                .iter()
+                .flat_map(|(_, tables)| tables.tables.iter())
+                .flat_map(|(_, files)| files.iter())
+                .map(|file| Path::from(file.path.as_str()))
+                .collect();
             snapshot.removed_files = removed_files;
             // persist the individual files, building the snapshot as we go
             let persisted_snapshot = Arc::new(Mutex::new(snapshot));
@@ -389,11 +390,8 @@ impl QueryableBuffer {
                         }
                     }
                 }
-                // The snapshot that records the removed files is persisted, so a restart no
-                // longer indexes them: their objects can go. Until then they stay, so a stop
-                // before this point leaves no index entry pointing at a deleted object.
-                let PersistedSnapshotVersion::V1(snapshot) = &persisted_snapshot;
-                delete_removed_files(&persister.object_store(), &snapshot.removed_files);
+                // Now that the snapshot recording their removal is persisted, delete the objects.
+                delete_removed_files(&persister.object_store(), removed_paths);
             }
             // The WAL files up to this snapshot's are now in parquet or held nothing to persist,
             // and the WAL deletes them either way, so record the number even without a file.
@@ -531,40 +529,31 @@ impl SortDedupePersistSummary {
 /// older snapshots that still list them.
 ///
 /// Each file is deleted by its own task, on a best effort basis: a file that isn't deleted is no
-/// longer referenced.
-fn delete_removed_files(
-    object_store: &Arc<dyn ObjectStore>,
-    removed_files: &SerdeVecMap<DbId, DatabaseTables>,
-) {
-    for (_, tables) in removed_files {
-        for (_, files) in &tables.tables {
-            for file in files {
-                let path = file.path.clone();
-                let object_store = Arc::clone(object_store);
-                tokio::spawn(async move {
-                    let mut retry_count = 0;
-                    let path = path.into();
-                    while retry_count <= 10 {
-                        match object_store.delete(&path).await {
-                            Ok(()) => break,
-                            // This was already deleted so we can just skip it
-                            Err(Error::NotFound { .. }) => break,
-                            Err(_) => {
-                                retry_count += 1;
-                                // Sleep and increase the time with each retry.
-                                // This adds up to about 9 minutes over time.
-                                tokio::time::sleep(tokio::time::Duration::from_secs(
-                                    retry_count * 10,
-                                ))
-                                .await;
-                            }
-                        }
-                    }
-                });
+/// longer referenced, so it is left in object storage with a warning.
+fn delete_removed_files(object_store: &Arc<dyn ObjectStore>, paths: Vec<Path>) {
+    for path in paths {
+        let object_store = Arc::clone(object_store);
+        tokio::spawn(async move {
+            for attempt in 1..=REMOVED_FILE_DELETE_ATTEMPTS {
+                match object_store.delete(&path).await {
+                    // Deleted, or already gone.
+                    Ok(()) | Err(Error::NotFound { .. }) => return,
+                    Err(e) if attempt == REMOVED_FILE_DELETE_ATTEMPTS => warn!(
+                        %path,
+                        %e,
+                        attempts = attempt,
+                        "Failed to delete a parquet file removed by retention or a hard delete; leaving it in object storage"
+                    ),
+                    Err(_) => tokio::time::sleep(Duration::from_secs(attempt * 10)).await,
+                }
             }
-        }
+        });
     }
 }
+
+/// How many times [`delete_removed_files`] tries each delete. The waits between tries grow by
+/// 10 s each (10 s, 20 s, ..., 100 s): 550 s, about 9 minutes, in all.
+const REMOVED_FILE_DELETE_ATTEMPTS: u64 = 11;
 
 async fn sort_dedupe_persist(
     persist_job: PersistJob,
@@ -664,630 +653,4 @@ async fn sort_dedupe_persist(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::Precision;
-    use crate::paths::SnapshotInfoFilePath;
-    use crate::test_helpers::TestWriter;
-    use crate::write_buffer::validator::WriteValidator;
-    use datafusion_util::config::register_iox_object_store;
-    use executor::{DedicatedExecutor, register_current_runtime_for_io};
-    use influxdb3_catalog::resource::CatalogResource;
-    use influxdb3_wal::{Gen1Duration, SnapshotSequenceNumber, WalFileSequenceNumber};
-    use iox_query::exec::{ExecutorConfig, PerQueryMemoryPoolConfig};
-    use iox_time::{MockProvider, Time, TimeProvider};
-    use object_store::ObjectStore;
-    use object_store::memory::InMemory;
-    use parquet::arrow::arrow_reader;
-    use parquet::arrow::arrow_reader::ArrowReaderOptions;
-    use parquet_file::storage::{ParquetStorage, StorageId};
-    use std::num::NonZeroUsize;
-
-    #[tokio::test]
-    async fn snapshot_works_with_not_all_columns_in_buffer() {
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let metrics = Arc::new(metric::Registry::default());
-
-        let parquet_store =
-            ParquetStorage::new(Arc::clone(&object_store), StorageId::from("influxdb3"));
-        let exec = Arc::new(Executor::new_with_config_and_executor(
-            ExecutorConfig {
-                target_query_partitions: NonZeroUsize::new(1).unwrap(),
-                object_stores: [&parquet_store]
-                    .into_iter()
-                    .map(|store| (store.id(), Arc::clone(store.object_store())))
-                    .collect(),
-                metric_registry: Arc::clone(&metrics),
-                // Default to 1gb
-                mem_pool_size: 1024 * 1024 * 1024, // 1024 (b/kb) * 1024 (kb/mb) * 1024 (mb/gb)
-                per_query_mem_pool_config: PerQueryMemoryPoolConfig::Disabled,
-                heap_memory_limit: None,
-            },
-            DedicatedExecutor::new_testing(),
-        ));
-        let runtime_env = exec.new_context().inner().runtime_env();
-        register_iox_object_store(runtime_env, parquet_store.id(), Arc::clone(&object_store));
-        register_current_runtime_for_io();
-
-        let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
-        let catalog = Arc::new(
-            Catalog::new(
-                "hosta",
-                Arc::clone(&object_store),
-                Arc::clone(&time_provider) as _,
-                Default::default(),
-            )
-            .await
-            .unwrap(),
-        );
-        let persister = Arc::new(Persister::new(
-            Arc::clone(&object_store),
-            "hosta",
-            time_provider,
-        ));
-        let time_provider: Arc<dyn TimeProvider> =
-            Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
-
-        let queryable_buffer_args = QueryableBufferArgs {
-            executor: Arc::clone(&exec),
-            catalog: Arc::clone(&catalog),
-            persister: Arc::clone(&persister),
-            last_cache_provider: LastCacheProvider::new_from_catalog(Arc::clone(&catalog))
-                .await
-                .unwrap(),
-            distinct_cache_provider: DistinctCacheProvider::new_from_catalog(
-                Arc::clone(&time_provider),
-                Arc::clone(&catalog),
-            )
-            .await
-            .unwrap(),
-            persisted_files: Arc::new(PersistedFiles::new()),
-            parquet_cache: None,
-        };
-        let queryable_buffer = QueryableBuffer::new(queryable_buffer_args);
-
-        let db = data_types::NamespaceName::new("testdb").unwrap();
-
-        // create the initial write with two tags
-        let val = WriteValidator::initialize(db.clone(), Arc::clone(&catalog)).unwrap();
-        let lp = format!(
-            "foo,t2=a,t1=b f1=1i {}",
-            time_provider.now().timestamp_nanos()
-        );
-
-        let lines = val
-            .v1_parse_lines_and_catalog_updates(
-                &lp,
-                false,
-                time_provider.now(),
-                Precision::Nanosecond,
-            )
-            .unwrap()
-            .commit_catalog_changes()
-            .await
-            .unwrap()
-            .unwrap_success()
-            .convert_lines_to_buffer(Gen1Duration::new_1m());
-        let batch: WriteBatch = lines.into();
-        let wal_contents = WalContents {
-            persist_timestamp_ms: 0,
-            min_timestamp_ns: batch.min_time_ns,
-            max_timestamp_ns: batch.max_time_ns,
-            wal_file_number: WalFileSequenceNumber::new(1),
-            ops: vec![WalOp::Write(batch)],
-            snapshot: None,
-        };
-        let end_time =
-            wal_contents.max_timestamp_ns + Gen1Duration::new_1m().as_duration().as_nanos() as i64;
-
-        // write the lp into the buffer
-        queryable_buffer.notify(Arc::new(wal_contents)).await;
-
-        // now force a snapshot, persisting the data to parquet file. Also, buffer up a new write
-        let snapshot_sequence_number = SnapshotSequenceNumber::new(1);
-        let snapshot_details = SnapshotDetails {
-            snapshot_sequence_number,
-            end_time_marker: end_time,
-            first_wal_sequence_number: WalFileSequenceNumber::new(1),
-            last_wal_sequence_number: WalFileSequenceNumber::new(2),
-            forced: false,
-        };
-
-        // create another write, this time with only one tag, in a different gen1 block
-        let lp = "foo,t2=b f1=1i 240000000000";
-        let val = WriteValidator::initialize(db, Arc::clone(&catalog)).unwrap();
-
-        let lines = val
-            .v1_parse_lines_and_catalog_updates(
-                lp,
-                false,
-                time_provider.now(),
-                Precision::Nanosecond,
-            )
-            .unwrap()
-            .commit_catalog_changes()
-            .await
-            .unwrap()
-            .unwrap_success()
-            .convert_lines_to_buffer(Gen1Duration::new_1m());
-        let batch: WriteBatch = lines.into();
-        let wal_contents = WalContents {
-            persist_timestamp_ms: 0,
-            min_timestamp_ns: batch.min_time_ns,
-            max_timestamp_ns: batch.max_time_ns,
-            wal_file_number: WalFileSequenceNumber::new(2),
-            ops: vec![WalOp::Write(batch)],
-            snapshot: None,
-        };
-        let end_time =
-            wal_contents.max_timestamp_ns + Gen1Duration::new_1m().as_duration().as_nanos() as i64;
-
-        let details = queryable_buffer
-            .notify_and_snapshot(Arc::new(wal_contents), snapshot_details)
-            .await;
-        let _details = details.await.unwrap();
-
-        // validate we have a single persisted file
-        let db = catalog.db_schema("testdb").unwrap();
-        let table = db.table_definition("foo").unwrap();
-        assert_eq!(
-            table.sort_key,
-            SortKey::from_columns(vec!["t2", "t1", "time"])
-        );
-        let files = queryable_buffer
-            .persisted_files
-            .get_files(db.id, table.table_id);
-        assert_eq!(files.len(), 1);
-
-        // now force another snapshot, persisting the data to parquet file
-        let snapshot_sequence_number = SnapshotSequenceNumber::new(2);
-        let snapshot_details = SnapshotDetails {
-            snapshot_sequence_number,
-            end_time_marker: end_time,
-            first_wal_sequence_number: WalFileSequenceNumber::new(3),
-            last_wal_sequence_number: WalFileSequenceNumber::new(3),
-            forced: false,
-        };
-        queryable_buffer
-            .notify_and_snapshot(
-                Arc::new(WalContents {
-                    persist_timestamp_ms: 0,
-                    min_timestamp_ns: 0,
-                    max_timestamp_ns: 0,
-                    wal_file_number: WalFileSequenceNumber::new(3),
-                    ops: vec![],
-                    snapshot: Some(snapshot_details),
-                }),
-                snapshot_details,
-            )
-            .await
-            .await
-            .unwrap();
-
-        // validate we have two persisted files
-        let files = queryable_buffer
-            .persisted_files
-            .get_files(db.id, table.table_id);
-        assert_eq!(files.len(), 2);
-
-        // Verify the `iox::series::key` metadata is present in the parquet file
-        {
-            let path = Path::from(files[0].path.as_str());
-            let res = object_store
-                .get(&path)
-                .await
-                .unwrap()
-                .bytes()
-                .await
-                .unwrap();
-            let metadata =
-                arrow_reader::ArrowReaderMetadata::load(&res, ArrowReaderOptions::new()).unwrap();
-            let schema: Schema = Schema::try_from(Arc::clone(metadata.schema())).unwrap();
-            let primary_key = schema.primary_key();
-            assert_eq!(primary_key, &["t2", "t1", "time"]);
-        }
-    }
-
-    /// This test validates that buffer replay ignores data from deleted tables.
-    #[tokio::test]
-    async fn snapshot_skips_deleted_table() {
-        // Setup test infrastructure
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let metrics = Arc::new(metric::Registry::default());
-        let parquet_store =
-            ParquetStorage::new(Arc::clone(&object_store), StorageId::from("influxdb3"));
-        let exec = Arc::new(Executor::new_with_config_and_executor(
-            ExecutorConfig {
-                target_query_partitions: NonZeroUsize::new(1).unwrap(),
-                object_stores: [&parquet_store]
-                    .into_iter()
-                    .map(|store| (store.id(), Arc::clone(store.object_store())))
-                    .collect(),
-                metric_registry: Arc::clone(&metrics),
-                mem_pool_size: 1024 * 1024 * 1024,
-                per_query_mem_pool_config: PerQueryMemoryPoolConfig::Disabled,
-                heap_memory_limit: None,
-            },
-            DedicatedExecutor::new_testing(),
-        ));
-        let runtime_env = exec.new_context().inner().runtime_env();
-        register_iox_object_store(runtime_env, parquet_store.id(), Arc::clone(&object_store));
-        register_current_runtime_for_io();
-
-        let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
-        let catalog = Arc::new(
-            Catalog::new(
-                "hosta",
-                Arc::clone(&object_store),
-                Arc::clone(&time_provider) as _,
-                Default::default(),
-            )
-            .await
-            .unwrap(),
-        );
-
-        let persister = Arc::new(Persister::new(
-            Arc::clone(&object_store),
-            "hosta",
-            Arc::clone(&time_provider) as _,
-        ));
-
-        let queryable_buffer_args = QueryableBufferArgs {
-            executor: Arc::clone(&exec),
-            catalog: Arc::clone(&catalog),
-            persister: Arc::clone(&persister),
-            last_cache_provider: LastCacheProvider::new_from_catalog(Arc::clone(&catalog))
-                .await
-                .unwrap(),
-            distinct_cache_provider: DistinctCacheProvider::new_from_catalog(
-                Arc::clone(&time_provider) as _,
-                Arc::clone(&catalog),
-            )
-            .await
-            .unwrap(),
-            persisted_files: Arc::new(PersistedFiles::new()),
-            parquet_cache: None,
-        };
-        let queryable_buffer = QueryableBuffer::new(queryable_buffer_args);
-
-        let writer = TestWriter::new_with_catalog(Arc::clone(&catalog));
-        let lines1 = writer
-            .write_lp_to_write_batch("table1,tag=a value=1i 1000", 0)
-            .await;
-        let lines2 = writer
-            .write_lp_to_write_batch("table2,tag=b value=2i 2000", 0)
-            .await;
-
-        let db_schema = catalog.db_schema(TestWriter::DB_NAME).unwrap();
-        let db_id = db_schema.id();
-        let table1_id = db_schema.table_name_to_id("table1").unwrap();
-        let table2_id = db_schema.table_name_to_id("table2").unwrap();
-
-        // Soft delete the second table
-        use influxdb3_catalog::catalog::HardDeletionTime;
-        catalog
-            .soft_delete_table(TestWriter::DB_NAME, "table2", HardDeletionTime::Now)
-            .await
-            .unwrap();
-
-        let snapshot_details = SnapshotDetails {
-            snapshot_sequence_number: SnapshotSequenceNumber::new(1),
-            end_time_marker: 1000,
-            first_wal_sequence_number: WalFileSequenceNumber::new(1),
-            last_wal_sequence_number: WalFileSequenceNumber::new(2),
-            forced: false,
-        };
-
-        let wal_contents = influxdb3_wal::create::wal_contents_with_snapshot(
-            (0, 100, 1),
-            [
-                influxdb3_wal::create::write_batch_op(lines1),
-                influxdb3_wal::create::write_batch_op(lines2),
-            ],
-            snapshot_details,
-        );
-
-        queryable_buffer
-            .notify_and_snapshot(Arc::new(wal_contents), snapshot_details)
-            .await
-            .await
-            .unwrap();
-
-        // Verify only table1 has persisted files
-        let files1 = queryable_buffer.persisted_files.get_files(db_id, table1_id);
-        assert_eq!(files1.len(), 1, "Should have 1 persisted file for table1");
-
-        let files2 = queryable_buffer.persisted_files.get_files(db_id, table2_id);
-        assert_eq!(
-            files2.len(),
-            0,
-            "Soft deleted table should not have persisted files"
-        );
-    }
-
-    /// An in-memory store that can hold snapshot uploads. Once `hold_snapshot_puts` is called, a
-    /// PUT under the snapshot folder signals `snapshot_put_reached` and waits for
-    /// `release_snapshot_puts` before it writes anything. Every other request goes straight
-    /// through.
-    #[derive(Debug)]
-    struct SnapshotPutGate {
-        inner: InMemory,
-        snapshot_dir: Path,
-        held: tokio::sync::watch::Sender<bool>,
-        reached: tokio::sync::Notify,
-    }
-
-    impl SnapshotPutGate {
-        fn new(node_identifier_prefix: &str) -> Self {
-            Self {
-                inner: InMemory::new(),
-                snapshot_dir: Path::clone(&SnapshotInfoFilePath::dir(node_identifier_prefix)),
-                held: tokio::sync::watch::Sender::new(false),
-                reached: tokio::sync::Notify::new(),
-            }
-        }
-
-        fn hold_snapshot_puts(&self) {
-            self.held.send_replace(true);
-        }
-
-        fn release_snapshot_puts(&self) {
-            self.held.send_replace(false);
-        }
-
-        /// Returns once a snapshot PUT is waiting at the gate.
-        async fn snapshot_put_reached(&self) {
-            self.reached.notified().await
-        }
-    }
-
-    impl std::fmt::Display for SnapshotPutGate {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "SnapshotPutGate({})", self.inner)
-        }
-    }
-
-    #[async_trait]
-    impl ObjectStore for SnapshotPutGate {
-        async fn put_opts(
-            &self,
-            location: &Path,
-            payload: object_store::PutPayload,
-            opts: object_store::PutOptions,
-        ) -> object_store::Result<object_store::PutResult> {
-            let mut held = self.held.subscribe();
-            if location.prefix_matches(&self.snapshot_dir) && *held.borrow_and_update() {
-                self.reached.notify_one();
-                held.wait_for(|held| !*held)
-                    .await
-                    .expect("the gate outlives its requests");
-            }
-            self.inner.put_opts(location, payload, opts).await
-        }
-
-        async fn put_multipart_opts(
-            &self,
-            location: &Path,
-            opts: object_store::PutMultipartOpts,
-        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-            self.inner.put_multipart_opts(location, opts).await
-        }
-
-        async fn get_opts(
-            &self,
-            location: &Path,
-            options: object_store::GetOptions,
-        ) -> object_store::Result<object_store::GetResult> {
-            self.inner.get_opts(location, options).await
-        }
-
-        async fn delete(&self, location: &Path) -> object_store::Result<()> {
-            self.inner.delete(location).await
-        }
-
-        fn list(
-            &self,
-            prefix: Option<&Path>,
-        ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
-        {
-            self.inner.list(prefix)
-        }
-
-        async fn list_with_delimiter(
-            &self,
-            prefix: Option<&Path>,
-        ) -> object_store::Result<object_store::ListResult> {
-            self.inner.list_with_delimiter(prefix).await
-        }
-
-        async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-            self.inner.copy(from, to).await
-        }
-
-        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-            self.inner.copy_if_not_exists(from, to).await
-        }
-    }
-
-    /// Every index entry a server starting on `object_store` would load, through the same
-    /// snapshot load startup uses.
-    async fn index_after_restart(
-        object_store: &Arc<dyn ObjectStore>,
-        node_identifier_prefix: &str,
-    ) -> Vec<ParquetFile> {
-        let persister = Persister::new(
-            Arc::clone(object_store),
-            node_identifier_prefix,
-            Arc::new(MockProvider::new(Time::from_timestamp_nanos(0))) as _,
-        );
-        let loaded = persister.load_index(usize::MAX).await.unwrap();
-        loaded.fold.files().into_values().flatten().collect()
-    }
-
-    /// Retention removes a file from the index during a flush, and the snapshot that records the
-    /// removal is written later in that flush. If the process stops before that snapshot is
-    /// written, the next start loads the older snapshots, which still list the file, so its object
-    /// must still exist (TAG-2753). The snapshot's upload is held at the store, and the restart
-    /// reads the store as the stopped process left it. Once the snapshot is written, the object is
-    /// deleted.
-    #[tokio::test]
-    async fn retention_deletes_objects_only_after_the_snapshot_that_records_their_removal() {
-        const NODE: &str = "hosta";
-        let store = Arc::new(SnapshotPutGate::new(NODE));
-        let object_store: Arc<dyn ObjectStore> = Arc::clone(&store) as _;
-        let metrics = Arc::new(metric::Registry::default());
-        let parquet_store =
-            ParquetStorage::new(Arc::clone(&object_store), StorageId::from("influxdb3"));
-        let exec = Arc::new(Executor::new_with_config_and_executor(
-            ExecutorConfig {
-                target_query_partitions: NonZeroUsize::new(1).unwrap(),
-                object_stores: [&parquet_store]
-                    .into_iter()
-                    .map(|store| (store.id(), Arc::clone(store.object_store())))
-                    .collect(),
-                metric_registry: Arc::clone(&metrics),
-                mem_pool_size: 1024 * 1024 * 1024,
-                per_query_mem_pool_config: PerQueryMemoryPoolConfig::Disabled,
-                heap_memory_limit: None,
-            },
-            DedicatedExecutor::new_testing(),
-        ));
-        let runtime_env = exec.new_context().inner().runtime_env();
-        register_iox_object_store(runtime_env, parquet_store.id(), Arc::clone(&object_store));
-        register_current_runtime_for_io();
-
-        let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
-        let catalog = Arc::new(
-            Catalog::new(
-                NODE,
-                Arc::clone(&object_store),
-                Arc::clone(&time_provider) as _,
-                Default::default(),
-            )
-            .await
-            .unwrap(),
-        );
-        let persister = Arc::new(Persister::new(
-            Arc::clone(&object_store),
-            NODE,
-            Arc::clone(&time_provider) as _,
-        ));
-        let queryable_buffer = QueryableBuffer::new(QueryableBufferArgs {
-            executor: Arc::clone(&exec),
-            catalog: Arc::clone(&catalog),
-            persister: Arc::clone(&persister),
-            last_cache_provider: LastCacheProvider::new_from_catalog(Arc::clone(&catalog))
-                .await
-                .unwrap(),
-            distinct_cache_provider: DistinctCacheProvider::new_from_catalog(
-                Arc::clone(&time_provider) as _,
-                Arc::clone(&catalog),
-            )
-            .await
-            .unwrap(),
-            persisted_files: Arc::new(PersistedFiles::new()),
-            parquet_cache: None,
-        });
-
-        // Snapshot 1 persists a file and the snapshot that lists it.
-        let writer = TestWriter::new_with_catalog(Arc::clone(&catalog));
-        let lines = writer
-            .write_lp_to_write_batch("cpu,tag=a value=1i 1000", 0)
-            .await;
-        let snapshot_1 = SnapshotDetails {
-            snapshot_sequence_number: SnapshotSequenceNumber::new(1),
-            end_time_marker: 1000,
-            first_wal_sequence_number: WalFileSequenceNumber::new(1),
-            last_wal_sequence_number: WalFileSequenceNumber::new(1),
-            forced: false,
-        };
-        queryable_buffer
-            .notify_and_snapshot(
-                Arc::new(influxdb3_wal::create::wal_contents_with_snapshot(
-                    (0, 1000, 1),
-                    [influxdb3_wal::create::write_batch_op(lines)],
-                    snapshot_1,
-                )),
-                snapshot_1,
-            )
-            .await
-            .await
-            .unwrap();
-        let db_schema = catalog.db_schema(TestWriter::DB_NAME).unwrap();
-        let db_id = db_schema.id();
-        let table_id = db_schema.table_name_to_id("cpu").unwrap();
-        let files = queryable_buffer.persisted_files.get_files(db_id, table_id);
-        assert_eq!(files.len(), 1, "snapshot 1 persists one file");
-        let file = files[0].clone();
-        let file_path = Path::from(file.path.as_str());
-        object_store.head(&file_path).await.unwrap();
-
-        // The file's rows fall out of the database's retention period.
-        catalog
-            .set_retention_period_for_database(TestWriter::DB_NAME, Duration::from_secs(60 * 60))
-            .await
-            .unwrap();
-        time_provider.set(Time::from_timestamp_nanos(
-            Duration::from_secs(2 * 60 * 60).as_nanos() as i64,
-        ));
-
-        // Snapshot 2 removes the file from the index and records the removal. Its upload is held,
-        // so the process stops before the snapshot is written.
-        store.hold_snapshot_puts();
-        let snapshot_2 = SnapshotDetails {
-            snapshot_sequence_number: SnapshotSequenceNumber::new(2),
-            end_time_marker: 1000,
-            first_wal_sequence_number: WalFileSequenceNumber::new(2),
-            last_wal_sequence_number: WalFileSequenceNumber::new(2),
-            forced: false,
-        };
-        let snapshot_2_done = queryable_buffer
-            .notify_and_snapshot(
-                Arc::new(influxdb3_wal::create::wal_contents_with_snapshot(
-                    (0, 0, 2),
-                    [],
-                    snapshot_2,
-                )),
-                snapshot_2,
-            )
-            .await;
-        assert!(
-            queryable_buffer
-                .persisted_files
-                .get_files(db_id, table_id)
-                .is_empty(),
-            "retention removed the file from the index"
-        );
-        tokio::time::timeout(Duration::from_secs(10), store.snapshot_put_reached())
-            .await
-            .expect("snapshot 2's upload reaches the store");
-        // Let any delete that was started before the upload run.
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
-
-        // A restart loads snapshot 1, which lists the file: its object must still be there.
-        let indexed = index_after_restart(&object_store, NODE).await;
-        assert_eq!(indexed, vec![file.clone()]);
-        for entry in &indexed {
-            if let Err(e) = object_store.head(&Path::from(entry.path.as_str())).await {
-                panic!(
-                    "after a restart, the index entry {} points at a deleted object: {e}",
-                    entry.path
-                );
-            }
-        }
-
-        // Without the stop, snapshot 2 is written and then the object is deleted.
-        store.release_snapshot_puts();
-        snapshot_2_done.await.unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while object_store.head(&file_path).await.is_ok() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the file's object is deleted once snapshot 2 is written");
-        assert!(index_after_restart(&object_store, NODE).await.is_empty());
-    }
-}
+mod tests;

@@ -213,7 +213,8 @@ impl PersistedFiles {
     /// [`Self::remove_persisted_files`]. An entry that only shares an id with a due entry stays
     /// indexed (builds before TAG-2495 could reuse ids after a restart). The returned map holds
     /// exactly the entries removed from the index and from the metrics. The caller records them
-    /// in the next snapshot's `removed_files` and deletes their objects.
+    /// in the next snapshot's `removed_files` and deletes their objects once that snapshot is
+    /// persisted.
     pub fn remove_files_for_deletion(
         &self,
         catalog: Arc<Catalog>,

@@ -931,16 +931,16 @@ async fn test_checkpoint_gives_up_the_gate_so_index_snapshots_keep_going() {
     assert_eq!(prune_a.await.count(), 1);
 }
 
-/// A stop after a flush's snapshot records a retention removal, but before the removed file's
-/// object is deleted, leaves an object that no index entry points to. Startup deletes such
-/// objects, but only in the snapshots it loads, and a checkpoint replaces the snapshots before
-/// it. So the checkpoint deletes them before it is written (TAG-2753).
-#[tokio::test]
-async fn test_checkpoint_deletes_objects_a_stop_left_after_a_retention_removal() {
-    let h = CompactionHarness::new().await;
+/// Two files, one past its retention period. The next flush's snapshot records the expired
+/// file's removal, then the flush deletes its object; putting the object back leaves the store
+/// as a stop between the two would. Returns the expired file's path and the live file.
+async fn leave_an_object_after_a_retention_removal(
+    h: &CompactionHarness,
+) -> (ObjPath, ParquetFile) {
     h.write_gen1("testtable value=1 10000000000").await;
     h.write_gen1("testtable value=2 7200000000000").await;
     let expired = h.indexed_file_at(10_000_000_000);
+    let live = h.indexed_file_at(7_200_000_000_000);
     let expired_path = ObjPath::from(expired.path.as_str());
     let bytes = h
         .object_store
@@ -956,8 +956,6 @@ async fn test_checkpoint_deletes_objects_a_stop_left_after_a_retention_removal()
         .unwrap();
     h.set_now(Duration::from_secs(7_300));
 
-    // The next flush's snapshot records the removal, then the flush deletes the object. Putting
-    // the object back leaves the store as a stop between the two would.
     h.write_buffer
         .write_lp(
             data_types::NamespaceName::new(CompactionHarness::DB).unwrap(),
@@ -970,7 +968,7 @@ async fn test_checkpoint_deletes_objects_a_stop_left_after_a_retention_removal()
         .await
         .unwrap();
     {
-        // The permit is the WAL's snapshot permit, which the checkpoint below waits for.
+        // The permit is the WAL's snapshot permit, which a checkpoint waits for.
         let (snapshot_done, _, _permit) = h
             .write_buffer
             .wal()
@@ -994,6 +992,17 @@ async fn test_checkpoint_deletes_objects_a_stop_left_after_a_retention_removal()
         .put(&expired_path, bytes.into())
         .await
         .unwrap();
+    (expired_path, live)
+}
+
+/// A stop after a flush's snapshot records a retention removal, but before the removed file's
+/// object is deleted, leaves an object that no index entry points to. Startup deletes such
+/// objects, but only in the snapshots it loads, and a checkpoint replaces the snapshots before
+/// it. So the checkpoint deletes them before it is written (TAG-2753).
+#[tokio::test]
+async fn test_checkpoint_deletes_objects_a_stop_left_after_a_retention_removal() {
+    let h = CompactionHarness::new().await;
+    let (expired_path, live) = leave_an_object_after_a_retention_removal(&h).await;
 
     let mut state = checkpoint_state(&h);
     h.service.write_index_checkpoint(&mut state).await.unwrap();
@@ -1006,11 +1015,26 @@ async fn test_checkpoint_deletes_objects_a_stop_left_after_a_retention_removal()
     );
     assert!(
         h.object_store
-            .head(&ObjPath::from(
-                h.indexed_file_at(7_200_000_000_000).path.as_str()
-            ))
+            .head(&ObjPath::from(live.path.as_str()))
             .await
             .is_ok(),
         "the live file's object stays"
     );
+}
+
+/// The first checkpoint after a restart replaces the snapshots that start-up loaded, so it
+/// starts with their marked removals: a second stop before start-up's own deletes finish still
+/// leaves nothing behind once that checkpoint is written.
+#[tokio::test]
+async fn test_first_checkpoint_after_a_restart_deletes_the_removals_startup_loaded() {
+    let h = CompactionHarness::new().await;
+    let (expired_path, _) = leave_an_object_after_a_retention_removal(&h).await;
+
+    let (_, restarted) = h.restart_loading_all().await;
+    let state = IndexCheckpointState::new(
+        restarted
+            .take_index_checkpoint_base()
+            .expect("the startup index"),
+    );
+    assert_eq!(state.removals.unindexed(&state.fold), vec![expired_path]);
 }

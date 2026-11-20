@@ -204,6 +204,15 @@ pub struct PersistedSnapshot {
     /// images that predate it ignore the field and load a checkpoint as an ordinary snapshot.
     #[serde(default, skip_serializing_if = "is_false")]
     pub checkpoint: bool,
+    /// True when the writer deletes the objects of `removed_files` once this snapshot is
+    /// written: a flush's removals for retention and hard deletes. A stop before those deletes
+    /// finish leaves objects that no index entry points to, so startup and each index
+    /// checkpoint delete the objects of these removals that the index no longer holds (see
+    /// `write_buffer::removed_objects`). False for compaction's removals, whose objects
+    /// compaction deletes, and for the index check's, whose objects it keeps. Left out of the
+    /// JSON when false; images that predate it ignore the field.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deletes_removed_objects: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -230,6 +239,7 @@ impl PersistedSnapshot {
             databases: SerdeVecMap::new(),
             removed_files: SerdeVecMap::new(),
             checkpoint: false,
+            deletes_removed_objects: false,
         }
     }
 
@@ -257,6 +267,7 @@ impl PersistedSnapshot {
             databases: SerdeVecMap::new(),
             removed_files: SerdeVecMap::new(),
             checkpoint: true,
+            deletes_removed_objects: false,
         };
         for ((database_id, table_id), files) in files {
             for file in &files {
@@ -703,6 +714,7 @@ mod tests {
             parquet_size_bytes: 0,
             removed_files: SerdeVecMap::new(),
             checkpoint: false,
+            deletes_removed_objects: false,
         };
 
         // db 2 setup
@@ -747,6 +759,7 @@ mod tests {
             parquet_size_bytes: 0,
             removed_files: SerdeVecMap::new(),
             checkpoint: false,
+            deletes_removed_objects: false,
         };
 
         let overall_counts = PersistedSnapshot::overall_db_table_file_counts(&[

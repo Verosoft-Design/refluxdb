@@ -1,5 +1,6 @@
 use crate::persister::{IndexCheckpointBase, Persister};
 use crate::write_buffer::persisted_files::{PersistedFiles, SnapshotFold};
+use crate::write_buffer::removed_objects::{MarkedRemovals, delete_unindexed_now};
 use crate::{ParquetFile, ParquetFileId, PersistedSnapshot, PersistedSnapshotVersion, WriteBuffer};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -154,6 +155,10 @@ struct IndexCheckpointState {
     checkpoints: Vec<SnapshotSequenceNumber>,
     /// No attempt before this, after one failed.
     retry_at: Option<std::time::Instant>,
+    /// The marked removals of the snapshots folded since the last checkpoint written (at first,
+    /// of those loaded at startup), whose objects the next checkpoint deletes before it is
+    /// written (see `write_buffer::removed_objects`).
+    removals: MarkedRemovals,
 }
 
 impl IndexCheckpointState {
@@ -170,6 +175,7 @@ impl IndexCheckpointState {
             last_checkpoint_at: std::time::Instant::now(),
             checkpoints: base.checkpoints,
             retry_at: None,
+            removals: base.removals,
         }
     }
 }
@@ -1194,6 +1200,7 @@ impl CompactionService {
                 snapshot.context("fetching a snapshot to fold into the index checkpoint")?
             {
                 fetched += 1;
+                state.removals.collect(&snapshot);
                 state.fold.apply(snapshot);
             }
             state.folded_through = Some(SnapshotSequenceNumber::new(seq));
@@ -1202,6 +1209,18 @@ impl CompactionService {
         // The checkpoint's own number holds no snapshot info file.
         state.folded_through = Some(checkpoint_sequence_number);
         state.fold.compact();
+
+        // A stop before a flush's deletes finished leaves objects that no entry points to.
+        // Startup deletes them, but only in the snapshots it loads, which this checkpoint
+        // replaces: delete them before it is written. Failed deletes are kept for the next one.
+        let removed_objects = state.removals.unindexed(&state.fold);
+        let removed_objects_count = removed_objects.len();
+        let failed_deletes = delete_unindexed_now(
+            &self.object_store,
+            removed_objects,
+            INDEX_CHECKPOINT_FETCH_CONCURRENCY,
+        )
+        .await;
 
         let checkpoint = PersistedSnapshot::new_index_checkpoint(
             header.node_id,
@@ -1235,6 +1254,7 @@ impl CompactionService {
         state.last_checkpoint = Some(checkpoint_sequence_number);
         state.last_checkpoint_at = std::time::Instant::now();
         state.retry_at = None;
+        state.removals.retain_paths(&failed_deletes);
         // Numbers are handed out above every name listed at startup, so this one is the newest.
         state.checkpoints.insert(0, checkpoint_sequence_number);
         let expired = state
@@ -1256,6 +1276,8 @@ impl CompactionService {
             not_found = (checkpoint_sequence_number.as_u64().saturating_sub(first) as usize)
                 .saturating_sub(fetched),
             deleted_checkpoints = expired.len(),
+            removed_objects = removed_objects_count,
+            failed_deletes = failed_deletes.len(),
             elapsed_ms = started.elapsed().as_millis() as u64,
             "wrote an index checkpoint"
         );
@@ -1897,6 +1919,7 @@ mod tests {
     use object_store::memory::InMemory;
 
     mod checkpoint_tests;
+    mod removed_objects_tests;
 
     struct CompactionHarness {
         object_store: Arc<dyn ObjectStore>,

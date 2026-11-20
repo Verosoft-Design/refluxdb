@@ -930,3 +930,87 @@ async fn test_checkpoint_gives_up_the_gate_so_index_snapshots_keep_going() {
     release.notify_one();
     assert_eq!(prune_a.await.count(), 1);
 }
+
+/// A stop after a flush's snapshot records a retention removal, but before the removed file's
+/// object is deleted, leaves an object that no index entry points to. Startup deletes such
+/// objects, but only in the snapshots it loads, and a checkpoint replaces the snapshots before
+/// it. So the checkpoint deletes them before it is written (TAG-2753).
+#[tokio::test]
+async fn test_checkpoint_deletes_objects_a_stop_left_after_a_retention_removal() {
+    let h = CompactionHarness::new().await;
+    h.write_gen1("testtable value=1 10000000000").await;
+    h.write_gen1("testtable value=2 7200000000000").await;
+    let expired = h.indexed_file_at(10_000_000_000);
+    let expired_path = ObjPath::from(expired.path.as_str());
+    let bytes = h
+        .object_store
+        .get(&expired_path)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    h.catalog
+        .set_retention_period_for_database(CompactionHarness::DB, Duration::from_secs(3_600))
+        .await
+        .unwrap();
+    h.set_now(Duration::from_secs(7_300));
+
+    // The next flush's snapshot records the removal, then the flush deletes the object. Putting
+    // the object back leaves the store as a stop between the two would.
+    h.write_buffer
+        .write_lp(
+            data_types::NamespaceName::new(CompactionHarness::DB).unwrap(),
+            "testtable value=3 7250000000000",
+            iox_time::Time::from_timestamp_nanos(0),
+            false,
+            crate::Precision::Nanosecond,
+            false,
+        )
+        .await
+        .unwrap();
+    {
+        // The permit is the WAL's snapshot permit, which the checkpoint below waits for.
+        let (snapshot_done, _, _permit) = h
+            .write_buffer
+            .wal()
+            .force_flush_buffer()
+            .await
+            .expect("the flush snapshots");
+        snapshot_done.await.expect("snapshot failed");
+    }
+    assert!(
+        !h.indexed_files().contains(&expired),
+        "retention removed it"
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while h.object_store.head(&expired_path).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the flush deletes the object");
+    h.object_store
+        .put(&expired_path, bytes.into())
+        .await
+        .unwrap();
+
+    let mut state = checkpoint_state(&h);
+    h.service.write_index_checkpoint(&mut state).await.unwrap();
+    assert!(
+        matches!(
+            h.object_store.head(&expired_path).await,
+            Err(object_store::Error::NotFound { .. })
+        ),
+        "the checkpoint deletes the object before it is written"
+    );
+    assert!(
+        h.object_store
+            .head(&ObjPath::from(
+                h.indexed_file_at(7_200_000_000_000).path.as_str()
+            ))
+            .await
+            .is_ok(),
+        "the live file's object stays"
+    );
+}

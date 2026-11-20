@@ -4,6 +4,7 @@
 use crate::paths::ParquetFilePath;
 use crate::paths::SnapshotInfoFilePath;
 use crate::write_buffer::persisted_files::SnapshotFold;
+use crate::write_buffer::removed_objects::MarkedRemovals;
 use crate::{PersistedSnapshot, PersistedSnapshotVersion};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -176,6 +177,9 @@ pub(crate) struct LoadedIndex {
     /// may be readable at the next start, and startup then loads only names that sort before it,
     /// so a snapshot written under its number or a lower one would be left out.
     pub(crate) highest_listed: Option<SnapshotSequenceNumber>,
+    /// The removals of the loaded snapshots that are marked
+    /// [`PersistedSnapshot::deletes_removed_objects`]; see `write_buffer::removed_objects`.
+    pub(crate) removals: MarkedRemovals,
 }
 
 /// The index a server started with, kept for its first index checkpoint (see
@@ -190,6 +194,9 @@ pub struct IndexCheckpointBase {
     pub(crate) loaded_checkpoint: Option<SnapshotSequenceNumber>,
     /// The index checkpoints in object storage at startup, newest first.
     pub(crate) checkpoints: Vec<SnapshotSequenceNumber>,
+    /// The marked removals of the snapshots loaded at startup, whose objects the first
+    /// checkpoint deletes again before it is written.
+    pub(crate) removals: MarkedRemovals,
 }
 
 impl Persister {
@@ -327,6 +334,7 @@ impl Persister {
             })
             .collect();
         let mut fold = SnapshotFold::default();
+        let mut removals = MarkedRemovals::default();
         // Everything before this position in `list` is newer than the checkpoint loaded.
         let mut newer_than_checkpoint = list.len();
         let mut checkpoint = None;
@@ -364,6 +372,7 @@ impl Persister {
             .buffered(FETCH_CONCURRENCY);
         while let Some(result) = fetches.next().await {
             let PersistedSnapshotVersion::V1(snapshot) = result?;
+            removals.collect(&snapshot);
             fold.apply(snapshot);
         }
 
@@ -392,6 +401,7 @@ impl Persister {
             checkpoint,
             checkpoints: checkpoints.into_iter().map(|(_, seq)| seq).collect(),
             highest_listed,
+            removals,
         })
     }
 
@@ -656,6 +666,7 @@ mod tests {
             databases: SerdeVecMap::new(),
             removed_files: SerdeVecMap::new(),
             checkpoint: false,
+            deletes_removed_objects: false,
             min_time: 0,
             max_time: 1,
             row_count: 0,
@@ -680,6 +691,7 @@ mod tests {
             databases: SerdeVecMap::new(),
             removed_files: SerdeVecMap::new(),
             checkpoint: false,
+            deletes_removed_objects: false,
             max_time: 1,
             min_time: 0,
             row_count: 0,
@@ -694,6 +706,7 @@ mod tests {
             databases: SerdeVecMap::new(),
             removed_files: SerdeVecMap::new(),
             checkpoint: false,
+            deletes_removed_objects: false,
             min_time: 0,
             max_time: 1,
             row_count: 0,
@@ -708,6 +721,7 @@ mod tests {
             databases: SerdeVecMap::new(),
             removed_files: SerdeVecMap::new(),
             checkpoint: false,
+            deletes_removed_objects: false,
             min_time: 0,
             max_time: 1,
             row_count: 0,
@@ -744,6 +758,7 @@ mod tests {
             databases: SerdeVecMap::new(),
             removed_files: SerdeVecMap::new(),
             checkpoint: false,
+            deletes_removed_objects: false,
             min_time: 0,
             max_time: 1,
             row_count: 0,
@@ -773,6 +788,7 @@ mod tests {
                 databases: SerdeVecMap::new(),
                 removed_files: SerdeVecMap::new(),
                 checkpoint: false,
+                deletes_removed_objects: false,
                 min_time: 0,
                 max_time: 1,
                 row_count: 0,
@@ -1003,6 +1019,7 @@ mod tests {
                 databases: SerdeVecMap::new(),
                 removed_files: SerdeVecMap::new(),
                 checkpoint: false,
+                deletes_removed_objects: false,
                 min_time: 0,
                 max_time: 1,
                 row_count: 0,
@@ -1240,6 +1257,7 @@ mod tests {
                 databases: tables_with(added),
                 removed_files: removed,
                 checkpoint: false,
+                deletes_removed_objects: false,
                 min_time: 0,
                 max_time: 1,
                 row_count: 10,
@@ -1352,6 +1370,7 @@ mod tests {
             max_time: 1,
             removed_files: SerdeVecMap::new(),
             checkpoint: false,
+            deletes_removed_objects: false,
             databases,
         });
         insta::assert_json_snapshot!(snapshot);

@@ -78,6 +78,7 @@ async fn queryable_buffer_over(
         .unwrap(),
         persisted_files: Arc::new(PersistedFiles::new()),
         parquet_cache: None,
+        metric_registry: metrics,
     });
     (queryable_buffer, catalog)
 }
@@ -296,6 +297,84 @@ async fn index_after_restart(object_store: &Arc<dyn ObjectStore>) -> Vec<Parquet
     loaded.fold.files().into_values().flatten().collect()
 }
 
+/// Snapshot 1 persists one cpu file and the snapshot that lists it. Then the file's rows fall
+/// out of the database's retention period, so the next snapshot removes it. Returns the file.
+async fn persist_a_file_past_retention(
+    queryable_buffer: &QueryableBuffer,
+    catalog: &Arc<Catalog>,
+    time_provider: &MockProvider,
+    object_store: &Arc<dyn ObjectStore>,
+) -> ParquetFile {
+    let writer = TestWriter::new_with_catalog(Arc::clone(catalog));
+    let lines = writer
+        .write_lp_to_write_batch("cpu,tag=a value=1i 1000", 0)
+        .await;
+    let snapshot_1 = SnapshotDetails {
+        snapshot_sequence_number: SnapshotSequenceNumber::new(1),
+        end_time_marker: 1000,
+        first_wal_sequence_number: WalFileSequenceNumber::new(1),
+        last_wal_sequence_number: WalFileSequenceNumber::new(1),
+        forced: false,
+    };
+    queryable_buffer
+        .notify_and_snapshot(
+            Arc::new(influxdb3_wal::create::wal_contents_with_snapshot(
+                (0, 1000, 1),
+                [influxdb3_wal::create::write_batch_op(lines)],
+                snapshot_1,
+            )),
+            snapshot_1,
+        )
+        .await
+        .await
+        .unwrap();
+    let (db_id, table_id) = cpu_ids(catalog);
+    let files = queryable_buffer.persisted_files.get_files(db_id, table_id);
+    assert_eq!(files.len(), 1, "snapshot 1 persists one file");
+    let file = files[0].clone();
+    object_store
+        .head(&Path::from(file.path.as_str()))
+        .await
+        .unwrap();
+
+    catalog
+        .set_retention_period_for_database(TestWriter::DB_NAME, Duration::from_secs(60 * 60))
+        .await
+        .unwrap();
+    time_provider.set(Time::from_timestamp_nanos(
+        Duration::from_secs(2 * 60 * 60).as_nanos() as i64,
+    ));
+    file
+}
+
+fn cpu_ids(catalog: &Catalog) -> (DbId, TableId) {
+    let db_schema = catalog.db_schema(TestWriter::DB_NAME).unwrap();
+    (db_schema.id(), db_schema.table_name_to_id("cpu").unwrap())
+}
+
+/// The WAL contents and details of snapshot 2, which persists no rows.
+fn snapshot_2() -> (Arc<WalContents>, SnapshotDetails) {
+    let snapshot_2 = SnapshotDetails {
+        snapshot_sequence_number: SnapshotSequenceNumber::new(2),
+        end_time_marker: 1000,
+        first_wal_sequence_number: WalFileSequenceNumber::new(2),
+        last_wal_sequence_number: WalFileSequenceNumber::new(2),
+        forced: false,
+    };
+    let contents = influxdb3_wal::create::wal_contents_with_snapshot((0, 0, 2), [], snapshot_2);
+    (Arc::new(contents), snapshot_2)
+}
+
+async fn wait_until_deleted(object_store: &Arc<dyn ObjectStore>, path: &Path, what: &str) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while object_store.head(path).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what}"));
+}
+
 /// Retention removes a file from the index during a flush, and the snapshot that records the
 /// removal is written later in that flush. If the process stops before that snapshot is
 /// written, the next start loads the older snapshots, which still list the file, so its object
@@ -320,67 +399,17 @@ async fn retention_deletes_objects_only_after_the_snapshot_that_records_their_re
     let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
     let (queryable_buffer, catalog) =
         queryable_buffer_over(Arc::clone(&object_store), Arc::clone(&time_provider)).await;
-
-    // Snapshot 1 persists a file and the snapshot that lists it.
-    let writer = TestWriter::new_with_catalog(Arc::clone(&catalog));
-    let lines = writer
-        .write_lp_to_write_batch("cpu,tag=a value=1i 1000", 0)
-        .await;
-    let snapshot_1 = SnapshotDetails {
-        snapshot_sequence_number: SnapshotSequenceNumber::new(1),
-        end_time_marker: 1000,
-        first_wal_sequence_number: WalFileSequenceNumber::new(1),
-        last_wal_sequence_number: WalFileSequenceNumber::new(1),
-        forced: false,
-    };
-    queryable_buffer
-        .notify_and_snapshot(
-            Arc::new(influxdb3_wal::create::wal_contents_with_snapshot(
-                (0, 1000, 1),
-                [influxdb3_wal::create::write_batch_op(lines)],
-                snapshot_1,
-            )),
-            snapshot_1,
-        )
-        .await
-        .await
-        .unwrap();
-    let db_schema = catalog.db_schema(TestWriter::DB_NAME).unwrap();
-    let db_id = db_schema.id();
-    let table_id = db_schema.table_name_to_id("cpu").unwrap();
-    let files = queryable_buffer.persisted_files.get_files(db_id, table_id);
-    assert_eq!(files.len(), 1, "snapshot 1 persists one file");
-    let file = files[0].clone();
+    let file =
+        persist_a_file_past_retention(&queryable_buffer, &catalog, &time_provider, &object_store)
+            .await;
     let file_path = Path::from(file.path.as_str());
-    object_store.head(&file_path).await.unwrap();
-
-    // The file's rows fall out of the database's retention period.
-    catalog
-        .set_retention_period_for_database(TestWriter::DB_NAME, Duration::from_secs(60 * 60))
-        .await
-        .unwrap();
-    time_provider.set(Time::from_timestamp_nanos(
-        Duration::from_secs(2 * 60 * 60).as_nanos() as i64,
-    ));
+    let (db_id, table_id) = cpu_ids(&catalog);
 
     // Snapshot 2 removes the file from the index and records the removal. Its upload is held,
     // so the process stops before the snapshot is written.
-    let snapshot_2 = SnapshotDetails {
-        snapshot_sequence_number: SnapshotSequenceNumber::new(2),
-        end_time_marker: 1000,
-        first_wal_sequence_number: WalFileSequenceNumber::new(2),
-        last_wal_sequence_number: WalFileSequenceNumber::new(2),
-        forced: false,
-    };
+    let (contents, details) = snapshot_2();
     let snapshot_2_done = queryable_buffer
-        .notify_and_snapshot(
-            Arc::new(influxdb3_wal::create::wal_contents_with_snapshot(
-                (0, 0, 2),
-                [],
-                snapshot_2,
-            )),
-            snapshot_2,
-        )
+        .notify_and_snapshot(contents, details)
         .await;
     assert!(
         queryable_buffer
@@ -394,6 +423,11 @@ async fn retention_deletes_objects_only_after_the_snapshot_that_records_their_re
     tokio::time::timeout(Duration::from_secs(10), snapshot_2_reached.notified())
         .await
         .expect("snapshot 2's upload reaches the store");
+    assert_eq!(
+        queryable_buffer.held_deletes.fetch(),
+        1,
+        "the file's delete waits for snapshot 2"
+    );
 
     // A restart loads snapshot 1, which lists the file: its object must still be there.
     let indexed = index_after_restart(&object_store).await;
@@ -410,12 +444,128 @@ async fn retention_deletes_objects_only_after_the_snapshot_that_records_their_re
     // Without the stop, snapshot 2 is written and then the object is deleted.
     release_snapshot_2.notify_one();
     snapshot_2_done.await.unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while object_store.head(&file_path).await.is_ok() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+    assert_eq!(queryable_buffer.held_deletes.fetch(), 0);
+    wait_until_deleted(
+        &object_store,
+        &file_path,
+        "the file's object is deleted once snapshot 2 is written",
+    )
+    .await;
+    assert!(index_after_restart(&object_store).await.is_empty());
+}
+
+/// Start a write buffer on `object_store`, as a server start does.
+async fn start_write_buffer(
+    object_store: Arc<dyn ObjectStore>,
+    time_provider: Arc<MockProvider>,
+) -> Arc<crate::write_buffer::WriteBufferImpl> {
+    let catalog = Arc::new(
+        Catalog::new(
+            NODE,
+            Arc::clone(&object_store),
+            Arc::clone(&time_provider) as _,
+            Default::default(),
+        )
+        .await
+        .unwrap(),
+    );
+    crate::write_buffer::WriteBufferImpl::new(crate::write_buffer::WriteBufferImplArgs {
+        persister: Arc::new(Persister::new(
+            Arc::clone(&object_store),
+            NODE,
+            Arc::clone(&time_provider) as _,
+        )),
+        catalog: Arc::clone(&catalog),
+        last_cache: LastCacheProvider::new_from_catalog(Arc::clone(&catalog))
+            .await
+            .unwrap(),
+        distinct_cache: DistinctCacheProvider::new_from_catalog(
+            Arc::clone(&time_provider) as _,
+            Arc::clone(&catalog),
+        )
+        .await
+        .unwrap(),
+        time_provider: time_provider as _,
+        executor: Arc::new(Executor::new_testing()),
+        wal_config: influxdb3_wal::WalConfig::test_config(),
+        parquet_cache: None,
+        metric_registry: Arc::new(metric::Registry::default()),
+        snapshotted_wal_files_to_keep: 10,
+        query_file_limit: None,
+        n_snapshots_to_load_on_start: usize::MAX,
+        shutdown: influxdb3_shutdown::ShutdownManager::new_testing().register(),
+        wal_replay_concurrency_limit: None,
     })
     .await
-    .expect("the file's object is deleted once snapshot 2 is written");
-    assert!(index_after_restart(&object_store).await.is_empty());
+    .unwrap()
+}
+
+/// A stop after the snapshot that records a retention removal is written, but before the
+/// removed file's object is deleted, leaves an object that no index entry points to. The next
+/// start deletes it (TAG-2753).
+#[tokio::test]
+async fn startup_deletes_the_object_of_a_removal_whose_delete_a_stop_cut_off() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
+    let (queryable_buffer, catalog) =
+        queryable_buffer_over(Arc::clone(&object_store), Arc::clone(&time_provider)).await;
+    let file =
+        persist_a_file_past_retention(&queryable_buffer, &catalog, &time_provider, &object_store)
+            .await;
+    let file_path = Path::from(file.path.as_str());
+    let bytes = object_store
+        .get(&file_path)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+
+    // Snapshot 2 records the removal, then the flush deletes the object. Putting the object
+    // back leaves the store as a stop between the two would: the snapshot written, the delete
+    // not run.
+    let (contents, details) = snapshot_2();
+    queryable_buffer
+        .notify_and_snapshot(contents, details)
+        .await
+        .await
+        .unwrap();
+    wait_until_deleted(
+        &object_store,
+        &file_path,
+        "the flush deletes the file's object",
+    )
+    .await;
+    object_store.put(&file_path, bytes.into()).await.unwrap();
+    assert!(
+        index_after_restart(&object_store).await.is_empty(),
+        "no index entry points to the object"
+    );
+
+    let _write_buffer = start_write_buffer(Arc::clone(&object_store), time_provider).await;
+    wait_until_deleted(
+        &object_store,
+        &file_path,
+        "startup deletes the object a stop left behind",
+    )
+    .await;
+}
+
+/// While a snapshot's upload keeps failing, the removed files whose deletes wait for it are
+/// logged on the first failure and then every 60th, and not at all when none wait.
+#[test]
+fn held_deletes_are_logged_on_the_first_failed_upload_then_every_minute() {
+    let capture = test_helpers::tracing::TracingCapture::new();
+    for failed_uploads in 1..=120 {
+        log_held_deletes(failed_uploads, 3);
+        log_held_deletes(failed_uploads, 0);
+    }
+    let logs = capture.to_string();
+    assert_eq!(
+        logs.matches("the objects of 3 parquet files removed by retention or a hard delete are kept until the snapshot that records their removal is persisted")
+            .count(),
+        3,
+        "{logs}"
+    );
+    assert!(!logs.contains("the objects of 0 parquet files"), "{logs}");
 }

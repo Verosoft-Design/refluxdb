@@ -600,6 +600,13 @@ impl SnapshotFold {
         }
     }
 
+    /// Whether the table indexes an entry at `path`.
+    pub(crate) fn indexes(&self, db_id: DbId, table_id: TableId, path: &str) -> bool {
+        self.tables
+            .get(&(db_id, table_id))
+            .is_some_and(|loader| loader.by_path.contains_key(path))
+    }
+
     /// The newest snapshot applied so far, if any.
     pub(crate) fn newest(&self) -> Option<SnapshotHeader> {
         self.newest

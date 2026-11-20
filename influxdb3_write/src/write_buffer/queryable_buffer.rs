@@ -2,6 +2,7 @@ use crate::chunk::BufferChunk;
 use crate::paths::ParquetFilePath;
 use crate::persister::Persister;
 use crate::write_buffer::persisted_files::PersistedFiles;
+use crate::write_buffer::removed_objects::delete_removed_files;
 use crate::write_buffer::table_buffer::TableBuffer;
 use crate::{ChunkFilter, ParquetFile, ParquetFileId, PersistedSnapshot, PersistedSnapshotVersion};
 use anyhow::Context;
@@ -24,9 +25,9 @@ use iox_query::QueryChunk;
 use iox_query::chunk_statistics::{NoColumnRanges, create_chunk_statistics};
 use iox_query::exec::Executor;
 use iox_query::frontend::reorg::ReorgPlanner;
+use metric::{Registry, U64Gauge};
 use object_store::path::Path;
-use object_store::{Error, ObjectStore};
-use observability_deps::tracing::{error, info, warn};
+use observability_deps::tracing::{error, info};
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 use parquet::format::FileMetaData;
@@ -51,6 +52,9 @@ pub struct QueryableBuffer {
     /// Sends a notification to this watch channel whenever a snapshot info is persisted
     persisted_snapshot_notify_rx: tokio::sync::watch::Receiver<Option<PersistedSnapshotVersion>>,
     persisted_snapshot_notify_tx: tokio::sync::watch::Sender<Option<PersistedSnapshotVersion>>,
+    /// Files removed by retention or a hard delete whose objects wait for the snapshot that
+    /// records their removal to be persisted.
+    held_deletes: U64Gauge,
 }
 
 #[derive(Debug)]
@@ -62,7 +66,11 @@ pub struct QueryableBufferArgs {
     pub distinct_cache_provider: Arc<DistinctCacheProvider>,
     pub persisted_files: Arc<PersistedFiles>,
     pub parquet_cache: Option<Arc<dyn ParquetCacheOracle>>,
+    pub metric_registry: Arc<Registry>,
 }
+
+/// The gauge [`QueryableBuffer`] keeps of removed files whose deletes wait for their snapshot.
+pub const HELD_DELETES_METRIC_NAME: &str = "influxdb3_removed_parquet_files_awaiting_snapshot";
 
 impl QueryableBuffer {
     pub fn new(
@@ -74,8 +82,15 @@ impl QueryableBuffer {
             distinct_cache_provider,
             persisted_files,
             parquet_cache,
+            metric_registry,
         }: QueryableBufferArgs,
     ) -> Self {
+        let held_deletes = metric_registry
+            .register_metric::<U64Gauge>(
+                HELD_DELETES_METRIC_NAME,
+                "parquet files removed by retention or a hard delete whose objects are kept until the snapshot that records the removal is persisted",
+            )
+            .recorder([]);
         let buffer = Arc::new(RwLock::new(BufferState::new(Arc::clone(&catalog))));
         let (persisted_snapshot_notify_tx, persisted_snapshot_notify_rx) =
             tokio::sync::watch::channel(None);
@@ -90,6 +105,7 @@ impl QueryableBuffer {
             parquet_cache,
             persisted_snapshot_notify_rx,
             persisted_snapshot_notify_tx,
+            held_deletes,
         }
     }
 
@@ -228,6 +244,14 @@ impl QueryableBuffer {
         let removed_files = self
             .persisted_files
             .remove_files_for_deletion(Arc::clone(&self.catalog));
+        let removed_paths: Vec<Path> = removed_files
+            .iter()
+            .flat_map(|(_, tables)| tables.tables.iter())
+            .flat_map(|(_, files)| files.iter())
+            .map(|file| Path::from(file.path.as_str()))
+            .collect();
+        let held = removed_paths.len() as u64;
+        self.held_deletes.inc(held);
 
         let (sender, receiver) = oneshot::channel();
 
@@ -239,6 +263,7 @@ impl QueryableBuffer {
         let catalog = Arc::clone(&self.catalog);
         let notify_snapshot_tx = self.persisted_snapshot_notify_tx.clone();
         let parquet_cache = self.parquet_cache.clone();
+        let held_deletes = self.held_deletes.clone();
 
         tokio::spawn(async move {
             info!(
@@ -253,12 +278,7 @@ impl QueryableBuffer {
                 catalog.sequence_number(),
             );
 
-            let removed_paths: Vec<Path> = removed_files
-                .iter()
-                .flat_map(|(_, tables)| tables.tables.iter())
-                .flat_map(|(_, files)| files.iter())
-                .map(|file| Path::from(file.path.as_str()))
-                .collect();
+            snapshot.deletes_removed_objects = !removed_files.is_empty();
             snapshot.removed_files = removed_files;
             // persist the individual files, building the snapshot as we go
             let persisted_snapshot = Arc::new(Mutex::new(snapshot));
@@ -375,6 +395,7 @@ impl QueryableBuffer {
                     .into_inner(),
             );
             if !persist_jobs_empty || !removed_files_empty {
+                let mut failed_uploads = 0;
                 loop {
                     match persister.persist_snapshot(&persisted_snapshot).await {
                         Ok(_) => {
@@ -386,10 +407,13 @@ impl QueryableBuffer {
                         }
                         Err(e) => {
                             error!(%e, "Error persisting snapshot, sleeping and retrying...");
+                            failed_uploads += 1;
+                            log_held_deletes(failed_uploads, held);
                             tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                     }
                 }
+                held_deletes.dec(held);
                 // Now that the snapshot recording their removal is persisted, delete the objects.
                 delete_removed_files(&persister.object_store(), removed_paths);
             }
@@ -524,36 +548,22 @@ impl SortDedupePersistSummary {
     }
 }
 
-/// Delete the objects of files that retention or a hard delete removed from the index. Call it
-/// only once the snapshot that records their removal is persisted: before that, a restart loads
-/// older snapshots that still list them.
-///
-/// Each file is deleted by its own task, on a best effort basis: a file that isn't deleted is no
-/// longer referenced, so it is left in object storage with a warning.
-fn delete_removed_files(object_store: &Arc<dyn ObjectStore>, paths: Vec<Path>) {
-    for path in paths {
-        let object_store = Arc::clone(object_store);
-        tokio::spawn(async move {
-            for attempt in 1..=REMOVED_FILE_DELETE_ATTEMPTS {
-                match object_store.delete(&path).await {
-                    // Deleted, or already gone.
-                    Ok(()) | Err(Error::NotFound { .. }) => return,
-                    Err(e) if attempt == REMOVED_FILE_DELETE_ATTEMPTS => warn!(
-                        %path,
-                        %e,
-                        attempts = attempt,
-                        "Failed to delete a parquet file removed by retention or a hard delete; leaving it in object storage"
-                    ),
-                    Err(_) => tokio::time::sleep(Duration::from_secs(attempt * 10)).await,
-                }
-            }
-        });
+/// While a snapshot's upload keeps failing, say on the first failure and every
+/// [`HELD_DELETES_LOG_EVERY`] after it how many removed files' objects wait for it. The deletes
+/// must wait: deleting before the snapshot is persisted lets a restart index deleted objects.
+fn log_held_deletes(failed_uploads: u64, held: u64) {
+    if held > 0 && (failed_uploads == 1 || failed_uploads % HELD_DELETES_LOG_EVERY == 0) {
+        error!(
+            held_deletes = held,
+            failed_uploads,
+            "the objects of {held} parquet files removed by retention or a hard delete are kept until the snapshot that records their removal is persisted"
+        );
     }
 }
 
-/// How many times [`delete_removed_files`] tries each delete. The waits between tries grow by
-/// 10 s each (10 s, 20 s, ..., 100 s): 550 s, about 9 minutes, in all.
-const REMOVED_FILE_DELETE_ATTEMPTS: u64 = 11;
+/// Failed snapshot uploads between [`log_held_deletes`] lines: about a minute, at one upload a
+/// second.
+const HELD_DELETES_LOG_EVERY: u64 = 60;
 
 async fn sort_dedupe_persist(
     persist_job: PersistJob,

@@ -3,6 +3,7 @@
 mod metrics;
 pub mod persisted_files;
 pub mod queryable_buffer;
+pub(crate) mod removed_objects;
 mod table_buffer;
 use influxdb3_shutdown::ShutdownToken;
 use tokio::sync::{oneshot, watch::Receiver};
@@ -54,7 +55,7 @@ use iox_time::{Time, TimeProvider};
 use metric::Registry;
 use metrics::WriteMetrics;
 use object_store::{ObjectMeta, ObjectStore, path::Path as ObjPath};
-use observability_deps::tracing::{debug, error, warn};
+use observability_deps::tracing::{debug, error, info, warn};
 use parquet_file::storage::ParquetExecInput;
 use queryable_buffer::QueryableBufferArgs;
 use schema::Schema;
@@ -241,7 +242,10 @@ impl WriteBufferImpl {
             }),
             loaded_checkpoint: loaded.checkpoint,
             checkpoints: loaded.checkpoints,
+            removals: loaded.removals.clone(),
         };
+        // A stop before a flush's deletes finished leaves objects that no entry points to.
+        let unindexed_removals = loaded.removals.unindexed(&loaded.fold);
 
         let persisted_files = Arc::new(PersistedFiles::from_fold(loaded.fold));
         let queryable_buffer = Arc::new(QueryableBuffer::new(QueryableBufferArgs {
@@ -252,7 +256,15 @@ impl WriteBufferImpl {
             distinct_cache_provider: Arc::clone(&distinct_cache),
             persisted_files: Arc::clone(&persisted_files),
             parquet_cache: parquet_cache.clone(),
+            metric_registry: Arc::clone(&metric_registry),
         }));
+        if !unindexed_removals.is_empty() {
+            info!(
+                count = unindexed_removals.len(),
+                "deleting the objects of files that retention or a hard delete removed before the last stop"
+            );
+            removed_objects::delete_removed_files(&persister.object_store(), unindexed_removals);
+        }
 
         // create the wal instance, which will replay into the queryable buffer and start
         // the background flush task.

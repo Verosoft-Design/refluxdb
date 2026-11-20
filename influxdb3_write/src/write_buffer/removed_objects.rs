@@ -89,34 +89,37 @@ impl MarkedRemovals {
         paths.into_iter().map(Path::from).collect()
     }
 
-    pub(crate) fn clear(&mut self) {
-        self.0.clear();
+    /// Keep only the removals at `paths`.
+    pub(crate) fn retain_paths(&mut self, paths: &[Path]) {
+        let paths: BTreeSet<&str> = paths.iter().map(|p| p.as_ref()).collect();
+        self.0.retain(|(_, _, path)| paths.contains(path.as_str()));
     }
 }
 
 /// Delete each of `paths` once, at most `concurrency` at a time, and wait for them: the index
-/// checkpoint writer's pass (see the module docs). Returns how many deletes failed; NotFound
-/// counts as deleted.
+/// checkpoint writer's pass (see the module docs). Returns the paths whose delete failed;
+/// NotFound counts as deleted.
 pub(crate) async fn delete_unindexed_now(
     object_store: &Arc<dyn ObjectStore>,
     paths: Vec<Path>,
     concurrency: usize,
-) -> usize {
+) -> Vec<Path> {
     futures::stream::iter(paths)
         .map(|path| {
             let object_store = Arc::clone(object_store);
             async move {
                 match object_store.delete(&path).await {
-                    Ok(()) | Err(Error::NotFound { .. }) => 0,
+                    Ok(()) | Err(Error::NotFound { .. }) => None,
                     Err(e) => {
-                        warn!(%path, %e, "Failed to delete a parquet file removed by retention or a hard delete; leaving it in object storage");
-                        1
+                        warn!(%path, %e, "Failed to delete a parquet file removed by retention or a hard delete; the next index checkpoint tries again");
+                        Some(path)
                     }
                 }
             }
         })
         .buffer_unordered(concurrency)
-        .fold(0, |failed, f| async move { failed + f })
+        .filter_map(|failed| async move { failed })
+        .collect()
         .await
 }
 

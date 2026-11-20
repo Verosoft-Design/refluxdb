@@ -1212,7 +1212,7 @@ impl CompactionService {
 
         // A stop before a flush's deletes finished leaves objects that no entry points to.
         // Startup deletes them, but only in the snapshots it loads, which this checkpoint
-        // replaces: delete them before it is written.
+        // replaces: delete them before it is written. Failed deletes are kept for the next one.
         let removed_objects = state.removals.unindexed(&state.fold);
         let removed_objects_count = removed_objects.len();
         let failed_deletes = delete_unindexed_now(
@@ -1254,7 +1254,7 @@ impl CompactionService {
         state.last_checkpoint = Some(checkpoint_sequence_number);
         state.last_checkpoint_at = std::time::Instant::now();
         state.retry_at = None;
-        state.removals.clear();
+        state.removals.retain_paths(&failed_deletes);
         // Numbers are handed out above every name listed at startup, so this one is the newest.
         state.checkpoints.insert(0, checkpoint_sequence_number);
         let expired = state
@@ -1277,7 +1277,7 @@ impl CompactionService {
                 .saturating_sub(fetched),
             deleted_checkpoints = expired.len(),
             removed_objects = removed_objects_count,
-            failed_deletes,
+            failed_deletes = failed_deletes.len(),
             elapsed_ms = started.elapsed().as_millis() as u64,
             "wrote an index checkpoint"
         );
@@ -1919,6 +1919,7 @@ mod tests {
     use object_store::memory::InMemory;
 
     mod checkpoint_tests;
+    mod removed_objects_tests;
 
     struct CompactionHarness {
         object_store: Arc<dyn ObjectStore>,

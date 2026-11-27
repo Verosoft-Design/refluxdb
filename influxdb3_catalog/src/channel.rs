@@ -4,6 +4,7 @@ use anyhow::Context;
 use futures::future::try_join_all;
 use observability_deps::tracing::warn;
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 
 use crate::{catalog::CatalogUpdate, log::CatalogBatch};
 
@@ -23,16 +24,23 @@ pub type CatalogUpdateReceiver = mpsc::Receiver<CatalogUpdateMessage>;
 /// messages does not need to worry about sending the response back to the catalog on broadcast.
 pub struct CatalogUpdateMessage {
     update: Arc<CatalogUpdate>,
-    tx: Option<oneshot::Sender<()>>,
+    tx: Option<oneshot::Sender<Vec<JoinHandle<()>>>>,
+    completions: Vec<JoinHandle<()>>,
 }
 
 impl CatalogUpdateMessage {
     /// Create a new `CatalogUpdateMessage`
-    fn new(update: Arc<CatalogUpdate>, tx: oneshot::Sender<()>) -> Self {
+    fn new(update: Arc<CatalogUpdate>, tx: oneshot::Sender<Vec<JoinHandle<()>>>) -> Self {
         Self {
             update,
             tx: Some(tx),
+            completions: Vec::new(),
         }
+    }
+
+    /// Wait for these already-started tasks after releasing the catalog write permit.
+    pub fn defer_completion(&mut self, completions: Vec<JoinHandle<()>>) {
+        self.completions.extend(completions);
     }
 
     /// Iterate over the `CatalogBatch`s in the update
@@ -46,8 +54,8 @@ impl Drop for CatalogUpdateMessage {
     fn drop(&mut self) {
         if let Some(tx) = self.tx.take() {
             let _ = tx
-                .send(())
-                .inspect_err(|error| warn!(?error, "unable to send ACK for catalog update"));
+                .send(std::mem::take(&mut self.completions))
+                .inspect_err(|_| warn!("unable to send ACK for catalog update"));
         }
     }
 }
@@ -90,7 +98,7 @@ impl CatalogSubscriptions {
     pub(crate) async fn send_update(
         &self,
         update: Arc<CatalogUpdate>,
-    ) -> Result<(), SubscriptionError> {
+    ) -> Result<Vec<JoinHandle<()>>, SubscriptionError> {
         let mut responses = vec![];
         for (name, sub) in self
             .subscriptions
@@ -104,17 +112,16 @@ impl CatalogSubscriptions {
                     .await
                     .with_context(|| format!("failed to send update to {name}"))?;
                 rx.await
-                    .with_context(|| format!("failed to receive response from {name}"))?;
-                Ok(())
+                    .with_context(|| format!("failed to receive response from {name}"))
             }));
         }
 
-        try_join_all(responses)
+        let completions = try_join_all(responses)
             .await
             .context("failed to collect responses from catalog subscribers")?
             .into_iter()
-            .collect::<Result<Vec<()>, anyhow::Error>>()?;
-        Ok(())
+            .collect::<Result<Vec<_>, anyhow::Error>>()?;
+        Ok(completions.into_iter().flatten().collect())
     }
 }
 

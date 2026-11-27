@@ -13,8 +13,9 @@ use influxdb3_catalog::log::{
     CatalogBatch, DatabaseCatalogOp, DeleteTriggerLog, PluginType, TriggerDefinition,
     TriggerIdentifier, TriggerSpecificationDefinition, ValidPluginFilename,
 };
+use influxdb3_id::{DbId, TriggerId};
 use influxdb3_internal_api::query_executor::QueryExecutor;
-use influxdb3_py_api::system_py::CacheStore;
+use influxdb3_py_api::system_py::{CacheStore, PyCache};
 use influxdb3_sys_events::SysEventStore;
 use influxdb3_types::http::{
     SchedulePluginTestRequest, SchedulePluginTestResponse, WalPluginTestRequest,
@@ -31,7 +32,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::oneshot::Receiver;
-use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::sync::{RwLock, mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
+use tokio::time::{Instant, timeout_at};
 
 pub mod environment;
 pub mod manager;
@@ -52,166 +55,115 @@ pub struct ProcessingEngineManagerImpl {
     plugin_event_tx: RwLock<PluginChannels>,
 }
 
+type TriggerKey = (DbId, TriggerId);
+
 #[derive(Debug, Default)]
 struct PluginChannels {
-    /// Map of database to wal trigger name to handler
-    wal_triggers: HashMap<String, HashMap<String, mpsc::Sender<WalEvent>>>,
-    /// Map of database to schedule trigger name to handler
-    schedule_triggers: HashMap<String, HashMap<String, mpsc::Sender<ScheduleEvent>>>,
-    /// Map of request path to the request trigger handler
-    request_triggers: HashMap<String, mpsc::Sender<RequestEvent>>,
+    running: HashMap<TriggerKey, RunningTrigger>,
+    request_paths: HashMap<String, TriggerKey>,
+}
+
+#[derive(Debug)]
+struct RunningTrigger {
+    database_name: Arc<str>,
+    trigger_name: Arc<str>,
+    route: TriggerRoute,
+    cancellation: watch::Sender<bool>,
+    cache: PyCache,
+    task: JoinHandle<()>,
+}
+
+#[derive(Debug)]
+enum TriggerRoute {
+    Wal(mpsc::Sender<WalEvent>),
+    Schedule,
+    Request(String, mpsc::Sender<Request>),
+}
+
+impl TriggerRoute {
+    fn plugin_type(&self) -> PluginType {
+        match self {
+            Self::Wal(_) => PluginType::WalRows,
+            Self::Schedule => PluginType::Schedule,
+            Self::Request(..) => PluginType::Request,
+        }
+    }
 }
 
 const PLUGIN_EVENT_BUFFER_SIZE: usize = 60;
+const SHUTDOWN_BUDGET: Duration = Duration::from_secs(20);
 
 impl PluginChannels {
-    // returns Ok(Some(receiver)) if there was a sender to the named trigger.
-    async fn send_shutdown(
-        &self,
-        db: String,
-        trigger: String,
-        plugin_type: PluginType,
-    ) -> Result<Option<Receiver<()>>, ProcessingEngineError> {
-        match plugin_type {
-            PluginType::WalRows => {
-                if let Some(trigger_map) = self.wal_triggers.get(&db) {
-                    if let Some(sender) = trigger_map.get(&trigger) {
-                        // create a one shot to wait for the shutdown to complete
-                        let (tx, rx) = oneshot::channel();
-                        if sender.send(WalEvent::Shutdown(tx)).await.is_err() {
-                            return Err(ProcessingEngineError::TriggerShutdownError {
-                                database: db,
-                                trigger_name: trigger,
-                            });
-                        }
-                        return Ok(Some(rx));
-                    }
-                }
-            }
-            PluginType::Schedule => {
-                if let Some(trigger_map) = self.schedule_triggers.get(&db) {
-                    if let Some(sender) = trigger_map.get(&trigger) {
-                        // create a one shot to wait for the shutdown to complete
-                        let (tx, rx) = oneshot::channel();
-                        if sender.send(ScheduleEvent::Shutdown(tx)).await.is_err() {
-                            return Err(ProcessingEngineError::TriggerShutdownError {
-                                database: db,
-                                trigger_name: trigger,
-                            });
-                        }
-                        return Ok(Some(rx));
-                    }
-                }
-            }
-            PluginType::Request => {
-                if let Some(sender) = self.request_triggers.get(&trigger) {
-                    // create a one shot to wait for the shutdown to complete
-                    let (tx, rx) = oneshot::channel();
-                    if sender.send(RequestEvent::Shutdown(tx)).await.is_err() {
-                        return Err(ProcessingEngineError::TriggerShutdownError {
-                            database: db,
-                            trigger_name: trigger,
-                        });
-                    }
-                    return Ok(Some(rx));
-                }
-            }
+    fn insert(&mut self, key: TriggerKey, runtime: RunningTrigger) {
+        if let TriggerRoute::Request(path, _) = &runtime.route {
+            self.request_paths.insert(path.clone(), key);
         }
-
-        Ok(None)
+        self.running.insert(key, runtime);
     }
 
-    fn remove_trigger(&mut self, db: String, trigger: String, plugin_type: PluginType) {
-        match plugin_type {
-            PluginType::WalRows => {
-                if let Some(trigger_map) = self.wal_triggers.get_mut(&db) {
-                    trigger_map.remove(&trigger);
-                }
-            }
-            PluginType::Schedule => {
-                if let Some(trigger_map) = self.schedule_triggers.get_mut(&db) {
-                    trigger_map.remove(&trigger);
-                }
-            }
-            PluginType::Request => {
-                self.request_triggers.remove(&trigger);
-            }
-        }
-    }
-
-    /// The type of a running WAL or scheduled trigger, found by name. Used when the
-    /// catalog no longer has the trigger but its plugin may still be running.
-    fn running_plugin_type(&self, db: &str, trigger: &str) -> Option<PluginType> {
-        if self
-            .wal_triggers
-            .get(db)
-            .is_some_and(|triggers| triggers.contains_key(trigger))
-        {
-            Some(PluginType::WalRows)
-        } else if self
-            .schedule_triggers
-            .get(db)
-            .is_some_and(|triggers| triggers.contains_key(trigger))
-        {
-            Some(PluginType::Schedule)
-        } else {
-            None
-        }
-    }
-
-    fn add_wal_trigger(&mut self, db: String, trigger: String) -> mpsc::Receiver<WalEvent> {
-        let (tx, rx) = mpsc::channel(PLUGIN_EVENT_BUFFER_SIZE);
-        self.wal_triggers.entry(db).or_default().insert(trigger, tx);
-        rx
-    }
-
-    fn add_schedule_trigger(
+    fn detach(
         &mut self,
-        db: String,
-        trigger: String,
-    ) -> mpsc::Receiver<ScheduleEvent> {
-        let (tx, rx) = mpsc::channel(PLUGIN_EVENT_BUFFER_SIZE);
-        self.schedule_triggers
-            .entry(db)
-            .or_default()
-            .insert(trigger, tx);
-        rx
-    }
-
-    fn add_request_trigger(&mut self, path: String) -> mpsc::Receiver<RequestEvent> {
-        let (tx, rx) = mpsc::channel(PLUGIN_EVENT_BUFFER_SIZE);
-        self.request_triggers.insert(path, tx);
-        rx
-    }
-
-    async fn send_wal_contents(&self, wal_contents: Arc<WalContents>) {
-        for (db, trigger_map) in &self.wal_triggers {
-            for (trigger, sender) in trigger_map {
-                if let Err(e) = sender
-                    .send(WalEvent::WriteWalContents(Arc::clone(&wal_contents)))
-                    .await
-                {
-                    warn!(%e, %db, ?trigger, "error sending wal contents to plugin");
-                }
-            }
-        }
-    }
-
-    async fn send_request(
-        &self,
-        trigger_path: &str,
-        request: Request,
-    ) -> Result<(), ProcessingEngineError> {
-        let event = RequestEvent::Request(request);
-        if let Some(sender) = self.request_triggers.get(trigger_path) {
-            if sender.send(event).await.is_err() {
-                return Err(ProcessingEngineError::RequestTriggerNotFound);
-            }
-        } else {
-            return Err(ProcessingEngineError::RequestTriggerNotFound);
+        key: TriggerKey,
+        generation: Option<&watch::Receiver<bool>>,
+    ) -> Option<RunningTrigger> {
+        let runtime = self.running.get(&key)?;
+        if generation
+            .is_some_and(|generation| !runtime.cancellation.subscribe().same_channel(generation))
+        {
+            return None;
         }
 
-        Ok(())
+        let runtime = self.running.remove(&key)?;
+        if let TriggerRoute::Request(path, _) = &runtime.route {
+            if self.request_paths.get(path) == Some(&key) {
+                self.request_paths.remove(path);
+            }
+        }
+        Some(runtime)
+    }
+}
+
+async fn cancelled(receiver: &mut watch::Receiver<bool>) {
+    // A closed control channel also has no running owner.
+    let _ = receiver.wait_for(|cancelled| *cancelled).await;
+}
+
+async fn send_to_trigger<T>(
+    sender: mpsc::Sender<T>,
+    mut cancellation: watch::Receiver<bool>,
+    event: T,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = cancelled(&mut cancellation) => false,
+        result = sender.send(event) => result.is_ok(),
+    }
+}
+
+async fn wait_for_shutdown(
+    runtime: RunningTrigger,
+    (database_id, trigger_id): TriggerKey,
+    operation: &'static str,
+    started: Instant,
+) {
+    let mut task = runtime.task;
+    if timeout_at(started + SHUTDOWN_BUDGET, &mut task)
+        .await
+        .is_err()
+    {
+        task.abort();
+        warn!(
+            operation,
+            ?database_id,
+            ?trigger_id,
+            database = %runtime.database_name,
+            trigger = %runtime.trigger_name,
+            plugin_type = ?runtime.route.plugin_type(),
+            phase = "completion",
+            budget_ms = SHUTDOWN_BUDGET.as_millis() as u64,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "trigger shutdown timed out"
+        );
     }
 }
 
@@ -368,162 +320,135 @@ impl LocalPlugin {
 }
 
 impl ProcessingEngineManagerImpl {
-    // TODO(trevor): should this be id-based and not use names?
     async fn run_trigger(
         self: Arc<Self>,
         db_name: &str,
         trigger_name: &str,
+        expected: Option<TriggerKey>,
     ) -> Result<(), ProcessingEngineError> {
         debug!(db_name, trigger_name, "starting trigger");
-
-        {
-            let db_schema = self
-                .catalog
-                .db_schema(db_name)
-                .ok_or_else(|| ProcessingEngineError::DatabaseNotFound(db_name.to_string()))?;
-            let trigger = db_schema
-                .processing_engine_triggers
-                .get_by_name(trigger_name)
-                .clone()
-                .ok_or_else(|| CatalogError::ProcessingEngineTriggerNotFound {
-                    database_name: db_name.to_string(),
-                    trigger_name: trigger_name.to_string(),
-                })?;
-
-            if trigger.node_id != self.node_id {
-                error!(
-                    "Not running trigger {}, as it is configured for node id {}. Multi-node not supported in core, so this shouldn't happen.",
-                    trigger_name, trigger.node_id
-                );
-                return Ok(());
-            }
-
-            let plugin_context = PluginContext {
-                write_buffer: Arc::clone(&self.write_buffer),
-                query_executor: Arc::clone(&self.query_executor),
-                sys_event_store: Arc::clone(&self.sys_event_store),
-                manager: Arc::clone(&self),
-            };
-            let plugin_code = Arc::new(self.read_plugin_code(&trigger.plugin_filename).await?);
-            match trigger.trigger.plugin_type() {
-                PluginType::WalRows => {
-                    let rec = self
-                        .plugin_event_tx
-                        .write()
-                        .await
-                        .add_wal_trigger(db_name.to_string(), trigger_name.to_string());
-
-                    plugins::run_wal_contents_plugin(
-                        db_name.to_string(),
-                        plugin_code,
-                        trigger,
-                        plugin_context,
-                        rec,
-                    )
-                }
-                PluginType::Schedule => {
-                    let rec = self
-                        .plugin_event_tx
-                        .write()
-                        .await
-                        .add_schedule_trigger(db_name.to_string(), trigger_name.to_string());
-
-                    plugins::run_schedule_plugin(
-                        db_name.to_string(),
-                        plugin_code,
-                        trigger,
-                        Arc::clone(&self.time_provider),
-                        plugin_context,
-                        rec,
-                    )?
-                }
-                PluginType::Request => {
-                    let TriggerSpecificationDefinition::RequestPath { path } = &trigger.trigger
-                    else {
-                        unreachable!()
-                    };
-                    let rec = self
-                        .plugin_event_tx
-                        .write()
-                        .await
-                        .add_request_trigger(path.to_string());
-
-                    plugins::run_request_plugin(
-                        db_name.to_string(),
-                        plugin_code,
-                        trigger,
-                        plugin_context,
-                        rec,
-                    )
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    // TODO(trevor): should this be id-based and not use names?
-    async fn stop_trigger(
-        &self,
-        db_name: &str,
-        trigger_name: &str,
-    ) -> Result<(), ProcessingEngineError> {
         let db_schema = self
             .catalog
             .db_schema(db_name)
             .ok_or_else(|| ProcessingEngineError::DatabaseNotFound(db_name.to_string()))?;
-        // A forced delete reaches the catalog before this runs, so a trigger that is
-        // still running may already be gone from it. Find that one by name, or it
-        // would keep running with no way to stop it.
-        let plugin_type = match db_schema
+        let trigger = db_schema
             .processing_engine_triggers
             .get_by_name(trigger_name)
-        {
-            Some(trigger) => trigger.trigger.plugin_type(),
-            None => self
-                .plugin_event_tx
-                .read()
-                .await
-                .running_plugin_type(db_name, trigger_name)
-                .ok_or_else(|| CatalogError::ProcessingEngineTriggerNotFound {
-                    database_name: db_name.to_string(),
-                    trigger_name: trigger_name.to_string(),
-                })?,
-        };
-
-        let Some(shutdown_rx) = self
-            .plugin_event_tx
-            .write()
-            .await
-            .send_shutdown(db_name.to_string(), trigger_name.to_string(), plugin_type)
-            .await?
-        else {
+            .ok_or_else(|| CatalogError::ProcessingEngineTriggerNotFound {
+                database_name: db_name.to_string(),
+                trigger_name: trigger_name.to_string(),
+            })?;
+        let key = (db_schema.id, trigger.trigger_id);
+        if trigger.disabled || expected.is_some_and(|expected| expected != key) {
             return Ok(());
-        };
-
-        if shutdown_rx.await.is_err() {
-            warn!(
-                "shutdown trigger receiver dropped, may have received multiple shutdown requests"
-            );
-        } else {
-            self.plugin_event_tx.write().await.remove_trigger(
-                db_name.to_string(),
-                trigger_name.to_string(),
-                plugin_type,
-            );
         }
-        self.cache
-            .lock()
-            .drop_trigger_cache(db_name.to_string(), trigger_name.to_string());
+        if trigger.node_id != self.node_id {
+            error!(
+                trigger_name, node_id = %trigger.node_id,
+                "trigger is configured for a different node"
+            );
+            return Ok(());
+        }
 
+        let plugin_code = Arc::new(self.read_plugin_code(&trigger.plugin_filename).await?);
+        let mut channels = self.plugin_event_tx.write().await;
+        // Startup can race an update while loading the plugin file.
+        let still_active = self.catalog.db_schema(db_name).is_some_and(|db| {
+            db.id == key.0
+                && db
+                    .processing_engine_triggers
+                    .get_by_name(trigger_name)
+                    .is_some_and(|current| current.trigger_id == key.1 && !current.disabled)
+        });
+        if !still_active || channels.running.contains_key(&key) {
+            return Ok(());
+        }
+
+        let (cancellation, receiver) = watch::channel(false);
+        let cache = PyCache::new_trigger_cache(Arc::clone(&self.cache), receiver.clone());
+        let context = PluginContext {
+            write_buffer: Arc::clone(&self.write_buffer),
+            query_executor: Arc::clone(&self.query_executor),
+            sys_event_store: Arc::clone(&self.sys_event_store),
+            manager: Arc::clone(&self),
+            key,
+            cancellation: receiver,
+            cache: cache.clone(),
+        };
+        let (route, task) = match trigger.trigger.plugin_type() {
+            PluginType::Request => {
+                let TriggerSpecificationDefinition::RequestPath { path } = &trigger.trigger else {
+                    unreachable!()
+                };
+                let (tx, rx) = mpsc::channel(PLUGIN_EVENT_BUFFER_SIZE);
+                let task = plugins::run_request_plugin(
+                    db_name.to_string(),
+                    plugin_code,
+                    Arc::clone(&trigger),
+                    context,
+                    rx,
+                );
+                (TriggerRoute::Request(path.clone(), tx), task)
+            }
+            PluginType::WalRows => {
+                let (tx, rx) = mpsc::channel(PLUGIN_EVENT_BUFFER_SIZE);
+                let task = plugins::run_wal_contents_plugin(
+                    db_name.to_string(),
+                    plugin_code,
+                    Arc::clone(&trigger),
+                    context,
+                    rx,
+                );
+                (TriggerRoute::Wal(tx), task)
+            }
+            PluginType::Schedule => {
+                let task = plugins::run_schedule_plugin(
+                    db_name.to_string(),
+                    plugin_code,
+                    Arc::clone(&trigger),
+                    Arc::clone(&self.time_provider),
+                    context,
+                )?;
+                (TriggerRoute::Schedule, task)
+            }
+        };
+        channels.insert(
+            key,
+            RunningTrigger {
+                database_name: Arc::clone(&trigger.database_name),
+                trigger_name: Arc::clone(&trigger.trigger_name),
+                route,
+                cancellation,
+                cache,
+                task,
+            },
+        );
         Ok(())
+    }
+
+    async fn stop_trigger(
+        &self,
+        key: TriggerKey,
+        generation: Option<&watch::Receiver<bool>>,
+        operation: &'static str,
+    ) -> Option<JoinHandle<()>> {
+        let mut channels = self.plugin_event_tx.write().await;
+        let runtime = channels.detach(key, generation)?;
+        let started = Instant::now();
+        // ponytail: A watch signal dispatches synchronously, even with a full event queue.
+        runtime.cancellation.send_replace(true);
+        drop(channels);
+        runtime.cache.retire_trigger_cache();
+        Some(tokio::spawn(wait_for_shutdown(
+            runtime, key, operation, started,
+        )))
     }
 
     pub async fn start_triggers(self: Arc<Self>) -> Result<(), ProcessingEngineError> {
         let triggers = self.catalog.active_triggers();
         for (db_name, trigger_name) in triggers {
             Arc::clone(&self)
-                .run_trigger(&db_name, &trigger_name)
+                .run_trigger(&db_name, &trigger_name, None)
                 .await?;
         }
         Ok(())
@@ -614,11 +539,20 @@ impl ProcessingEngineManagerImpl {
             response_tx: tx,
         };
 
-        self.plugin_event_tx
-            .write()
-            .await
-            .send_request(trigger_path, request)
-            .await?;
+        let route = {
+            let channels = self.plugin_event_tx.read().await;
+            channels.request_paths.get(trigger_path).and_then(|key| {
+                let runtime = channels.running.get(key)?;
+                let TriggerRoute::Request(_, sender) = &runtime.route else {
+                    return None;
+                };
+                Some((sender.clone(), runtime.cancellation.subscribe()))
+            })
+        };
+        let (sender, cancellation) = route.ok_or(ProcessingEngineError::RequestTriggerNotFound)?;
+        if !send_to_trigger(sender, cancellation, request).await {
+            return Err(ProcessingEngineError::RequestTriggerNotFound);
+        }
 
         rx.await.map_err(|e| {
             error!(%e, "error receiving response from plugin");
@@ -634,8 +568,34 @@ impl ProcessingEngineManagerImpl {
 #[async_trait::async_trait]
 impl WalFileNotifier for ProcessingEngineManagerImpl {
     async fn notify(&self, write: Arc<WalContents>) {
-        let plugin_channels = self.plugin_event_tx.read().await;
-        plugin_channels.send_wal_contents(write).await;
+        let routes: Vec<_> = self
+            .plugin_event_tx
+            .read()
+            .await
+            .running
+            .values()
+            .filter_map(|runtime| match &runtime.route {
+                TriggerRoute::Wal(sender) => Some((
+                    sender.clone(),
+                    runtime.cancellation.subscribe(),
+                    Arc::clone(&runtime.database_name),
+                    Arc::clone(&runtime.trigger_name),
+                )),
+                _ => None,
+            })
+            .collect();
+        for (sender, cancellation, db, trigger) in routes {
+            if !send_to_trigger(
+                sender,
+                cancellation.clone(),
+                WalEvent::WriteWalContents(Arc::clone(&write)),
+            )
+            .await
+                && !*cancellation.borrow()
+            {
+                warn!(%db, %trigger, "error sending wal contents to plugin");
+            }
+        }
     }
 
     async fn notify_and_snapshot(
@@ -643,8 +603,7 @@ impl WalFileNotifier for ProcessingEngineManagerImpl {
         write: Arc<WalContents>,
         snapshot_details: SnapshotDetails,
     ) -> Receiver<SnapshotDetails> {
-        let plugin_channels = self.plugin_event_tx.read().await;
-        plugin_channels.send_wal_contents(write).await;
+        self.notify(write).await;
 
         // configure a reciever that we immediately close
         let (tx, rx) = oneshot::channel();
@@ -660,18 +619,6 @@ impl WalFileNotifier for ProcessingEngineManagerImpl {
 #[allow(dead_code)]
 pub(crate) enum WalEvent {
     WriteWalContents(Arc<WalContents>),
-    Shutdown(oneshot::Sender<()>),
-}
-
-#[allow(dead_code)]
-pub(crate) enum ScheduleEvent {
-    Shutdown(oneshot::Sender<()>),
-}
-
-#[allow(dead_code)]
-pub(crate) enum RequestEvent {
-    Request(Request),
-    Shutdown(oneshot::Sender<()>),
 }
 
 #[allow(dead_code)]
@@ -688,7 +635,8 @@ fn background_catalog_update(
     mut subscription: CatalogUpdateReceiver,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(catalog_update) = subscription.recv().await {
+        while let Some(mut catalog_update) = subscription.recv().await {
+            let mut completions = Vec::new();
             for batch in catalog_update
                 .batches()
                 .filter_map(CatalogBatch::as_database)
@@ -699,12 +647,17 @@ fn background_catalog_update(
                         DatabaseCatalogOp::CreateTrigger(TriggerDefinition {
                             trigger_name,
                             database_name,
+                            trigger_id,
                             disabled,
                             ..
                         }) => {
                             if !disabled {
                                 if let Err(error) = processing_engine_manager
-                                    .run_trigger(database_name, trigger_name)
+                                    .run_trigger(
+                                        database_name,
+                                        trigger_name,
+                                        Some((batch.database_id, *trigger_id)),
+                                    )
                                     .await
                                 {
                                     error!(?error, "failed to run the created trigger");
@@ -712,40 +665,43 @@ fn background_catalog_update(
                             }
                         }
                         DatabaseCatalogOp::EnableTrigger(TriggerIdentifier {
+                            db_id,
                             db_name,
+                            trigger_id,
                             trigger_name,
-                            ..
                         }) => {
                             if let Err(error) = processing_engine_manager
-                                .run_trigger(db_name, trigger_name)
+                                .run_trigger(db_name, trigger_name, Some((*db_id, *trigger_id)))
                                 .await
                             {
                                 error!(?error, "failed to run the trigger");
                             }
                         }
                         DatabaseCatalogOp::DeleteTrigger(DeleteTriggerLog {
-                            trigger_name,
+                            trigger_id,
                             force: true,
                             ..
                         }) => {
-                            if let Err(error) = processing_engine_manager
-                                .stop_trigger(&batch.database_name, trigger_name)
-                                .await
-                            {
-                                error!(?error, "failed to disable the trigger");
-                            }
+                            completions.extend(
+                                processing_engine_manager
+                                    .stop_trigger(
+                                        (batch.database_id, *trigger_id),
+                                        None,
+                                        "force_delete",
+                                    )
+                                    .await,
+                            );
                         }
                         DatabaseCatalogOp::DisableTrigger(TriggerIdentifier {
-                            db_name,
-                            trigger_name,
+                            db_id,
+                            trigger_id,
                             ..
                         }) => {
-                            if let Err(error) = processing_engine_manager
-                                .stop_trigger(db_name, trigger_name)
-                                .await
-                            {
-                                error!(?error, "failed to disable the trigger");
-                            }
+                            completions.extend(
+                                processing_engine_manager
+                                    .stop_trigger((*db_id, *trigger_id), None, "disable")
+                                    .await,
+                            );
                         }
                         // NOTE(trevor/catalog-refactor): it is not clear that any other operation needs to be
                         // handled, based on the existing code, but we could potentially
@@ -754,18 +710,24 @@ fn background_catalog_update(
                     }
                 }
             }
+            catalog_update.defer_completion(completions);
         }
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::ProcessingEngineManagerImpl;
     use crate::environment::DisabledManager;
     use crate::plugins::ProcessingEngineEnvironmentManager;
+    use crate::{
+        ProcessingEngineManagerImpl, Request, RunningTrigger, SHUTDOWN_BUDGET, TriggerKey,
+        TriggerRoute,
+    };
     use arrow_array::{Array, StringArray};
+    use bytes::Bytes;
     use data_types::NamespaceName;
     use datafusion_util::config::register_iox_object_store;
+    use hashbrown::HashMap;
     use influxdb3_cache::distinct_cache::DistinctCacheProvider;
     use influxdb3_cache::last_cache::LastCacheProvider;
     use influxdb3_catalog::CatalogError;
@@ -774,6 +736,7 @@ mod tests {
     use influxdb3_id::{ColumnId, SerdeVecMap};
     use influxdb3_internal_api::query_executor::UnimplementedQueryExecutor;
     use influxdb3_py_api::logging::ProcessingEngineLog;
+    use influxdb3_py_api::system_py::PyCache;
     use influxdb3_shutdown::ShutdownManager;
     use influxdb3_sys_events::SysEventStore;
     use influxdb3_wal::{
@@ -799,6 +762,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tempfile::NamedTempFile;
+    use tokio::sync::{mpsc, oneshot, watch};
+    use tokio::time::{Instant, advance, timeout};
+
+    use crate::manager::ProcessingEngineError;
 
     #[test_log::test(tokio::test)]
     async fn test_trigger_lifecycle() -> influxdb3_write::write_buffer::Result<()> {
@@ -993,6 +960,285 @@ mod tests {
         };
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_shutdown_force_delete_unblocks_routing_and_catalog() {
+        let (pem, file) = setup(
+            Time::from_timestamp_nanos(0),
+            Arc::new(InMemory::new()),
+            WalConfig::default(),
+        )
+        .await;
+        pem.catalog.create_database("foo").await.unwrap();
+        let key =
+            create_test_trigger(&pem, &file, "request_name", "request:request_path", true).await;
+
+        // A full event queue with a task that never acknowledges shutdown.
+        let (request_tx, mut request_rx) = mpsc::channel(1);
+        request_tx
+            .try_send(Request {
+                query_params: HashMap::new(),
+                headers: HashMap::new(),
+                body: Bytes::new(),
+                response_tx: oneshot::channel().0,
+            })
+            .unwrap();
+        let (dropped_tx, mut dropped_rx) = oneshot::channel::<()>();
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        pem.plugin_event_tx.write().await.insert(
+            key,
+            RunningTrigger {
+                database_name: "foo".into(),
+                trigger_name: "request_name".into(),
+                route: TriggerRoute::Request("request_path".into(), request_tx),
+                cache: PyCache::new_trigger_cache(Arc::clone(&pem.cache), cancel_tx.subscribe()),
+                cancellation: cancel_tx,
+                task: tokio::spawn(async move {
+                    std::future::pending::<()>().await;
+                    drop(dropped_tx);
+                }),
+            },
+        );
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer = {
+            let captured = Arc::clone(&captured);
+            move || CapturedLog(Arc::clone(&captured))
+        };
+        let _subscriber = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(writer)
+                .with_ansi(false)
+                .finish(),
+        );
+        tracing::callsite::rebuild_interest_cache();
+
+        tokio::time::pause();
+        let started = Instant::now();
+        let pending_request =
+            pem.request_trigger("request_path", HashMap::new(), HashMap::new(), Bytes::new());
+        tokio::pin!(pending_request);
+        assert!(futures_util::poll!(&mut pending_request).is_pending());
+
+        let catalog = Arc::clone(&pem.catalog);
+        let deletion = tokio::spawn(async move {
+            catalog
+                .delete_processing_engine_trigger("foo", "request_name", true)
+                .await
+        });
+        timeout(
+            Duration::from_secs(1),
+            cancel_rx.wait_for(|cancelled| *cancelled),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            pending_request.await,
+            Err(ProcessingEngineError::RequestTriggerNotFound)
+        ));
+        assert!(matches!(
+            pem.request_trigger("request_path", HashMap::new(), HashMap::new(), Bytes::new())
+                .await,
+            Err(ProcessingEngineError::RequestTriggerNotFound)
+        ));
+        assert!(request_rx.try_recv().is_ok());
+        assert!(request_rx.try_recv().is_err());
+        assert!(
+            pem.catalog
+                .db_schema("foo")
+                .unwrap()
+                .processing_engine_triggers
+                .get_by_name("request_name")
+                .is_none()
+        );
+
+        timeout(
+            Duration::from_secs(1),
+            pem.catalog.create_database("unrelated"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(pem.stop_trigger(key, None, "force_delete").await.is_none());
+
+        let before_deadline = started + SHUTDOWN_BUDGET - Duration::from_secs(1);
+        advance(before_deadline - Instant::now()).await;
+        assert!(!deletion.is_finished());
+        assert!(matches!(
+            dropped_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        advance(Duration::from_secs(1)).await;
+        deletion.await.unwrap().unwrap();
+        assert!(dropped_rx.await.is_err());
+        // Tokio timers round up to the next millisecond tick.
+        assert!(
+            (SHUTDOWN_BUDGET..=SHUTDOWN_BUDGET + Duration::from_millis(1))
+                .contains(&started.elapsed())
+        );
+
+        let logs = captured.lock().unwrap();
+        let logs = std::str::from_utf8(&logs).unwrap();
+        let timeouts: Vec<_> = logs
+            .lines()
+            .filter(|line| line.contains("trigger shutdown timed out"))
+            .collect();
+        assert_eq!(timeouts.len(), 1);
+        assert!(timeouts[0].contains("force_delete"));
+        assert!(timeouts[0].contains("completion"));
+    }
+
+    #[tokio::test]
+    async fn bounded_shutdown_preserves_replacement_and_accepts_closed_task() {
+        let (pem, _) = setup(
+            Time::from_timestamp_nanos(0),
+            Arc::new(InMemory::new()),
+            WalConfig::default(),
+        )
+        .await;
+        tokio::time::pause();
+        let started = Instant::now();
+        let key = (influxdb3_id::DbId::new(1), influxdb3_id::TriggerId::new(1));
+        let (cancel_tx, mut generation) = watch::channel(false);
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        pem.plugin_event_tx.write().await.insert(
+            key,
+            RunningTrigger {
+                database_name: "foo".into(),
+                trigger_name: "schedule".into(),
+                route: TriggerRoute::Schedule,
+                cache: PyCache::new_trigger_cache(Arc::clone(&pem.cache), cancel_tx.subscribe()),
+                cancellation: cancel_tx,
+                task: tokio::spawn(async {
+                    let _ = release_rx.await;
+                }),
+            },
+        );
+
+        let old_completion = pem
+            .stop_trigger(key, Some(&generation), "disable")
+            .await
+            .unwrap();
+        generation.wait_for(|cancelled| *cancelled).await.unwrap();
+        let (replacement_tx, replacement) = watch::channel(false);
+        let closed_task = tokio::spawn(async {});
+        let closed = closed_task.abort_handle();
+        closed_task.abort();
+        pem.plugin_event_tx.write().await.insert(
+            key,
+            RunningTrigger {
+                database_name: "foo".into(),
+                trigger_name: "schedule".into(),
+                route: TriggerRoute::Schedule,
+                cache: PyCache::new_trigger_cache(Arc::clone(&pem.cache), replacement.clone()),
+                cancellation: replacement_tx,
+                task: closed_task,
+            },
+        );
+
+        assert!(
+            pem.stop_trigger(key, Some(&generation), "self_disable")
+                .await
+                .is_none()
+        );
+        release_tx.send(()).unwrap();
+        old_completion.await.unwrap();
+        assert!(!*replacement.borrow());
+        assert!(pem.plugin_event_tx.read().await.running.contains_key(&key));
+        pem.stop_trigger(key, Some(&replacement), "disable")
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+        assert!(closed.is_finished());
+        assert!(*replacement.borrow());
+        assert_eq!(Instant::now(), started);
+    }
+
+    #[tokio::test]
+    async fn bounded_shutdown_restart_routes_only_active_definitions() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (pem, file) = setup(
+            Time::from_timestamp_nanos(0),
+            Arc::clone(&store),
+            WalConfig::default(),
+        )
+        .await;
+        pem.catalog.create_database("foo").await.unwrap();
+        let enabled = create_test_trigger(&pem, &file, "enabled", "request:enabled", false).await;
+        let disabled =
+            create_test_trigger(&pem, &file, "disabled", "request:disabled", false).await;
+        let deleted = create_test_trigger(&pem, &file, "deleted", "request:deleted", false).await;
+        tokio::time::pause();
+
+        pem.catalog
+            .disable_processing_engine_trigger("foo", "disabled")
+            .await
+            .unwrap();
+        pem.catalog
+            .delete_processing_engine_trigger("foo", "deleted", true)
+            .await
+            .unwrap();
+        // Reload the persisted catalog and start a fresh runtime registry. No request runs Python.
+        let catalog = Arc::new(
+            Catalog::new(
+                "test_host",
+                store,
+                Arc::clone(&pem.time_provider),
+                Default::default(),
+            )
+            .await
+            .unwrap(),
+        );
+        let restarted = ProcessingEngineManagerImpl::new(
+            pem.environment_manager.clone(),
+            catalog,
+            pem.node_id(),
+            Arc::clone(&pem.write_buffer),
+            Arc::clone(&pem.query_executor),
+            Arc::clone(&pem.time_provider),
+            Arc::clone(&pem.sys_event_store),
+        )
+        .await;
+        Arc::clone(&restarted).start_triggers().await.unwrap();
+        let channels = restarted.plugin_event_tx.read().await;
+        assert_eq!(channels.running.len(), 1);
+        assert_eq!(channels.request_paths.get("enabled"), Some(&enabled));
+        assert!(!channels.running.contains_key(&disabled));
+        assert!(!channels.running.contains_key(&deleted));
+    }
+
+    async fn create_test_trigger(
+        pem: &ProcessingEngineManagerImpl,
+        file: &NamedTempFile,
+        name: &str,
+        spec: &str,
+        disabled: bool,
+    ) -> TriggerKey {
+        let filename = file.path().file_name().unwrap().to_str().unwrap();
+        pem.catalog
+            .create_processing_engine_trigger(
+                "foo",
+                name,
+                Arc::clone(&pem.node_id),
+                pem.validate_plugin_filename(filename).await.unwrap(),
+                spec,
+                TriggerSettings::default(),
+                &None,
+                disabled,
+            )
+            .await
+            .unwrap();
+        let db = pem.catalog.db_schema("foo").unwrap();
+        (
+            db.id,
+            db.processing_engine_triggers
+                .get_by_name(name)
+                .unwrap()
+                .trigger_id,
+        )
     }
 
     const BATCH_ERROR: &str = "error executing against batch";
@@ -1294,9 +1540,13 @@ mod tests {
         pem.plugin_event_tx
             .read()
             .await
-            .wal_triggers
-            .get("foo")
-            .is_some_and(|triggers| triggers.contains_key(trigger_name))
+            .running
+            .values()
+            .any(|runtime| {
+                runtime.database_name.as_ref() == "foo"
+                    && runtime.trigger_name.as_ref() == trigger_name
+                    && matches!(runtime.route, TriggerRoute::Wal(_))
+            })
     }
 
     async fn schedule_trigger_registered(
@@ -1306,9 +1556,13 @@ mod tests {
         pem.plugin_event_tx
             .read()
             .await
-            .schedule_triggers
-            .get("foo")
-            .is_some_and(|triggers| triggers.contains_key(trigger_name))
+            .running
+            .values()
+            .any(|runtime| {
+                runtime.database_name.as_ref() == "foo"
+                    && runtime.trigger_name.as_ref() == trigger_name
+                    && matches!(runtime.route, TriggerRoute::Schedule)
+            })
     }
 
     struct CapturedLog(Arc<Mutex<Vec<u8>>>);

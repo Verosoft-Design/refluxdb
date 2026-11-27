@@ -148,8 +148,13 @@ impl Catalog {
                     UpdatePrompt::Applied => {
                         self.apply_ordered_catalog_batch(&ordered_batch, &permit);
                         self.background_checkpoint(&ordered_batch);
-                        self.broadcast_update(ordered_batch.into_batch()).await?;
-                        Ok(Prompt::Success(self.sequence_number()))
+                        let sequence = ordered_batch.sequence_number();
+                        let completions = self.broadcast_update(ordered_batch.into_batch()).await?;
+                        drop(permit);
+                        for completion in completions {
+                            let _ = completion.await;
+                        }
+                        Ok(Prompt::Success(sequence))
                     }
                 }
             }
@@ -1035,8 +1040,13 @@ impl Catalog {
                         UpdatePrompt::Applied => {
                             self.apply_ordered_catalog_batch(&ordered_batch, &permit);
                             self.background_checkpoint(&ordered_batch);
-                            self.broadcast_update(ordered_batch.clone().into_batch())
+                            let completions = self
+                                .broadcast_update(ordered_batch.clone().into_batch())
                                 .await?;
+                            drop(permit);
+                            for completion in completions {
+                                let _ = completion.await;
+                            }
                             return Ok(ordered_batch);
                         }
                     }
@@ -1108,7 +1118,9 @@ impl Catalog {
             .inspect_err(|error| debug!(?error, "failed to fetch next catalog sequence"))?
         {
             let batch = self.apply_ordered_catalog_batch(&ordered_catalog_batch, permit);
-            self.broadcast_update(batch).await?;
+            // Replay holds the write permit across batches. Deferred tasks are already
+            // running and dropping their handles lets replay continue in sequence.
+            drop(self.broadcast_update(batch).await?);
             sequence_number = sequence_number.next();
             if update_until.is_some_and(|max_sequence| sequence_number > max_sequence) {
                 break;
@@ -1121,13 +1133,16 @@ impl Catalog {
     }
 
     /// Broadcast a `CatalogUpdate` to all subscribed components in the system.
-    async fn broadcast_update(&self, update: impl Into<CatalogUpdate>) -> Result<()> {
-        self.subscriptions
+    async fn broadcast_update(
+        &self,
+        update: impl Into<CatalogUpdate>,
+    ) -> Result<Vec<tokio::task::JoinHandle<()>>> {
+        Ok(self
+            .subscriptions
             .write()
             .await
             .send_update(Arc::new(update.into()))
-            .await?;
-        Ok(())
+            .await?)
     }
 
     /// Persist the catalog as a checkpoint in the background if we are at the _n_th sequence

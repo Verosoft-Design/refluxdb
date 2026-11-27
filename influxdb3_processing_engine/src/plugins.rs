@@ -1,7 +1,7 @@
 use crate::PluginCode;
 use crate::ProcessingEngineManagerImpl;
 use crate::environment::PythonEnvironmentManager;
-use crate::{RequestEvent, ScheduleEvent, WalEvent};
+use crate::{Request, TriggerKey, WalEvent, cancelled};
 use data_types::NamespaceName;
 use hashbrown::HashMap;
 use influxdb3_catalog::catalog::Catalog;
@@ -31,7 +31,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 use thiserror::Error;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 
 #[derive(Debug, Error)]
 pub enum PluginError {
@@ -46,9 +47,6 @@ pub enum PluginError {
 
     #[error(transparent)]
     WriteBufferError(#[from] write_buffer::Error),
-
-    #[error("failed to send shutdown message back")]
-    FailedToShutdown,
 
     #[error(transparent)]
     AnyhowError(#[from] anyhow::Error),
@@ -95,15 +93,17 @@ pub(crate) fn run_wal_contents_plugin(
     trigger_definition: Arc<TriggerDefinition>,
     context: PluginContext,
     plugin_receiver: mpsc::Receiver<WalEvent>,
-) {
+) -> JoinHandle<()> {
     let trigger_plugin = TriggerPlugin::new(db_name, plugin_code, trigger_definition, context);
 
-    tokio::task::spawn(async move {
-        trigger_plugin
+    tokio::spawn(async move {
+        if let Err(error) = trigger_plugin
             .run_wal_contents_plugin(plugin_receiver)
             .await
-            .expect("trigger plugin failed");
-    });
+        {
+            error!(%error, "WAL trigger failed");
+        }
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -119,8 +119,7 @@ pub(crate) fn run_schedule_plugin(
     trigger_definition: Arc<TriggerDefinition>,
     time_provider: Arc<dyn TimeProvider>,
     context: PluginContext,
-    plugin_receiver: mpsc::Receiver<ScheduleEvent>,
-) -> Result<(), PluginError> {
+) -> Result<JoinHandle<()>, PluginError> {
     // Ensure that the plugin is a schedule plugin
     let plugin_type = trigger_definition.trigger.plugin_type();
     if !matches!(plugin_type, influxdb3_catalog::log::PluginType::Schedule) {
@@ -136,14 +135,14 @@ pub(crate) fn run_schedule_plugin(
         &trigger_plugin.trigger_definition.trigger,
         Arc::clone(&time_provider),
     )?;
-    tokio::task::spawn(async move {
-        trigger_plugin
-            .run_schedule_plugin(plugin_receiver, runner, time_provider)
+    Ok(tokio::spawn(async move {
+        if let Err(error) = trigger_plugin
+            .run_schedule_plugin(runner, time_provider)
             .await
-            .expect("cron trigger plugin failed");
-    });
-
-    Ok(())
+        {
+            error!(%error, "scheduled trigger failed");
+        }
+    }))
 }
 
 pub(crate) fn run_request_plugin(
@@ -151,15 +150,14 @@ pub(crate) fn run_request_plugin(
     plugin_code: Arc<PluginCode>,
     trigger_definition: Arc<TriggerDefinition>,
     context: PluginContext,
-    plugin_receiver: mpsc::Receiver<RequestEvent>,
-) {
+    plugin_receiver: mpsc::Receiver<Request>,
+) -> JoinHandle<()> {
     let trigger_plugin = TriggerPlugin::new(db_name, plugin_code, trigger_definition, context);
-    tokio::task::spawn(async move {
-        trigger_plugin
-            .run_request_plugin(plugin_receiver)
-            .await
-            .expect("trigger plugin failed");
-    });
+    tokio::spawn(async move {
+        if let Err(error) = trigger_plugin.run_request_plugin(plugin_receiver).await {
+            error!(%error, "request trigger failed");
+        }
+    })
 }
 
 pub(crate) struct PluginContext {
@@ -171,6 +169,9 @@ pub(crate) struct PluginContext {
     pub(crate) manager: Arc<ProcessingEngineManagerImpl>,
     // sys events for writing logs to ring buffers
     pub(crate) sys_event_store: Arc<SysEventStore>,
+    pub(crate) key: TriggerKey,
+    pub(crate) cancellation: watch::Receiver<bool>,
+    pub(crate) cache: PyCache,
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +183,9 @@ struct TriggerPlugin {
     query_executor: Arc<dyn QueryExecutor>,
     manager: Arc<ProcessingEngineManagerImpl>,
     logger: ProcessingEngineLogger,
+    key: TriggerKey,
+    cancellation: watch::Receiver<bool>,
+    cache: PyCache,
 }
 
 mod python_plugin {
@@ -199,7 +203,7 @@ mod python_plugin {
     use influxdb3_catalog::log::ErrorBehavior;
     use influxdb3_py_api::logging::LogLevel;
     use influxdb3_py_api::system_py::{
-        PluginReturnState, ProcessingEngineLogger, PyCache, execute_python_with_batch,
+        PluginReturnState, ProcessingEngineLogger, execute_python_with_batch,
         execute_request_trigger, execute_schedule_trigger,
     };
     use influxdb3_wal::{WalContents, WalOp};
@@ -221,6 +225,7 @@ mod python_plugin {
             let logger = ProcessingEngineLogger::new(
                 context.sys_event_store,
                 Arc::clone(&trigger_definition.trigger_name),
+                context.cancellation.clone(),
             );
             Self {
                 trigger_definition,
@@ -230,7 +235,28 @@ mod python_plugin {
                 query_executor: Arc::clone(&context.query_executor),
                 manager: Arc::clone(&context.manager),
                 logger,
+                key: context.key,
+                cancellation: context.cancellation,
+                cache: context.cache,
             }
+        }
+
+        fn is_cancelled(&self) -> bool {
+            *self.cancellation.borrow()
+        }
+
+        async fn run_python<T: Send + 'static>(
+            &self,
+            run: impl FnOnce() -> T + Send + 'static,
+        ) -> Result<Option<T>, PluginError> {
+            let cancellation = self.cancellation.clone();
+            Ok(tokio::task::spawn_blocking(move || {
+                if *cancellation.borrow() {
+                    return None;
+                }
+                Some(run())
+            })
+            .await?)
         }
 
         pub(crate) async fn run_wal_contents_plugin(
@@ -239,310 +265,218 @@ mod python_plugin {
         ) -> Result<(), PluginError> {
             info!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, ?self.trigger_definition.plugin_filename, "starting wal contents plugin");
             let mut futures = FuturesUnordered::new();
+            let mut cancellation = self.cancellation.clone();
             loop {
-                tokio::select! {
+                let result = tokio::select! {
+                    biased;
+                    _ = cancelled(&mut cancellation) => break,
+                    Some(result) = futures.next() => result,
                     event = receiver.recv() => {
-                        match event {
-                            Some(WalEvent::WriteWalContents(wal_contents)) => {
-                                if self.trigger_definition.trigger_settings.run_async {
-                                    let clone = self.clone();
-                                    futures.push(async move {clone.process_wal_contents(wal_contents).await});
-                                } else {
-                                    match self.process_wal_contents(wal_contents).await? {
-
-                                    PluginNextState::SuccessfulRun => {}
-                                    PluginNextState::LogError(error_log) => {
-                                            self.logger.log(LogLevel::Error, error_log);
-                                        }
-                                    PluginNextState::Disable(trigger_definition) => {
-                                            warn!("disabling trigger {}", trigger_definition.trigger_name);
-                                            self.send_disable_trigger();
-                                            while let Some(event) = receiver.recv().await {
-                                                match event {
-                                                    WalEvent::WriteWalContents(_) => {
-                                                        warn!("skipping wal contents because trigger is being disabled")
-                                                    }
-                                                    WalEvent::Shutdown(shutdown) => {
-                                                        if shutdown.send(()).is_err() {
-                                                            error!("failed to send back shutdown for trigger {}", trigger_definition.trigger_name);
-                                                        }
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                }
-                            }
-                            Some(WalEvent::Shutdown(sender)) => {
-                                sender.send(()).map_err(|_| PluginError::FailedToShutdown)?;
-                                break;
-                            }
-                            None => {break;}
+                        let Some(WalEvent::WriteWalContents(wal_contents)) = event else { break };
+                        if self.trigger_definition.trigger_settings.run_async {
+                            futures.push(self.process_wal_contents(wal_contents));
+                            continue;
                         }
+                        Ok(self.process_wal_contents(wal_contents).await?)
                     }
-                    Some(result) = futures.next() => {
-                        match result {
-                            Ok(result) => {
-                                match result {
-                                    PluginNextState::SuccessfulRun => {}
-                                    PluginNextState::LogError(error_log) => {
-                                        error!("trigger failed with error {error_log}");
-                                        self.logger.log(LogLevel::Error, error_log);
-                                    },
-                                    PluginNextState::Disable(_) => {
-                                        self.send_disable_trigger();
-                                        while let Some(event) = receiver.recv().await {
-                                            match event {
-                                                WalEvent::WriteWalContents(_) => {
-                                                    warn!("skipping wal contents because trigger is being disabled")
-                                                }
-                                                WalEvent::Shutdown(shutdown) => {
-                                                    if shutdown.send(()).is_err() {
-                                                        error!("failed to send back shutdown for trigger {}", self.trigger_definition.trigger_name);
-                                                    }
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            Err(err) => {
-                                error!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, "error processing wal contents: {err}");
-                            }
-                        }
+                };
+                if self.is_cancelled() {
+                    break;
+                }
+                match result {
+                    Ok(PluginNextState::SuccessfulRun) => {}
+                    Ok(PluginNextState::LogError(error_log)) => {
+                        self.logger.log(LogLevel::Error, error_log);
+                    }
+                    Ok(PluginNextState::Disable(trigger_definition)) => {
+                        warn!("disabling trigger {}", trigger_definition.trigger_name);
+                        self.send_disable_trigger();
+                        break;
+                    }
+                    Err(err) => {
+                        error!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, "error processing wal contents: {err}");
                     }
                 }
             }
-
             Ok(())
         }
 
-        /// This sends the disable trigger command to the processing engine manager,
-        /// it is done in a separate task so that the caller can send back shutdown.
-        pub(crate) fn send_disable_trigger(&self) {
+        /// Self-disable retires this runtime without updating its catalog definition.
+        fn send_disable_trigger(&self) {
             let manager = Arc::clone(&self.manager);
-            let db_name = Arc::clone(&self.trigger_definition.database_name);
-            let trigger_name = Arc::clone(&self.trigger_definition.trigger_name);
-            let fut = async move { manager.stop_trigger(&db_name, &trigger_name).await };
-            // start the disable call, then look for the shutdown message
-            tokio::spawn(fut);
+            let key = self.key;
+            let generation = self.cancellation.clone();
+            tokio::spawn(async move {
+                if let Some(completion) = manager
+                    .stop_trigger(key, Some(&generation), "self_disable")
+                    .await
+                {
+                    let _ = completion.await;
+                }
+            });
         }
 
         pub(crate) async fn run_schedule_plugin(
             &self,
-            mut receiver: Receiver<ScheduleEvent>,
             mut runner: ScheduleTriggerRunner,
             time_provider: Arc<dyn TimeProvider>,
         ) -> Result<(), PluginError> {
             let mut futures = FuturesUnordered::new();
-            loop {
-                let Some(next_run_instant) = runner.next_run_time() else {
-                    break;
-                };
-
-                tokio::select! {
+            let mut cancellation = self.cancellation.clone();
+            while let Some(next_run_instant) = runner.next_run_time() {
+                let result = tokio::select! {
+                    biased;
+                    _ = cancelled(&mut cancellation) => break,
+                    Some(result) = futures.next() => result,
                     _ = time_provider.sleep_until(next_run_instant) => {
                         let Some(schema) = self.write_buffer.catalog().db_schema(self.db_name.as_str()) else {
                             return Err(PluginError::MissingDb);
                         };
-
                         let Some(trigger_time) = runner.next_trigger_time else {
                             return Err(anyhow!("running a cron trigger that is finished.").into());
                         };
 
                         runner.advance_time();
+                        let run = ScheduleTriggerRunner::run_at_time(self.clone(), trigger_time, schema);
                         if self.trigger_definition.trigger_settings.run_async {
-                            let trigger =self.clone();
-                            let fut = async move {ScheduleTriggerRunner::run_at_time(trigger, trigger_time, schema).await};
-                            futures.push(fut);
-                        } else {
-                            match ScheduleTriggerRunner::run_at_time(self.clone(), trigger_time, schema).await {
-                                Ok(plugin_state) => {
-                                    match plugin_state {
-                                        PluginNextState::SuccessfulRun => {}
-                                        PluginNextState::LogError(err) => {
-                                            self.logger.log(LogLevel::Error, format!("error running scheduled plugin: {err}"));
-                                            error!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, "error running scheduled plugin: {err}");
-                                        }
-                                        PluginNextState::Disable(trigger_definition) => {
-                                            warn!("disabling trigger {} due to error", trigger_definition.trigger_name);
-                                            self.send_disable_trigger();
-                                            let Some(ScheduleEvent::Shutdown(sender)) = receiver.recv().await else {
-                                                warn!("didn't receive shutdown notification from receiver");
-                                                break;
-                                            };
-
-                                            if sender.send(()).is_err() {
-                                                error!("failed to send shutdown message back");
-                                            }
-                                            break;
-                                        }
-                                    }
-                                }
-                                Err(err) => {
-                                    self.logger.log(LogLevel::Error, format!("error running scheduled plugin: {err}"));
-                                    error!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, "error running scheduled plugin: {}", err);
-                                }
-                            }
-
+                            futures.push(run);
+                            continue;
                         }
+                        run.await
                     }
-                    event = receiver.recv() => {
-                        match event {
-                            None => {
-                                warn!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, "trigger plugin receiver closed");
-                                break;
-                            }
-                            Some(ScheduleEvent::Shutdown(sender)) => {
-                                sender.send(()).map_err(|_| PluginError::FailedToShutdown)?;
-                                break;
-                            }
-                        }
+                };
+                if self.is_cancelled() {
+                    break;
+                }
+                match result {
+                    Ok(PluginNextState::SuccessfulRun) => {}
+                    Ok(PluginNextState::LogError(error)) => {
+                        self.logger.log(
+                            LogLevel::Error,
+                            format!("error running scheduled plugin: {error}"),
+                        );
                     }
-                    Some(result) = futures.next() => {
-                        match result {
-                            Err(e) => {
-                                self.logger.log(LogLevel::Error, format!("error running async scheduled plugin: {e}"));
-                                error!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, "error running async scheduled plugin: {e}");
-                            }
-                            Ok(result) => {
-                                match result {
-                                    PluginNextState::SuccessfulRun => {}
-                                    PluginNextState::LogError(err) => {
-                                        self.logger.log(LogLevel::Error, format!("error running async scheduled plugin: {err}"));
-                                        error!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, "error running async scheduled plugin: {err}");
-                                    }
-                                    PluginNextState::Disable(trigger_definition) => {
-                                        warn!("disabling trigger {} due to error", trigger_definition.trigger_name);
-                                        self.send_disable_trigger();
-
-                                        let Some(ScheduleEvent::Shutdown(sender)) = receiver.recv().await else {
-                                            warn!("didn't receive shutdown notification from receiver");
-                                            break;
-                                        };
-
-                                        if sender.send(()).is_err() {
-                                            error!("failed to send shutdown message back");
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                        }
+                    Ok(PluginNextState::Disable(trigger_definition)) => {
+                        warn!(
+                            "disabling trigger {} due to error",
+                            trigger_definition.trigger_name
+                        );
+                        self.send_disable_trigger();
+                        break;
+                    }
+                    Err(error) => {
+                        self.logger.log(
+                            LogLevel::Error,
+                            format!("error running scheduled plugin: {error}"),
+                        );
+                        error!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, "error running scheduled plugin: {error}");
                     }
                 }
             }
-
             Ok(())
         }
 
         pub(crate) async fn run_request_plugin(
             &self,
-            mut receiver: Receiver<RequestEvent>,
+            mut receiver: Receiver<Request>,
         ) -> Result<(), PluginError> {
             info!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, ?self.trigger_definition.plugin_filename, "starting request plugin");
 
+            let mut cancellation = self.cancellation.clone();
             loop {
-                match receiver.recv().await {
-                    None => {
-                        warn!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, "trigger plugin receiver closed");
-                        break;
-                    }
-                    Some(RequestEvent::Request(request)) => {
-                        let Some(schema) =
-                            self.write_buffer.catalog().db_schema(self.db_name.as_str())
-                        else {
-                            error!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, "missing db schema");
-                            return Err(PluginError::MissingDb);
-                        };
-                        let plugin_code = self.plugin_code.code();
-                        let query_executor = Arc::clone(&self.query_executor);
-                        let logger = Some(self.logger.clone());
-                        let trigger_arguments = self.trigger_definition.trigger_arguments.clone();
-                        let py_cache = PyCache::new_trigger_cache(
-                            Arc::clone(&self.manager.cache),
-                            self.trigger_definition.database_name.to_string(),
-                            self.trigger_definition.trigger_name.to_string(),
-                        );
+                let request = tokio::select! {
+                    biased;
+                    _ = cancelled(&mut cancellation) => break,
+                    request = receiver.recv() => request,
+                };
+                let Some(request) = request else { break };
+                if self.is_cancelled() {
+                    break;
+                }
+                let Some(schema) = self.write_buffer.catalog().db_schema(self.db_name.as_str())
+                else {
+                    error!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, "missing db schema");
+                    return Err(PluginError::MissingDb);
+                };
+                let plugin_code = self.plugin_code.code();
+                let query_executor = Arc::clone(&self.query_executor);
+                let logger = Some(self.logger.clone());
+                let trigger_arguments = self.trigger_definition.trigger_arguments.clone();
+                let py_cache = self.cache.clone();
 
-                        let result = tokio::task::spawn_blocking(move || {
-                            execute_request_trigger(
-                                plugin_code.as_ref(),
-                                schema,
-                                query_executor,
-                                logger,
-                                &trigger_arguments,
-                                request.query_params,
-                                request.headers,
-                                request.body,
-                                py_cache,
-                            )
-                        })
-                        .await?;
+                let Some(result) = self
+                    .run_python(move || {
+                        execute_request_trigger(
+                            plugin_code.as_ref(),
+                            schema,
+                            query_executor,
+                            logger,
+                            &trigger_arguments,
+                            request.query_params,
+                            request.headers,
+                            request.body,
+                            py_cache,
+                        )
+                    })
+                    .await?
+                else {
+                    break;
+                };
 
-                        // produce the HTTP response
-                        let response = match result {
-                            Ok((
-                                response_code,
-                                response_headers,
-                                response_body,
-                                plugin_return_state,
-                            )) => {
-                                let errors = self.handle_return_state(plugin_return_state).await;
-                                // TODO: here is one spot we'll pick up errors to put into the plugin system table
-                                for error in errors {
-                                    self.logger.log(
-                                        LogLevel::Error,
-                                        format!("error running request plugin: {error}"),
-                                    );
-                                    error!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, "error running request plugin: {error}");
-                                }
-
-                                let response_status = StatusCode::from_u16(response_code)
-                                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                                let mut response = ResponseBuilder::new().status(response_status);
-
-                                for (key, value) in response_headers {
-                                    response = response.header(
-                                        key.as_str(),
-                                        HeaderValue::from_str(&value)
-                                            .unwrap_or_else(|_| HeaderValue::from_static("")),
-                                    );
-                                }
-
-                                response
-                                    .body(bytes_to_response_body(response_body))
-                                    .context("building response")?
-                            }
-                            Err(e) => {
-                                // build json string with the error with serde so that it is {"error": "error message"}
-                                self.logger.log(
-                                    LogLevel::Error,
-                                    format!("error running request plugin: {e}"),
-                                );
-                                error!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, "error running request plugin: {e}");
-                                let body = serde_json::json!({"error": e.to_string()}).to_string();
-                                ResponseBuilder::new()
-                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                    .body(bytes_to_response_body(body))
-                                    .context("building response")?
-                            }
-                        };
-
-                        if request.response_tx.send(response).is_err() {
-                            error!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, "error sending response");
+                if self.is_cancelled() {
+                    break;
+                }
+                // produce the HTTP response
+                let response = match result {
+                    Ok((response_code, response_headers, response_body, plugin_return_state)) => {
+                        let errors = self.handle_return_state(plugin_return_state).await;
+                        // TODO: here is one spot we'll pick up errors to put into the plugin system table
+                        for error in errors {
+                            self.logger.log(
+                                LogLevel::Error,
+                                format!("error running request plugin: {error}"),
+                            );
+                            error!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, "error running request plugin: {error}");
                         }
+
+                        let response_status = StatusCode::from_u16(response_code)
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                        let mut response = ResponseBuilder::new().status(response_status);
+
+                        for (key, value) in response_headers {
+                            response = response.header(
+                                key.as_str(),
+                                HeaderValue::from_str(&value)
+                                    .unwrap_or_else(|_| HeaderValue::from_static("")),
+                            );
+                        }
+
+                        response
+                            .body(bytes_to_response_body(response_body))
+                            .context("building response")?
                     }
-                    Some(RequestEvent::Shutdown(sender)) => {
-                        sender.send(()).map_err(|_| PluginError::FailedToShutdown)?;
-                        break;
+                    Err(e) => {
+                        // build json string with the error with serde so that it is {"error": "error message"}
+                        self.logger.log(
+                            LogLevel::Error,
+                            format!("error running request plugin: {e}"),
+                        );
+                        error!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, "error running request plugin: {e}");
+                        let body = serde_json::json!({"error": e.to_string()}).to_string();
+                        ResponseBuilder::new()
+                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                            .body(bytes_to_response_body(body))
+                            .context("building response")?
                     }
+                };
+
+                if self.is_cancelled() {
+                    break;
+                }
+                if request.response_tx.send(response).is_err() {
+                    error!(?self.trigger_definition.trigger_name, ?self.trigger_definition.database_name, "error sending response");
                 }
             }
-
             Ok(())
         }
 
@@ -592,6 +526,9 @@ mod python_plugin {
 
                         // loop for retries, in general it will only run once.
                         loop {
+                            if self.is_cancelled() {
+                                return Ok(PluginNextState::SuccessfulRun);
+                            }
                             let logger = Some(self.logger.clone());
                             let plugin_code = Arc::clone(&self.plugin_code.code());
                             let query_executor = Arc::clone(&self.query_executor);
@@ -599,29 +536,32 @@ mod python_plugin {
                             let trigger_arguments =
                                 self.trigger_definition.trigger_arguments.clone();
                             let wal_contents_clone = Arc::clone(&wal_contents);
-                            let py_cache = PyCache::new_trigger_cache(
-                                Arc::clone(&self.manager.cache),
-                                self.trigger_definition.database_name.to_string(),
-                                self.trigger_definition.trigger_name.to_string(),
-                            );
+                            let py_cache = self.cache.clone();
 
-                            let result = tokio::task::spawn_blocking(move || {
-                                let write_batch = match &wal_contents_clone.ops[op_index] {
-                                    WalOp::Write(wb) => wb,
-                                    _ => unreachable!("Index was checked."),
-                                };
-                                execute_python_with_batch(
-                                    plugin_code.as_ref(),
-                                    write_batch,
-                                    schema_clone,
-                                    query_executor,
-                                    logger,
-                                    table_filter,
-                                    &trigger_arguments,
-                                    py_cache,
-                                )
-                            })
-                            .await?;
+                            let Some(result) = self
+                                .run_python(move || {
+                                    let write_batch = match &wal_contents_clone.ops[op_index] {
+                                        WalOp::Write(wb) => wb,
+                                        _ => unreachable!("Index was checked."),
+                                    };
+                                    execute_python_with_batch(
+                                        plugin_code.as_ref(),
+                                        write_batch,
+                                        schema_clone,
+                                        query_executor,
+                                        logger,
+                                        table_filter,
+                                        &trigger_arguments,
+                                        py_cache,
+                                    )
+                                })
+                                .await?
+                            else {
+                                return Ok(PluginNextState::SuccessfulRun);
+                            };
+                            if self.is_cancelled() {
+                                return Ok(PluginNextState::SuccessfulRun);
+                            }
 
                             match result {
                                 Ok(result) => {
@@ -678,7 +618,7 @@ mod python_plugin {
 
             let mut errors = Vec::new();
 
-            if !plugin_return_state.write_back_lines.is_empty() {
+            if !self.is_cancelled() && !plugin_return_state.write_back_lines.is_empty() {
                 if let Err(e) = self
                     .write_buffer
                     .write_lp(
@@ -696,6 +636,9 @@ mod python_plugin {
             }
 
             for (db_name, lines) in plugin_return_state.write_db_lines {
+                if self.is_cancelled() {
+                    break;
+                }
                 let Ok(namespace_name) = NamespaceName::new(db_name.clone()) else {
                     errors.push(format!("invalid database name: {db_name}"));
                     continue;
@@ -801,35 +744,41 @@ mod python_plugin {
         ) -> Result<PluginNextState, PluginError> {
             // This loop is here just for the retry case.
             loop {
+                if plugin.is_cancelled() {
+                    return Ok(PluginNextState::SuccessfulRun);
+                }
                 let plugin_code = plugin.plugin_code.code();
                 let query_executor = Arc::clone(&plugin.query_executor);
                 let logger = Some(plugin.logger.clone());
                 let trigger_arguments = plugin.trigger_definition.trigger_arguments.clone();
                 let schema = Arc::clone(&db_schema);
-                let py_cache = PyCache::new_trigger_cache(
-                    Arc::clone(&plugin.manager.cache),
-                    plugin.trigger_definition.database_name.to_string(),
-                    plugin.trigger_definition.trigger_name.to_string(),
-                );
+                let py_cache = plugin.cache.clone();
 
-                let result = tokio::task::spawn_blocking(move || {
-                    execute_schedule_trigger(
-                        plugin_code.as_ref(),
-                        trigger_time,
-                        schema,
-                        query_executor,
-                        logger,
-                        &trigger_arguments,
-                        py_cache,
-                    )
-                })
-                .await?;
+                let Some(result) = plugin
+                    .run_python(move || {
+                        execute_schedule_trigger(
+                            plugin_code.as_ref(),
+                            trigger_time,
+                            schema,
+                            query_executor,
+                            logger,
+                            &trigger_arguments,
+                            py_cache,
+                        )
+                    })
+                    .await?
+                else {
+                    return Ok(PluginNextState::SuccessfulRun);
+                };
+                if plugin.is_cancelled() {
+                    return Ok(PluginNextState::SuccessfulRun);
+                }
                 match result {
                     Ok(result) => {
                         let errors = plugin.handle_return_state(result).await;
                         // TODO: here is one spot we'll pick up errors to put into the plugin system table
                         for error in errors {
-                            error!(?plugin.trigger_definition, "error running schedule plugin: {error}");
+                            error!(?plugin.trigger_definition.trigger_name, ?plugin.trigger_definition.database_name, "error running schedule plugin: {error}");
                         }
                         return Ok(PluginNextState::SuccessfulRun);
                     }

@@ -1180,21 +1180,14 @@ impl PyCache {
         }
     }
 
-    /// Remove this generation's local namespace after sending its cancellation signal.
-    pub fn retire_trigger_cache(&self) {
-        if let Some(mut cache) = self.cache_store.try_lock() {
-            let retired = cache.namespaces.remove(&self.local_cache_id);
-            drop(cache);
+    /// Reclaim this generation's local namespace on the blocking pool.
+    pub fn retire_trigger_cache(&self) -> tokio::task::JoinHandle<()> {
+        let cache = Arc::clone(&self.cache_store);
+        let id = self.local_cache_id.clone();
+        tokio::task::spawn_blocking(move || {
+            let retired = cache.lock().namespaces.remove(&id);
             drop(retired);
-        } else {
-            // A Python cache call can be in progress when the generation is detached.
-            let cache = Arc::clone(&self.cache_store);
-            let id = self.local_cache_id.clone();
-            tokio::task::spawn_blocking(move || {
-                let retired = cache.lock().namespaces.remove(&id);
-                drop(retired);
-            });
-        }
+        })
     }
 
     fn is_cancelled(&self) -> bool {
@@ -1283,31 +1276,61 @@ mod cache_tests {
 
     #[test]
     fn bounded_shutdown_retires_only_the_old_trigger_cache() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(check_cache_reclamation());
+    }
+
+    async fn check_cache_reclamation() {
         pyo3::prepare_freethreaded_python();
         let time = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
         let store = Arc::new(Mutex::new(CacheStore::new(time, Duration::from_secs(10))));
         let (old_tx, old_rx) = watch::channel(false);
         let old = PyCache::new_trigger_cache(Arc::clone(&store), old_rx);
+        let (_new_tx, new_rx) = watch::channel(false);
+        let new = PyCache::new_trigger_cache(Arc::clone(&store), new_rx);
         Python::with_gil(|py| {
             old.put("old".into(), py.None(), None, None).unwrap();
             old.put("shared".into(), py.None(), None, Some(true))
                 .unwrap();
-            assert!(store.lock().namespaces.contains_key(&old.local_cache_id));
+        });
 
-            old_tx.send_replace(true);
-            old.retire_trigger_cache();
-            assert!(!store.lock().namespaces.contains_key(&old.local_cache_id));
+        // Hold the only blocking worker so retirement queues without holding the store lock.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let blocker = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            let _ = release_rx.blocking_recv();
+        });
+        started_rx.await.unwrap();
+        old_tx.send_replace(true);
+        let reclamation = old.retire_trigger_cache();
+        assert!(store.lock().namespaces.contains_key(&old.local_cache_id));
 
-            let (_new_tx, new_rx) = watch::channel(false);
-            let new = PyCache::new_trigger_cache(Arc::clone(&store), new_rx);
+        Python::with_gil(|py| {
             new.put("replacement".into(), py.None(), None, None)
                 .unwrap();
-
             old.put("late".into(), py.None(), None, None).unwrap();
             old.put("late".into(), py.None(), None, Some(true)).unwrap();
             assert!(!old.delete("replacement".into(), None).unwrap());
             assert!(!old.delete("shared".into(), Some(true)).unwrap());
+            assert!(
+                store
+                    .lock()
+                    .get(&new.local_cache_id, py, "replacement")
+                    .is_some()
+            );
+        });
+
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap();
+        reclamation.await.unwrap();
+        Python::with_gil(|py| {
             let mut store = store.lock();
+            assert!(!store.namespaces.contains_key(&old.local_cache_id));
             assert!(store.get(&new.local_cache_id, py, "replacement").is_some());
             assert!(store.get(&new.global_cache_id, py, "shared").is_some());
             assert!(store.get(&new.local_cache_id, py, "old").is_none());

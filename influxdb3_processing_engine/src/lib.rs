@@ -438,7 +438,8 @@ impl ProcessingEngineManagerImpl {
         // ponytail: A watch signal dispatches synchronously, even with a full event queue.
         runtime.cancellation.send_replace(true);
         drop(channels);
-        runtime.cache.retire_trigger_cache();
+        // The committed stop waits for the runtime to exit. Cache reclamation is independent.
+        drop(runtime.cache.retire_trigger_cache());
         Some(tokio::spawn(wait_for_shutdown(
             runtime, key, operation, started,
         )))
@@ -962,8 +963,17 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn bounded_shutdown_force_delete_unblocks_routing_and_catalog() {
+    #[test]
+    fn bounded_shutdown_force_delete_unblocks_routing_and_catalog() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(check_force_delete_while_cache_reclamation_waits());
+    }
+
+    async fn check_force_delete_while_cache_reclamation_waits() {
         let (pem, file) = setup(
             Time::from_timestamp_nanos(0),
             Arc::new(InMemory::new()),
@@ -1015,6 +1025,15 @@ mod tests {
         tracing::callsite::rebuild_interest_cache();
 
         tokio::time::pause();
+        // Keep the reclamation job queued past the committed stop and its timeout.
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let blocker = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            let _ = release_rx.blocking_recv();
+        });
+        started_rx.await.unwrap();
+
         let started = Instant::now();
         let pending_request =
             pem.request_trigger("request_path", HashMap::new(), HashMap::new(), Bytes::new());
@@ -1070,10 +1089,12 @@ mod tests {
             dropped_rx.try_recv(),
             Err(oneshot::error::TryRecvError::Empty)
         ));
-        advance(Duration::from_secs(1)).await;
+        // A busy blocking pool prevents auto-advance, so include the timer's rounding tick.
+        advance(Duration::from_secs(1) + Duration::from_millis(1)).await;
         deletion.await.unwrap().unwrap();
         assert!(dropped_rx.await.is_err());
-        // Tokio timers round up to the next millisecond tick.
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap();
         assert!(
             (SHUTDOWN_BUDGET..=SHUTDOWN_BUDGET + Duration::from_millis(1))
                 .contains(&started.elapsed())

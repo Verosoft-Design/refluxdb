@@ -371,9 +371,9 @@ impl AsRef<ParquetFile> for ParquetFile {
 
 #[cfg(test)]
 impl ParquetFile {
-    pub(crate) fn create_for_test(path: impl Into<String>) -> Self {
+    pub(crate) fn create_for_test(id: ParquetFileId, path: impl Into<String>) -> Self {
         Self {
-            id: ParquetFileId::new(),
+            id,
             path: path.into(),
             size_bytes: 1024,
             row_count: 1,
@@ -543,6 +543,40 @@ pub mod test_helpers {
     use iox_query::exec::IOxSessionContext;
     use iox_time::Time;
     use std::sync::Arc;
+
+    /// Run the named libtest test in a fresh process. Only the child runs the test body.
+    #[cfg(test)]
+    pub(crate) fn run_in_subprocess(qualified_name: &str) -> bool {
+        const CHILD_TEST: &str = "INFLUXDB3_WRITE_CHILD_TEST";
+        if std::env::var(CHILD_TEST).as_deref() == Ok(qualified_name) {
+            return true;
+        }
+
+        let (_, test_name) = qualified_name.split_once("::").unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact", test_name, "--format", "pretty", "--color", "never",
+            ])
+            .env(CHILD_TEST, qualified_name)
+            .env_remove("RUST_TEST_NOCAPTURE")
+            .output()
+            .unwrap_or_else(|err| panic!("could not spawn {test_name}: {err}"));
+
+        // ponytail: Use libtest's pretty output to catch an exact filter that ran zero tests.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let passed_test = format!("test {test_name} ... ok");
+        assert!(
+            output.status.success()
+                && stdout.lines().filter(|line| *line == passed_test).count() == 1
+                && stdout
+                    .lines()
+                    .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
+            "child test {test_name} exited with {}\nstdout:\n{stdout}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+        );
+        false
+    }
 
     /// Helper trait for getting [`RecordBatch`]es from a [`WriteBuffer`] implementation in tests
     #[async_trait::async_trait]

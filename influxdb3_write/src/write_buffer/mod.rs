@@ -1460,6 +1460,13 @@ mod tests {
     /// generated snapshot files use the next sequence number.
     #[tokio::test]
     async fn new_snapshots_use_correct_sequence() {
+        if !crate::test_helpers::run_in_subprocess(concat!(
+            module_path!(),
+            "::new_snapshots_use_correct_sequence"
+        )) {
+            return;
+        }
+
         // set up a local file system object store:
         let object_store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(test_helpers::tmp_dir().unwrap()).unwrap());
@@ -1569,6 +1576,13 @@ mod tests {
 
     #[tokio::test]
     async fn next_id_is_correct_number() {
+        if !crate::test_helpers::run_in_subprocess(concat!(
+            module_path!(),
+            "::next_id_is_correct_number"
+        )) {
+            return;
+        }
+
         // set up a local file system object store:
         let object_store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(test_helpers::tmp_dir().unwrap()).unwrap());

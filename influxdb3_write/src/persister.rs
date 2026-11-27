@@ -815,6 +815,13 @@ mod tests {
     // This test makes sure that the proper next_file_id is used if a parquet file
     // is added
     async fn persist_add_parquet_file_and_load_snapshot() {
+        if !crate::test_helpers::run_in_subprocess(concat!(
+            module_path!(),
+            "::persist_add_parquet_file_and_load_snapshot"
+        )) {
+            return;
+        }
+
         let local_disk =
             LocalFileSystem::new_with_prefix(test_helpers::tmp_dir().unwrap()).unwrap();
         let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
@@ -1319,15 +1326,15 @@ mod tests {
                         (
                             TableId::new(0),
                             vec![
-                                ParquetFile::create_for_test("1.parquet"),
-                                ParquetFile::create_for_test("2.parquet"),
+                                ParquetFile::create_for_test(ParquetFileId::from(0), "1.parquet"),
+                                ParquetFile::create_for_test(ParquetFileId::from(1), "2.parquet"),
                             ],
                         ),
                         (
                             TableId::new(1),
                             vec![
-                                ParquetFile::create_for_test("3.parquet"),
-                                ParquetFile::create_for_test("4.parquet"),
+                                ParquetFile::create_for_test(ParquetFileId::from(2), "3.parquet"),
+                                ParquetFile::create_for_test(ParquetFileId::from(3), "4.parquet"),
                             ],
                         ),
                     ]
@@ -1341,15 +1348,15 @@ mod tests {
                         (
                             TableId::new(0),
                             vec![
-                                ParquetFile::create_for_test("5.parquet"),
-                                ParquetFile::create_for_test("6.parquet"),
+                                ParquetFile::create_for_test(ParquetFileId::from(4), "5.parquet"),
+                                ParquetFile::create_for_test(ParquetFileId::from(5), "6.parquet"),
                             ],
                         ),
                         (
                             TableId::new(1),
                             vec![
-                                ParquetFile::create_for_test("7.parquet"),
-                                ParquetFile::create_for_test("8.parquet"),
+                                ParquetFile::create_for_test(ParquetFileId::from(6), "7.parquet"),
+                                ParquetFile::create_for_test(ParquetFileId::from(7), "8.parquet"),
                             ],
                         ),
                     ]
@@ -1360,7 +1367,7 @@ mod tests {
         .into();
         let snapshot = PersistedSnapshotVersion::V1(PersistedSnapshot {
             node_id: "host".to_string(),
-            next_file_id: ParquetFileId::new(),
+            next_file_id: ParquetFileId::from(8),
             snapshot_sequence_number: SnapshotSequenceNumber::new(0),
             wal_file_sequence_number: WalFileSequenceNumber::new(0),
             catalog_sequence_number: CatalogSequenceNumber::new(0),

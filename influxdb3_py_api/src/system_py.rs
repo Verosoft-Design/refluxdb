@@ -36,7 +36,9 @@ use pyo3::{
 use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::sync::watch;
 
 create_exception!(influxdb3_py_api, QueryError, PyException);
 
@@ -63,17 +65,26 @@ pub enum CacheType {
 pub struct ProcessingEngineLogger {
     sys_event_store: Arc<SysEventStore>,
     trigger_name: Arc<str>,
+    cancellation: watch::Receiver<bool>,
 }
 
 impl ProcessingEngineLogger {
-    pub fn new(sys_event_store: Arc<SysEventStore>, trigger_name: impl Into<Arc<str>>) -> Self {
+    pub fn new(
+        sys_event_store: Arc<SysEventStore>,
+        trigger_name: impl Into<Arc<str>>,
+        cancellation: watch::Receiver<bool>,
+    ) -> Self {
         Self {
             sys_event_store,
             trigger_name: trigger_name.into(),
+            cancellation,
         }
     }
 
     pub fn log(&self, log_level: LogLevel, log_line: impl Into<String>) {
+        if *self.cancellation.borrow() {
+            return;
+        }
         self.sys_event_store.record(ProcessingEngineLog::new(
             self.sys_event_store.time_provider().now(),
             log_level,
@@ -1053,17 +1064,14 @@ impl ExpiringCache {
 enum CacheId {
     Global(),
     GlobalTest(String),
-    Trigger {
-        database: String,
-        trigger_name: String,
-    },
+    Trigger(u64),
     TriggerTest(String),
 }
 
 impl CacheId {
     fn default_expiration(&self) -> Option<Duration> {
         match self {
-            Global() | Trigger { .. } => None,
+            Global() | Trigger(_) => None,
             // for tests, keep values around for 30 minutes.
             GlobalTest(_) | TriggerTest(_) => Some(Duration::from_secs(30 * 60)),
         }
@@ -1130,14 +1138,6 @@ impl CacheStore {
             false
         }
     }
-    pub fn drop_trigger_cache(&mut self, database: String, trigger_name: String) -> bool {
-        self.namespaces
-            .remove(&Trigger {
-                database,
-                trigger_name,
-            })
-            .is_some()
-    }
 }
 
 // Python class for Cache
@@ -1147,6 +1147,7 @@ pub struct PyCache {
     global_cache_id: CacheId,
     local_cache_id: CacheId,
     cache_store: Arc<Mutex<CacheStore>>,
+    cancellation: Option<watch::Receiver<bool>>,
 }
 
 impl PyCache {
@@ -1162,22 +1163,37 @@ impl PyCache {
             global_cache_id: GlobalTest(test_name.clone()),
             local_cache_id: TriggerTest(test_name),
             cache_store,
+            cancellation: None,
         }
     }
 
     pub fn new_trigger_cache(
         cache_store: Arc<Mutex<CacheStore>>,
-        database: String,
-        trigger_name: String,
+        cancellation: watch::Receiver<bool>,
     ) -> Self {
+        static NEXT_CACHE_ID: AtomicU64 = AtomicU64::new(0);
         Self {
             global_cache_id: Global(),
-            local_cache_id: Trigger {
-                database,
-                trigger_name,
-            },
+            local_cache_id: Trigger(NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed)),
             cache_store,
+            cancellation: Some(cancellation),
         }
+    }
+
+    /// Reclaim this generation's local namespace on the blocking pool.
+    pub fn retire_trigger_cache(&self) -> tokio::task::JoinHandle<()> {
+        let cache = Arc::clone(&self.cache_store);
+        let id = self.local_cache_id.clone();
+        tokio::task::spawn_blocking(move || {
+            let retired = cache.lock().namespaces.remove(&id);
+            drop(retired);
+        })
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .is_some_and(|signal| *signal.borrow())
     }
 }
 
@@ -1192,7 +1208,10 @@ impl PyCache {
         use_global: Option<bool>,
     ) -> PyResult<()> {
         let cache_id = self.cache_id(use_global);
-        self.cache_store.lock().put(cache_id, &key, value, ttl);
+        let mut cache = self.cache_store.lock();
+        if !self.is_cancelled() {
+            cache.put(cache_id, &key, value, ttl);
+        }
 
         Ok(())
     }
@@ -1206,7 +1225,14 @@ impl PyCache {
     ) -> PyResult<PyObject> {
         Python::with_gil(|py| {
             let cache_id = self.cache_id(use_global);
-            let result = self.cache_store.lock().get(cache_id, py, &key);
+            let result = {
+                let mut cache = self.cache_store.lock();
+                if self.is_cancelled() {
+                    None
+                } else {
+                    cache.get(cache_id, py, &key)
+                }
+            };
 
             match result {
                 Some(value) => {
@@ -1230,7 +1256,8 @@ impl PyCache {
     #[pyo3(signature = (key, use_global=None))]
     fn delete(&self, key: String, use_global: Option<bool>) -> PyResult<bool> {
         let cache_id = self.cache_id(use_global);
-        let result = self.cache_store.lock().delete(cache_id, &key);
+        let mut cache = self.cache_store.lock();
+        let result = !self.is_cancelled() && cache.delete(cache_id, &key);
 
         Ok(result)
     }
@@ -1240,4 +1267,75 @@ impl PyCache {
 #[pymodule]
 fn influxdb3_py_api(_m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use iox_time::MockProvider;
+
+    #[test]
+    fn bounded_shutdown_retires_only_the_old_trigger_cache() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(check_cache_reclamation());
+    }
+
+    async fn check_cache_reclamation() {
+        pyo3::prepare_freethreaded_python();
+        let time = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
+        let store = Arc::new(Mutex::new(CacheStore::new(time, Duration::from_secs(10))));
+        let (old_tx, old_rx) = watch::channel(false);
+        let old = PyCache::new_trigger_cache(Arc::clone(&store), old_rx);
+        let (_new_tx, new_rx) = watch::channel(false);
+        let new = PyCache::new_trigger_cache(Arc::clone(&store), new_rx);
+        Python::with_gil(|py| {
+            old.put("old".into(), py.None(), None, None).unwrap();
+            old.put("shared".into(), py.None(), None, Some(true))
+                .unwrap();
+        });
+
+        // Hold the only blocking worker so retirement queues without holding the store lock.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let blocker = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            let _ = release_rx.blocking_recv();
+        });
+        started_rx.await.unwrap();
+        old_tx.send_replace(true);
+        let reclamation = old.retire_trigger_cache();
+        assert!(store.lock().namespaces.contains_key(&old.local_cache_id));
+
+        Python::with_gil(|py| {
+            new.put("replacement".into(), py.None(), None, None)
+                .unwrap();
+            old.put("late".into(), py.None(), None, None).unwrap();
+            old.put("late".into(), py.None(), None, Some(true)).unwrap();
+            assert!(!old.delete("replacement".into(), None).unwrap());
+            assert!(!old.delete("shared".into(), Some(true)).unwrap());
+            assert!(
+                store
+                    .lock()
+                    .get(&new.local_cache_id, py, "replacement")
+                    .is_some()
+            );
+        });
+
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap();
+        reclamation.await.unwrap();
+        Python::with_gil(|py| {
+            let mut store = store.lock();
+            assert!(!store.namespaces.contains_key(&old.local_cache_id));
+            assert!(store.get(&new.local_cache_id, py, "replacement").is_some());
+            assert!(store.get(&new.global_cache_id, py, "shared").is_some());
+            assert!(store.get(&new.local_cache_id, py, "old").is_none());
+            assert!(store.get(&new.local_cache_id, py, "late").is_none());
+            assert!(store.get(&new.global_cache_id, py, "late").is_none());
+        });
+    }
 }
